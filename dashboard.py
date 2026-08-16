@@ -32,7 +32,15 @@ from data_engine import (
     cached_earnings_history_real,
     cached_options_flow,
     cached_retail_sentiment,
+    cached_13f_changes,
+    cached_marketbeat_institutional_sentiment,
     _compute_technical_levels,
+    _read_marketbeat_institutional_cache,
+    _read_news_sources,
+    add_news_source,
+    remove_news_source,
+    set_news_source_enabled,
+    test_news_feed,
     detect_technical_levels,
     fetch_session_price_summary,
     check_full_source_registry,
@@ -93,6 +101,7 @@ SOURCE_LABELS = {
     "sec_edgar_free": ("SEC EDGAR", "free"),
     "senate_efd_free": ("Senate EFD", "free"),
     "quiverquant": ("QuiverQuant", "paid"),
+    "Yahoo Finance RSS": ("Yahoo Finance RSS", "free"),  # default seeded news_sources feed
     None: ("no data", None),
 }
 
@@ -1081,68 +1090,83 @@ def render_signal_card(row):
     """
 
 
-def render_target_range(current, low, mean, median, high, height=200):
-    """Horizontal low/mean/median/high/current range. Labels that would
-    collide (any two values within ~8% of the overall span) are staggered
-    onto separate vertical tiers with a thin connector back to their true
-    marker position, so labels never overlap no matter how close two
-    values sit -- e.g. current price landing right on the median."""
-    points = [
-        ("Low", low, COLOR_BEARISH), ("Median", median, COLOR_INSTITUTIONAL),
-        ("Mean", mean, ACCENT), ("High", high, COLOR_BULLISH), ("Current", current, TEXT_PRIMARY),
-    ]
-    points = [(n, float(x), c) for n, x, c in points if x is not None and pd.notna(x)]
+def render_price_target_fan(hist_df, current, low, mean, high, height=380):
+    """Historical close price flowing into a forward-projecting fan toward
+    High/Average/Low analyst targets -- replaces the old static low..high
+    number-line entirely, redesigned directly against real Yahoo Finance
+    and TradingView price-target chart references (not a guess at their
+    style): a real price history line leads into three dashed projection
+    lines from the current price to each target, each ending in a
+    colored value+percent label at the right edge.
 
+    Median isn't drawn as a 4th fan line -- both reference charts use
+    exactly High/Average/Low, and a 4th line sitting close to Average
+    would just crowd the labels without adding a materially different
+    read -- but it isn't silently dropped either: the caller shows it in
+    the caption text above this chart."""
     fig = go.Figure()
-    if not points:
+    if hist_df is None or hist_df.empty or current is None:
         apply_theme(fig, height=height)
         return fig
 
-    xs = [x for _, x, _ in points]
-    x_span = (max(xs) - min(xs)) or max(abs(x) for x in xs) or 1.0
-    collision_threshold = x_span * 0.08
+    hist = hist_df["Close"].dropna()
+    if hist.empty:
+        apply_theme(fig, height=height)
+        return fig
 
-    points_by_x = sorted(points, key=lambda p: p[1])
-    last_x_at_level = {}
-    level_by_name = {}
-    for name, x, _ in points_by_x:
-        level = 0
-        while level in last_x_at_level and (x - last_x_at_level[level]) < collision_threshold:
-            level += 1
-        last_x_at_level[level] = x
-        level_by_name[name] = level
-    max_level = max(level_by_name.values())
+    last_close = float(hist.iloc[-1])
+    # Plotly's annotation/axis-range serialization chokes on raw pandas
+    # Timestamps ("Type is not JSON serializable: Timestamp") even though
+    # trace x= arrays accept them fine -- ISO date strings are safe
+    # everywhere, so every date used outside a trace's own x= array goes
+    # through this conversion.
+    last_date_str = hist.index[-1].strftime("%Y-%m-%d")
+    forecast_end_str = (hist.index[-1] + pd.Timedelta(days=365)).strftime("%Y-%m-%d")
+    hist_start_str = hist.index[0].strftime("%Y-%m-%d")
 
-    low_val = next((x for n, x, _ in points if n == "Low"), None)
-    high_val = next((x for n, x, _ in points if n == "High"), None)
-    if low_val is not None and high_val is not None:
-        fig.add_trace(go.Scatter(x=[low_val, high_val], y=[0, 0], mode="lines",
-                                  line=dict(color=TEXT_MUTED, width=6), hoverinfo="skip", showlegend=False))
+    hist_x = hist.index.strftime("%Y-%m-%d").tolist()
+    fig.add_trace(go.Scatter(
+        x=hist_x, y=hist.values, mode="lines", name="Historical",
+        line=dict(color=ACCENT, width=2), fill="tozeroy", fillcolor="rgba(0,229,255,0.07)",
+        hovertemplate="%{x|%b %d, %Y}: $%{y:,.2f}<extra></extra>", showlegend=False,
+    ))
+    fig.add_trace(go.Scatter(
+        x=[last_date_str], y=[last_close], mode="markers", showlegend=False,
+        marker=dict(color=TEXT_PRIMARY, size=8, line=dict(color=PANEL, width=1.5)),
+        hovertemplate=f"Current: ${last_close:,.2f}<extra></extra>",
+    ))
+    # Full-width reference line so "current" reads as a constant benchmark
+    # against the whole chart, not just a single pivot dot at the
+    # historical/forecast boundary -- makes it immediate to see where each
+    # fan line sits relative to today's price at a glance, including back
+    # across the historical portion.
+    fig.add_hline(y=last_close, line=dict(color=TEXT_PRIMARY, width=1, dash="dash"), opacity=0.35)
 
-    for name, x, color in points:
-        level = level_by_name[name]
-        label_y = 0.35 + level * 0.55
-
+    fan = [("High", high, COLOR_BULLISH), ("Average", mean, ACCENT), ("Low", low, COLOR_BEARISH)]
+    for name, val, color in fan:
+        if val is None or pd.isna(val):
+            continue
+        val = float(val)
+        pct = (val - last_close) / last_close * 100 if last_close else None
         fig.add_trace(go.Scatter(
-            x=[x], y=[0], mode="markers", showlegend=False,
-            marker=dict(color=color, size=15 if name == "Current" else 11,
-                        symbol="diamond" if name == "Current" else "circle",
-                        line=dict(color=PANEL, width=1)),
-            hovertemplate=f"{name}: $%{{x:,.2f}}<extra></extra>",
+            x=[last_date_str, forecast_end_str], y=[last_close, val], mode="lines",
+            line=dict(color=color, width=1.6, dash="dot"), showlegend=False, hoverinfo="skip",
         ))
-        if level > 0:
-            fig.add_trace(go.Scatter(
-                x=[x, x], y=[0.1, label_y - 0.18], mode="lines",
-                line=dict(color=color, width=1, dash="dot"), showlegend=False, hoverinfo="skip",
-            ))
-        fig.add_trace(go.Scatter(
-            x=[x], y=[label_y], mode="text", showlegend=False, hoverinfo="skip",
-            text=[f"{name}<br>${x:,.0f}"], textfont=dict(color=color, size=10),
-        ))
+        # Whole-number percent (not one decimal) specifically to keep this
+        # short enough not to clip against the right edge -- confirmed by
+        # rendering and looking at the actual output: "High $147.39 +139.1%"
+        # was wide enough to get cut off even with a wide right margin.
+        pct_txt = f" {pct:+.0f}%" if pct is not None else ""
+        fig.add_annotation(
+            x=forecast_end_str, y=val, xref="x", yref="y", xanchor="left", yanchor="middle", xshift=8,
+            text=f"<b>{name}</b> ${val:,.2f}{pct_txt}", showarrow=False,
+            font=dict(color=PANEL, size=10), bgcolor=color, bordercolor=color, borderpad=4,
+        )
 
-    fig.update_yaxes(visible=False, range=[-0.6, 0.9 + max_level * 0.55])
-    fig.update_xaxes(title=dict(text="Price target ($)", font=dict(color=TEXT_MUTED)))
-    apply_theme(fig, height=height, margin=dict(l=30, r=30, t=20, b=35), showlegend=False)
+    fig.update_xaxes(range=[hist_start_str, forecast_end_str], showgrid=False)
+    fig.update_yaxes(title=dict(text="Price ($)", font=dict(color=TEXT_MUTED)))
+    apply_theme(fig, height=height, margin=dict(l=45, r=150, t=15, b=35), showlegend=False,
+                hovermode="x unified")
     return fig
 
 
@@ -1342,6 +1366,91 @@ def compute_strike_bias(opt_raw, spot):
 _STATUS_ORDER = ["options_flow", "dark_pool", "congressional", "news", "13f"]
 
 
+def render_news_feeds_section():
+    """SETTINGS tab's 'News Feeds' section (Part 2): every news_sources
+    row with an Enabled toggle and Remove button, plus an Add Feed form
+    with a real Test Feed check (feedparser.parse against the candidate
+    URL) before saving. This is the ONE place feed management happens --
+    the NEWS tab only filters/views by feed name, it never adds/removes
+    (see the 'Manage feeds →' pointer there)."""
+    st.markdown('<div class="smd-section">NEWS FEEDS</div>', unsafe_allow_html=True)
+    st.caption(
+        "Real feed URLs, not publisher names -- add/remove a feed here and it takes effect "
+        "immediately for every ticker's news."
+    )
+    conn_nf = get_conn()
+    sources = _read_news_sources(conn_nf)
+
+    if not sources:
+        st.caption("No news feeds configured.")
+    else:
+        for src in sources:
+            rcol1, rcol2, rcol3, rcol4, rcol5 = st.columns([2, 3.5, 1, 1, 1])
+            rcol1.markdown(f"**{md_safe(src['name'])}**")
+            rcol2.markdown(
+                f'<span style="font-size:11px;color:{TEXT_SECONDARY};word-break:break-all;">'
+                f'{html.escape(src["feed_url"])}</span>',
+                unsafe_allow_html=True,
+            )
+            rcol3.markdown(f'<span style="font-size:11px;">{html.escape(src["url_type"])}</span>',
+                           unsafe_allow_html=True)
+            new_enabled = rcol4.checkbox(
+                "On", value=bool(src["enabled"]), key=f"news_src_enabled_{src['id']}", label_visibility="visible",
+            )
+            if new_enabled != bool(src["enabled"]):
+                set_news_source_enabled(conn_nf, src["id"], new_enabled)
+                st.cache_data.clear()
+                st.rerun()
+            if rcol5.button("Remove", key=f"news_src_remove_{src['id']}"):
+                remove_news_source(conn_nf, src["id"])
+                st.cache_data.clear()
+                st.rerun()
+
+    st.markdown("**Add feed**")
+    acol1, acol2 = st.columns([1, 2])
+    with acol1:
+        new_name = st.text_input("Name", key="news_add_name", placeholder="e.g. Yahoo Finance RSS")
+    with acol2:
+        new_url = st.text_input(
+            "Feed URL", key="news_add_url",
+            placeholder="https://example.com/rss?ticker={ticker}  (use {ticker} if the feed is per-symbol)",
+        )
+    tcol1, tcol2 = st.columns([1, 3])
+    with tcol1:
+        test_clicked = st.button("Test Feed", key="news_add_test", use_container_width=True)
+    if test_clicked:
+        if not new_url.strip():
+            st.warning("Enter a feed URL first.")
+        else:
+            with st.spinner("Testing feed..."):
+                st.session_state["news_test_result"] = test_news_feed(new_url.strip())
+                st.session_state["news_test_url"] = new_url.strip()
+
+    test_result = st.session_state.get("news_test_result")
+    if test_result and st.session_state.get("news_test_url") == new_url.strip():
+        if test_result["ok"]:
+            st.success(f"✅ {test_result['entry_count']} entries found. Preview:")
+            for title in test_result["preview"]:
+                st.caption(f"• {title}")
+        else:
+            st.error(f"❌ Feed test failed: {test_result['error']}")
+
+    if st.button("Save Feed", key="news_add_save"):
+        if not new_name.strip() or not new_url.strip():
+            st.warning("Name and Feed URL are both required.")
+        elif not (test_result and test_result.get("ok") and st.session_state.get("news_test_url") == new_url.strip()):
+            st.warning("Click 'Test Feed' first and confirm it returns real entries before saving.")
+        else:
+            add_news_source(conn_nf, new_name.strip(), new_url.strip(), url_type="rss")
+            st.session_state.pop("news_test_result", None)
+            st.session_state.pop("news_test_url", None)
+            st.cache_data.clear()
+            st.success(f"Saved '{new_name.strip()}'.")
+            st.rerun()
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+
 def render_settings_tab():
     """SETTINGS tab: full source registry (more room than the sidebar ever
     had), watchlist configuration, and a manual recheck-all button. Both
@@ -1399,6 +1508,8 @@ def render_settings_tab():
         })
     st.dataframe(pd.DataFrame(reg_rows), use_container_width=True, hide_index=True)
     st.caption(f"Checked at {registry.get('checked_at', '—')}")
+
+    render_news_feeds_section()
 
     st.markdown('<div class="smd-section">WATCHLIST</div>', unsafe_allow_html=True)
     st.caption(
@@ -1690,8 +1801,7 @@ with tab4:
                     render_gauge(row["dark_pool_pct"], ticker, is_proxy=bool(row["is_proxy"])),
                     use_container_width=True, key=f"dp_gauge_{ticker}",
                 )
-                st.caption(f"Volume z-score: {row['volume_zscore']:.2f} &middot; signal: {row['signal']}",
-                           unsafe_allow_html=True)
+                st.caption(f"Volume z-score: {row['volume_zscore']:.2f} · signal: {row['signal']}")
 
 # --------------------------------------------------------------------------
 # Tab 5 — POLYMARKET
@@ -2022,6 +2132,86 @@ with tab7:
                         st.caption("Institutional")
                         st.markdown(ai_section_or_fallback(ai_brief.get("institutional_analysis")))
 
+                        thirteenf_env = cached_13f_changes(
+                            conn, dd_ticker, max_age_hours=168, force_refresh=fetch_live,
+                        )
+                        thirteenf_filings = thirteenf_env["data"] or []
+                        st.markdown(
+                            f'<div style="margin-top:10px;font-size:11px;font-weight:700;'
+                            f'color:{TEXT_SECONDARY};">13F FILERS</div>', unsafe_allow_html=True,
+                        )
+                        if thirteenf_filings:
+                            for f in thirteenf_filings[:8]:
+                                st.markdown(
+                                    f'<div style="font-size:12px;padding:3px 0;border-bottom:1px solid {BORDER};">'
+                                    f'{html_safe_snippet(f.get("institution") or "Unknown institution")} '
+                                    f'<span style="color:{TEXT_MUTED};font-size:10px;">'
+                                    f'{html.escape(f.get("filing_date") or "")} &middot; '
+                                    f'{html.escape(f.get("form_type") or "")}</span></div>',
+                                    unsafe_allow_html=True,
+                                )
+                        else:
+                            st.caption("No recent 13F-HR filings found mentioning this ticker (SEC EDGAR).")
+
+                        mb_header_col, mb_btn_col = st.columns([2, 1.3])
+                        with mb_header_col:
+                            st.markdown(
+                                f'<div style="margin-top:10px;font-size:11px;font-weight:700;'
+                                f'color:{TEXT_SECONDARY};">MARKETBEAT INSTITUTIONAL</div>',
+                                unsafe_allow_html=True,
+                            )
+                        mb_cached = _read_marketbeat_institutional_cache(conn, dd_ticker)
+                        with mb_btn_col:
+                            if st.button("🏦 Fetch (opens Chrome)", key=f"mb_inst_fetch_{dd_ticker}"):
+                                with st.spinner(
+                                    "Launching a real Chrome window for MarketBeat -- watch for it "
+                                    "to pop up; this can take 10-30s (Cloudflare challenge)...",
+                                ):
+                                    mb_env = cached_marketbeat_institutional_sentiment(
+                                        conn, dd_ticker, force_refresh=True,
+                                    )
+                                mb_cached = mb_env["data"]
+                                if not mb_cached:
+                                    st.warning(
+                                        "Returned nothing -- check the terminal for "
+                                        "[marketbeat_institutional] log lines (ChromeDriver version "
+                                        "mismatch, Cloudflare block, or a page layout change are the "
+                                        "likely causes)."
+                                    )
+                        if mb_cached:
+                            mcol1, mcol2, mcol3 = st.columns(3)
+                            mcol1.metric("Ownership", mb_cached.get("ownership_pct") or "—")
+                            buyers = mb_cached.get("buyers")
+                            sellers = mb_cached.get("sellers")
+                            mcol2.metric(
+                                "Buyers / Sellers",
+                                f"{buyers if buyers is not None else '—'} / {sellers if sellers is not None else '—'}",
+                            )
+                            bias = mb_cached.get("net_flow_bias_pct")
+                            mcol3.metric("Buy bias", f"{bias}%" if bias is not None else "—")
+                            for t in (mb_cached.get("recent_transactions") or [])[:5]:
+                                action = t.get("action")
+                                action_color = (
+                                    COLOR_BULLISH if action == "buy"
+                                    else COLOR_BEARISH if action == "sell" else TEXT_SECONDARY
+                                )
+                                st.markdown(
+                                    f'<div style="font-size:12px;padding:3px 0;border-bottom:1px solid {BORDER};">'
+                                    f'<span style="color:{action_color};">&#9679;</span> '
+                                    f'{html_safe_snippet(t.get("institution") or "—")} '
+                                    f'<span style="color:{TEXT_MUTED};font-size:10px;">'
+                                    f'{html.escape(t.get("date") or "")} &middot; '
+                                    f'{html.escape(t.get("shares") or "—")} shares</span></div>',
+                                    unsafe_allow_html=True,
+                                )
+                        else:
+                            st.caption(
+                                "No MarketBeat institutional data cached for this ticker yet -- click "
+                                "Fetch above. Requires a real, visible desktop Chrome window; only "
+                                "works when this dashboard is running on a machine with an active "
+                                "desktop session, never headless/server."
+                            )
+
                     ai_brief_header("NEWS SUMMARY")
                     st.markdown(ai_section_or_fallback(ai_brief.get("news_summary")))
 
@@ -2132,17 +2322,28 @@ with tab7:
                     st.plotly_chart(render_recommendation_breakdown(rec_counts), use_container_width=True,
                                     key=f"dd_rec_breakdown_{dd_ticker}")
                     st.caption(
-                        f"Breakdown for period {targets.get('rec_period') or '—'} &middot; "
-                        f"{sum(v or 0 for v in rec_counts.values())} analysts", unsafe_allow_html=True,
+                        f"Breakdown for period {targets.get('rec_period') or '—'} · "
+                        f"{sum(v or 0 for v in rec_counts.values())} analysts"
                     )
                 else:
                     st.caption("No data available.")
             with ecol2:
                 st.markdown("**Analyst Price Targets (next 12 months)**")
                 n_analysts_txt = targets.get("numberOfAnalystOpinions")
+                median_val = targets.get("targetMedianPrice")
+                # Literal "·" instead of the &middot; HTML entity -- st.caption's
+                # unsafe_allow_html doesn't decode named entities the way
+                # st.markdown does (confirmed live: it rendered the literal
+                # text "&middot;" instead of "·"), so the entity+flag
+                # combination that works elsewhere via st.markdown doesn't
+                # carry over to st.caption. A real Unicode character sidesteps
+                # the question entirely -- no HTML processing required at all.
+                current_txt = f"Current ${snap['last_price']:,.2f} · " if snap.get("last_price") is not None else ""
+                median_txt = f" · median ${median_val:,.2f}" if median_val is not None else ""
                 st.caption(
-                    f"Aggregated from {n_analysts_txt} analysts via Yahoo Finance."
-                    if n_analysts_txt else "Aggregated via Yahoo Finance (analyst count unavailable)."
+                    f"{current_txt}Aggregated from {n_analysts_txt} analysts via Yahoo Finance{median_txt}."
+                    if n_analysts_txt else
+                    f"{current_txt}Aggregated via Yahoo Finance (analyst count unavailable){median_txt}."
                 )
                 has_targets = any(
                     targets.get(k) is not None
@@ -2150,31 +2351,37 @@ with tab7:
                 )
                 if has_targets:
                     st.plotly_chart(
-                        render_target_range(
-                            snap["last_price"], targets.get("targetLowPrice"),
-                            targets.get("targetMeanPrice"), targets.get("targetMedianPrice"),
-                            targets.get("targetHighPrice"),
+                        render_price_target_fan(
+                            fdd["price_df"], snap["last_price"], targets.get("targetLowPrice"),
+                            targets.get("targetMeanPrice"), targets.get("targetHighPrice"),
                         ),
                         use_container_width=True, key=f"dd_target_range_{dd_ticker}",
                     )
                 else:
                     st.caption("No data available.")
 
-                pt_breakdown = fetch_analyst_price_target_breakdown(dd_ticker)
-                if not pt_breakdown.empty:
-                    st.caption("Individual analyst actions with an attached price target (most recent first):")
-                    show_pt = pt_breakdown.rename(columns={
-                        "GradeDate": "Date", "Firm": "Firm", "Action": "Action",
-                        "ToGrade": "Rating", "currentPriceTarget": "Price Target",
-                    }).copy()
-                    show_pt["Date"] = show_pt["Date"].apply(fmt_date)
-                    show_pt["Price Target"] = show_pt["Price Target"].map(lambda v: f"${v:,.2f}")
-                    st.dataframe(show_pt, use_container_width=True, hide_index=True)
-                else:
-                    st.caption(
-                        "Individual analyst names/targets not available via free tier right now "
-                        "— showing aggregate only."
-                    )
+            # Full width, not squeezed into ecol2 -- a 5-column table reads
+            # far better with the whole panel's width than the ~62% share
+            # it had before, and pulling it out of the two-column layout
+            # is also what fixes ecol1/ecol2's height mismatch (ecol1's
+            # short metrics+chart stack used to finish long before ecol2,
+            # which kept growing with this table, leaving a large empty
+            # gap under ecol1 the whole time).
+            pt_breakdown = fetch_analyst_price_target_breakdown(dd_ticker)
+            if not pt_breakdown.empty:
+                st.caption("Individual analyst actions with an attached price target (most recent first):")
+                show_pt = pt_breakdown.rename(columns={
+                    "GradeDate": "Date", "Firm": "Firm", "Action": "Action",
+                    "ToGrade": "Rating", "currentPriceTarget": "Price Target",
+                }).copy()
+                show_pt["Date"] = show_pt["Date"].apply(fmt_date)
+                show_pt["Price Target"] = show_pt["Price Target"].map(lambda v: f"${v:,.2f}")
+                st.dataframe(show_pt, use_container_width=True, hide_index=True)
+            else:
+                st.caption(
+                    "Individual analyst names/targets not available via free tier right now "
+                    "— showing aggregate only."
+                )
 
             st.markdown("**Earnings History (Last 4 Quarters)**")
             eps_hist = earnings.get("eps_history")
@@ -2408,6 +2615,8 @@ with tab8:
         force_news = st.button("🔄 Refresh feed", use_container_width=True, key="news_feed_refresh")
 
     conn_news = get_conn()
+    st.caption("Feeds are managed in the SETTINGS tab → **News Feeds** (add, remove, enable/disable).")
+
     with st.spinner("Pulling news across the watchlist...") if force_news else nullcontext():
         for t in watchlist:
             cached_news(conn_news, t, limit=8, max_age_hours=2, force_refresh=force_news)
@@ -2426,11 +2635,28 @@ with tab8:
         st.info("No news cached yet for the watchlist. Click '🔄 Refresh feed'.")
     else:
         news_all["published_at"] = pd.to_datetime(news_all["published_at"], utc=True, errors="coerce")
-        publishers = sorted(p for p in news_all["publisher"].dropna().unique() if p)
+        # Filter options are the currently-enabled feed *names* (the
+        # news_sources registry), not article publisher domains -- feed
+        # management (add/remove/enable) lives entirely in SETTINGS, this
+        # is view-only narrowing of what's already been fetched.
+        enabled_feed_names = [s["name"] for s in _read_news_sources(conn_news, enabled_only=True)]
+        feed_options = sorted(set(enabled_feed_names) | set(news_all["source"].dropna().unique()))
 
         fcol1, fcol2, fcol3 = st.columns([2, 1.2, 1.2])
         with fcol1:
-            pub_sel = st.multiselect("Source", publishers, default=publishers, key="news_pub_filter")
+            # st.multiselect only applies `default=` the very first time a
+            # widget with this `key` is ever rendered in a session -- every
+            # add/remove/enable in SETTINGS after that point changes
+            # feed_options but NOT the already-initialized widget, which
+            # keeps whatever was selected back when it first appeared
+            # (confirmed live: adding two new feeds left this stuck
+            # showing 0 headlines despite the underlying data being fine).
+            # Keying on the actual option set forces a fresh widget --
+            # and therefore a fresh, correct default -- exactly when that
+            # set changes, instead of silently going stale.
+            feed_key = "news_feed_filter_" + "_".join(sorted(feed_options))
+            feed_sel = st.multiselect("Feed", feed_options, default=enabled_feed_names or feed_options,
+                                       key=feed_key)
         min_d = news_all["published_at"].min()
         max_d = news_all["published_at"].max()
         with fcol2:
@@ -2443,14 +2669,14 @@ with tab8:
             )
 
         filtered = news_all[
-            news_all["publisher"].isin(pub_sel)
+            news_all["source"].isin(feed_sel)
             & (news_all["published_at"].dt.date >= date_from)
             & (news_all["published_at"].dt.date <= date_to)
         ]
 
         st.caption(
-            f"{len(filtered)} headlines &middot; {len(watchlist)} tickers &middot; "
-            f"chronological, most recent first", unsafe_allow_html=True,
+            f"{len(filtered)} headlines · {len(watchlist)} tickers · "
+            f"chronological, most recent first"
         )
 
         if filtered.empty:
@@ -2458,6 +2684,7 @@ with tab8:
         else:
             for _, n in filtered.iterrows():
                 pub = md_safe(n["publisher"] or "Unknown source")
+                feed_name = md_safe(n["source"] or "—")
                 ago = time_ago(n["published_at"])
                 title = md_safe(n["title"])
                 headline = f"[{title}]({n['link']})" if n["link"] else title
@@ -2466,7 +2693,7 @@ with tab8:
                     <span style="background:{PANEL_ALT};color:{ACCENT};font-size:10px;font-weight:700;
                     padding:2px 8px;border-radius:10px;letter-spacing:0.04em;">{n['ticker']}</span>
                     <div style="margin-top:6px;">{headline}</div>
-                    <div style="color:{TEXT_MUTED};font-size:11px;margin-top:4px;">{pub} &middot; {ago}</div>
+                    <div style="color:{TEXT_MUTED};font-size:11px;margin-top:4px;">{pub} &middot; via {feed_name} &middot; {ago}</div>
                     </div>""",
                     unsafe_allow_html=True,
                 )

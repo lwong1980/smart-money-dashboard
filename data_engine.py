@@ -19,9 +19,11 @@ import html
 import json
 import math
 import os
+import random
 import re
 import sqlite3
 import time
+import urllib.parse
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -89,8 +91,12 @@ DATA_SOURCE_CONFIG = {
     "options_flow": "yfinance",
     "dark_pool": "finra_proxy",
     "congressional": "quiverquant",   # falls back to senate_efd if no API key
-    "news": "yfinance",
     "13f": "sec_edgar_free",
+    # "news" intentionally not here -- it's no longer a single provider
+    # dispatch. News sources are a real, user-editable registry (the
+    # news_sources table, managed from SETTINGS → News Feeds), since
+    # multiple feeds can be enabled/added/removed independently. See
+    # fetch_news()/add_news_source()/remove_news_source().
 }
 
 SEC_HEADERS = {"User-Agent": "SmartMoneyDashboard research@smartmoneydash.local"}
@@ -237,6 +243,20 @@ CREATE TABLE IF NOT EXISTS thirteenf_filings (
     UNIQUE(ticker, cik, accession_no)
 );
 
+CREATE TABLE IF NOT EXISTS marketbeat_institutional (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker TEXT NOT NULL,
+    ownership_pct TEXT,
+    buyers INTEGER,
+    sellers INTEGER,
+    inflows TEXT,
+    outflows TEXT,
+    net_flow_bias_pct INTEGER,
+    transactions_json TEXT,
+    source TEXT,
+    fetched_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS fetch_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ticker TEXT NOT NULL,
@@ -303,6 +323,15 @@ CREATE TABLE IF NOT EXISTS news_cache (
     source TEXT,
     fetched_at TEXT NOT NULL,
     UNIQUE(ticker, link)
+);
+
+CREATE TABLE IF NOT EXISTS news_sources (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    feed_url TEXT NOT NULL,
+    url_type TEXT NOT NULL DEFAULT 'rss',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    added_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS leaps_candidates_cache (
@@ -458,8 +487,30 @@ def init_db(db_path=DEFAULT_DB_PATH):
         conn.executescript(SCHEMA)
         conn.commit()
         _run_migrations(conn)
+        _seed_news_sources(conn)
     finally:
         conn.close()
+
+
+def _seed_news_sources(conn):
+    """One-time seed of news_sources with whatever feed is actually live
+    today -- confirmed by testing directly (feedparser.parse against the
+    real URL returned real, current headlines) rather than assumed. This
+    is the ONLY real news source this app has ever had: previously
+    fetched via yf.Ticker(ticker).news (a Python library call, not a
+    URL), now migrated to the equivalent real RSS URL so it fits the
+    editable feed-registry model. No-op once the table has any row (the
+    user may have since removed this default feed entirely -- that's a
+    valid state, not something to re-seed back in)."""
+    if conn.execute("SELECT COUNT(*) FROM news_sources").fetchone()[0] > 0:
+        return
+    conn.execute(
+        """INSERT INTO news_sources (name, feed_url, url_type, enabled, added_at)
+           VALUES (?,?,?,?,?)""",
+        ("Yahoo Finance RSS", "https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=US&lang=en-US",
+         "rss", 1, datetime.utcnow().isoformat()),
+    )
+    conn.commit()
 
 
 def get_connection(db_path=DEFAULT_DB_PATH):
@@ -2790,63 +2841,194 @@ def cached_buybacks(conn, ticker, max_age_hours=168, force_refresh=False):
 
 
 # --------------------------------------------------------------------------
-# fetch_news(ticker, limit=8) -> DataFrame[ticker, title, publisher, link,
-# published_at, source]. Source-agnostic: dispatches on
-# DATA_SOURCE_CONFIG["news"].
+# News source management -- news_sources is a real, user-editable registry
+# of feed URLs (SETTINGS tab's "News Feeds" section), not a hardcoded
+# single dispatch like every other DATA_SOURCE_CONFIG-driven fetcher. This
+# replaced the previous single yfinance-library-based implementation
+# (yf.Ticker(ticker).news) entirely -- that was a Python library call, not
+# a URL, so it couldn't be represented, tested, or removed the way a
+# registry row can be. _seed_news_sources() migrates that to the
+# equivalent real Yahoo RSS URL (confirmed live) as the one default row.
 # --------------------------------------------------------------------------
 
-def fetch_news(ticker, limit=8):
-    source = DATA_SOURCE_CONFIG.get("news", "yfinance")
-    if source == "yfinance":
-        return _fetch_news_yfinance(ticker, limit=limit)
-    raise NotImplementedError(
-        f"news source '{source}' is not implemented. "
-        "Intended: e.g. NewsAPI.org GET /v2/everything?q={ticker}&apiKey=..."
+def _read_news_sources(conn, enabled_only=False):
+    query = "SELECT id, name, feed_url, url_type, enabled, added_at FROM news_sources"
+    if enabled_only:
+        query += " WHERE enabled=1"
+    query += " ORDER BY id ASC"
+    rows = conn.execute(query).fetchall()
+    keys = ["id", "name", "feed_url", "url_type", "enabled", "added_at"]
+    return [dict(zip(keys, r)) for r in rows]
+
+
+def add_news_source(conn, name, feed_url, url_type="rss"):
+    conn.execute(
+        "INSERT INTO news_sources (name, feed_url, url_type, enabled, added_at) VALUES (?,?,?,1,?)",
+        (name.strip(), feed_url.strip(), url_type, datetime.utcnow().isoformat()),
     )
+    conn.commit()
 
 
-def _fetch_news_yfinance(ticker, limit=8):
-    t = yf.Ticker(ticker)
+def remove_news_source(conn, source_id):
+    """Deletes the row entirely -- per Part 2's spec, removal is real
+    removal (stops being fetched immediately), not a soft hide."""
+    conn.execute("DELETE FROM news_sources WHERE id=?", (source_id,))
+    conn.commit()
+
+
+def set_news_source_enabled(conn, source_id, enabled):
+    conn.execute("UPDATE news_sources SET enabled=? WHERE id=?", (1 if enabled else 0, source_id))
+    conn.commit()
+
+
+def test_news_feed(url):
+    """Real feedparser.parse(url) test for the SETTINGS 'Test Feed' button
+    -- called on a raw candidate URL (not yet saved), so a {ticker}
+    placeholder is substituted with a real, liquid ticker (SPY) purely so
+    the test fetch has something concrete to request; the placeholder
+    itself is preserved in the saved feed_url. Returns {"ok", "entry_count",
+    "preview" (first 3 titles), "error"} -- ok is False on zero entries or
+    a parse error, never silently treated as success."""
+    test_url = url.replace("{ticker}", "SPY")
     try:
-        raw = t.news or []
+        parsed = feedparser.parse(test_url)
+    except Exception as e:
+        return {"ok": False, "entry_count": 0, "preview": [], "error": str(e)}
+    if parsed.bozo and not parsed.entries:
+        err = str(parsed.get("bozo_exception") or "feed did not parse (malformed XML or non-feed response)")
+        return {"ok": False, "entry_count": 0, "preview": [], "error": err}
+    if not parsed.entries:
+        return {"ok": False, "entry_count": 0, "preview": [], "error": "feed parsed but returned zero entries"}
+    preview = [e.get("title") for e in parsed.entries[:3] if e.get("title")]
+    return {"ok": True, "entry_count": len(parsed.entries), "preview": preview, "error": None}
+
+
+def _derive_publisher_from_link(link):
+    """The per-article 'who actually wrote this' attribution -- RSS
+    entries from this feed carry no clean publisher field of their own
+    (confirmed: Yahoo's feed entries have no author/source field), but the
+    link's domain is a real, derived (not fabricated) signal for it."""
+    if not link:
+        return None
+    try:
+        netloc = urllib.parse.urlparse(link).netloc
+        return netloc[4:] if netloc.startswith("www.") else netloc or None
     except Exception:
-        raw = []
+        return None
+
+
+def _ticker_relevance_pattern(symbol):
+    """Whole-word ticker match, optional leading '$', bounded by non-
+    alphanumeric characters or string start/end -- so a short symbol like
+    'MU' doesn't match as a bare substring inside ordinary words ('Promising
+    MUsic Stocks', 'Community Bancorp'), confirmed as a real false-positive
+    against a live general feed (MarketBeat's headlines RSS). Same
+    convention already used for Reddit ticker matching in
+    smartmoneydashboard/src/server/sentiment.ts's tickerPattern()."""
+    return re.compile(rf"(?:^|[^A-Za-z0-9])\$?{re.escape(symbol)}(?:[^A-Za-z0-9]|$)", re.IGNORECASE)
+
+
+def _fetch_news_from_feed_row(feed, ticker, limit):
+    """Fetches one news_sources row's feed and returns a list of item
+    dicts. A '{ticker}' placeholder in feed_url makes this feed
+    ticker-parameterizable (a fresh, ticker-scoped fetch every call);
+    without one, it's a general feed fetched as-is (see fetch_news for how
+    ticker-relevance is applied to those). url_type='scrape' isn't
+    implemented yet -- no real scrape-based news source exists in this
+    app currently -- so it's logged and skipped rather than guessed at."""
+    is_ticker_feed = "{ticker}" in feed["feed_url"]
+    url = feed["feed_url"].format(ticker=ticker) if is_ticker_feed else feed["feed_url"]
+
+    if feed["url_type"] == "scrape":
+        print(f"[news] '{feed['name']}' is url_type=scrape, not implemented -- skipped")
+        return [], is_ticker_feed
+    if feed["url_type"] != "rss":
+        print(f"[news] '{feed['name']}' has unknown url_type={feed['url_type']!r} -- skipped")
+        return [], is_ticker_feed
+
+    try:
+        parsed = feedparser.parse(url)
+    except Exception as e:
+        print(f"[news] '{feed['name']}' fetch failed: {e}")
+        return [], is_ticker_feed
+
+    # `limit` truncates BEFORE ticker-relevance filtering is applied (see
+    # fetch_news), which is only correct for a ticker-parameterized feed --
+    # every entry there is already about that ticker, so keeping just the
+    # newest `limit` is right. For a general feed, the ticker-relevant
+    # entries are sparse and scattered through the whole feed (confirmed
+    # live: a real DUOL headline sat at index 74 of 250 on MarketBeat's
+    # feed) -- truncating to the first 8 before filtering meant a genuinely
+    # matching headline almost never got the chance to be seen at all.
+    # General feeds scan every entry; fetch_news truncates the final
+    # ticker-relevant results to `limit` afterward instead.
+    candidate_entries = parsed.entries[:limit] if is_ticker_feed else parsed.entries
 
     items = []
-    for entry in raw[:limit]:
-        # yfinance has nested news payloads under "content" in newer releases;
-        # fall back to the flat top-level schema from older ones.
-        content = entry.get("content") if isinstance(entry.get("content"), dict) else entry
-
-        title = content.get("title") or entry.get("title")
+    for entry in candidate_entries:
+        title = entry.get("title")
         if not title:
             continue
-
-        provider = content.get("provider")
-        publisher = provider.get("displayName") if isinstance(provider, dict) else entry.get("publisher")
-
-        canonical = content.get("canonicalUrl")
-        link = canonical.get("url") if isinstance(canonical, dict) else entry.get("link")
-
-        pub_raw = content.get("pubDate", entry.get("providerPublishTime"))
-        published_at = None
-        if isinstance(pub_raw, str):
-            published_at = pd.to_datetime(pub_raw, utc=True, errors="coerce")
-        elif isinstance(pub_raw, (int, float)):
-            published_at = pd.to_datetime(pub_raw, unit="s", utc=True, errors="coerce")
-
+        link = entry.get("link")
+        pub_struct = entry.get("published_parsed")
+        published_at = (
+            pd.Timestamp(*pub_struct[:6], tz="UTC") if pub_struct else
+            pd.to_datetime(entry.get("published"), utc=True, errors="coerce")
+        )
         items.append({
-            "ticker": ticker, "title": title, "publisher": publisher,
-            "link": link, "published_at": published_at, "source": "yfinance",
+            "title": title, "publisher": _derive_publisher_from_link(link),
+            "link": link, "published_at": published_at, "source": feed["name"],
         })
+    return items, is_ticker_feed
 
-    df = pd.DataFrame(items)
+
+def fetch_news(ticker, conn, limit=8):
+    """Pulls from every enabled news_sources feed (SETTINGS-managed
+    registry), combines and dedupes by normalized title, and returns a
+    DataFrame[ticker, title, publisher, link, published_at, source] --
+    same shape callers already expect. Ticker-parameterizable feeds
+    (feed_url contains '{ticker}') are always included; general feeds
+    (no placeholder) are included only for headlines whose title actually
+    mentions the ticker symbol, since a general market feed fetched for
+    every watchlist ticker would otherwise flood each ticker's per-ticker
+    view with irrelevant headlines. Fails soft per-feed (one broken feed
+    doesn't drop the others)."""
+    feeds = _read_news_sources(conn, enabled_only=True)
+    all_items = []
+    for feed in feeds:
+        items, is_ticker_feed = _fetch_news_from_feed_row(feed, ticker, limit)
+        if not is_ticker_feed:
+            pattern = _ticker_relevance_pattern(ticker)
+            items = [it for it in items if pattern.search(it["title"])]
+        all_items.extend(items)
+
+    seen_titles = set()
+    deduped = []
+    for it in all_items:
+        key = re.sub(r"\s+", " ", it["title"].strip().lower())
+        if key in seen_titles:
+            continue
+        seen_titles.add(key)
+        deduped.append({**it, "ticker": ticker})
+
+    df = pd.DataFrame(deduped)
     if not df.empty:
-        df = df.sort_values("published_at", ascending=False, na_position="last").reset_index(drop=True)
+        df = df.sort_values("published_at", ascending=False, na_position="last").head(limit).reset_index(drop=True)
     return df
 
 
 def _persist_news(conn, ticker, df):
+    """UPSERT, not INSERT OR IGNORE: a (ticker, link) pair that already
+    exists gets its source/title/publisher refreshed instead of silently
+    staying frozen forever. INSERT OR IGNORE was the bug behind a real
+    incident -- migrating the news source-tagging convention (source=
+    "yfinance" -> the feed's real registry name, e.g. "Yahoo Finance RSS")
+    left every already-cached article stuck under the old tag, since the
+    exact same article link recurring on a later fetch just got silently
+    skipped rather than updated. Since news_sources.name is user-editable
+    (rename a feed, or two different rows briefly resolve to the same
+    URL), the tag genuinely can change out from under an existing
+    cached link, and it should stick."""
     if df is None or df.empty:
         return
     cur = conn.cursor()
@@ -2857,8 +3039,12 @@ def _persist_news(conn, ticker, df):
         published_at = row.get("published_at")
         published_iso = published_at.isoformat() if pd.notna(published_at) else None
         cur.execute(
-            """INSERT OR IGNORE INTO news_cache (ticker, title, publisher, link, published_at, source, fetched_at)
-               VALUES (?,?,?,?,?,?,?)""",
+            """INSERT INTO news_cache (ticker, title, publisher, link, published_at, source, fetched_at)
+               VALUES (?,?,?,?,?,?,?)
+               ON CONFLICT(ticker, link) DO UPDATE SET
+                   title=excluded.title, publisher=excluded.publisher,
+                   published_at=excluded.published_at, source=excluded.source,
+                   fetched_at=excluded.fetched_at""",
             (ticker, row.get("title"), row.get("publisher"), link, published_iso, row.get("source"),
              datetime.utcnow().isoformat()),
         )
@@ -2893,7 +3079,7 @@ def cached_news(conn, ticker, limit=8, max_age_hours=2, force_refresh=False):
                     "fetched_at": _last_fetch_info(conn, table, ticker)}
     try:
         last_ts = get_last_timestamp(conn, table, ticker, "published_at")
-        df = fetch_news(ticker, limit=limit)
+        df = fetch_news(ticker, conn, limit=limit)
         new_count = len(df)
         if last_ts and not df.empty:
             new_count = int((df["published_at"] > pd.Timestamp(last_ts)).sum())
@@ -2903,7 +3089,7 @@ def cached_news(conn, ticker, limit=8, max_age_hours=2, force_refresh=False):
         # headlines still within the requested limit, sorted by publish date.
         merged = _read_news_cache(conn, ticker, limit=limit)
         result_df = merged if not merged.empty else df
-        source = df["source"].iloc[0] if not df.empty else DATA_SOURCE_CONFIG.get("news")
+        source = df["source"].iloc[0] if not df.empty else None
         return {"data": result_df, "source": source, "cache_hit": False, "fetched_at": datetime.utcnow().isoformat()}
     except Exception as e:
         _log_fetch(conn, table, ticker, False, 0, str(e))
@@ -3516,12 +3702,15 @@ def cached_earnings_signal(conn, ticker, max_age_hours=12, force_refresh=False):
 # this section fails soft (never raises) so a blocked/changed scrape
 # degrades one section of a briefing instead of crashing it.
 #
-# ~/trading/marketbeat_scraper.py (imported by new_top.py, not ported) is a
-# separate Selenium/undetected-chromedriver institutional scraper --
-# currently broken in this environment (ChromeDriver/Chrome version
-# mismatch). It is treated as degraded/unavailable; nothing here depends on
-# it. get_marketbeat_analyst_sentiment_structured, ported above, is a
-# plain-requests scrape defined directly in new_top.py and does not need it.
+# ~/trading/marketbeat_scraper.py's institutional-ownership half (Selenium/
+# undetected-chromedriver, real-Chrome-window-required) is now ported too
+# -- see fetch_marketbeat_institutional_sentiment() further down this file,
+# next to _fetch_marketbeat_earnings_history. It's the one deliberate
+# exception to this section's "every fetcher is a plain request" rule,
+# isolated for that reason; see its own module comment for why.
+# get_marketbeat_analyst_sentiment_structured, ported above as
+# _fetch_marketbeat_earnings_history, is a plain-requests scrape and never
+# needed the browser.
 # --------------------------------------------------------------------------
 
 def _earnings_dates_from_history_table(earnings_table, count=6):
@@ -3576,6 +3765,377 @@ def _fetch_marketbeat_earnings_history(ticker):
         except requests.RequestException:
             continue
     return []
+
+
+# --------------------------------------------------------------------------
+# MarketBeat institutional ownership -- Selenium/undetected-chromedriver,
+# ported from ~/trading/marketbeat_scraper.py's get_marketbeat_institutional_
+# sentiment. Unlike every other fetcher in this file, this one needs a REAL,
+# VISIBLE (non-headless -- Cloudflare blocks headless Chrome, confirmed by
+# the reference script's own comments) browser window to work at all. That
+# means: (1) it only works when this app is running on a machine with an
+# actual desktop session, never a headless server/cloud deployment, and
+# (2) calling it pops open a visible Chrome window on that machine. This is
+# a deliberate, isolated exception to every other source's plain-requests/
+# yfinance design -- kept opt-in (only called from the deep-dive tab's
+# explicit "Fetch live signals" flow, never from full_refresh's watchlist
+# sweep) for exactly that reason.
+#
+# The reference script's ChromeDriver-version-mismatch bug started as a
+# single hardcoded line -- `uc.Chrome(options=options, version_main=145)`
+# -- pinning ChromeDriver to Chrome 145 forever, breaking the moment the
+# real installed Chrome auto-updated past that. The first fix attempt
+# (drop version_main entirely) turned out to be based on a wrong
+# assumption: verified directly against this installed library version's
+# source (patcher.py's fetch_release_number) that a falsy version_main
+# does NOT auto-match the installed browser -- it fetches whatever Chrome-
+# for-Testing's LATEST STABLE release is overall, no reference to the
+# actually-installed browser at all. That's why the mismatch reappeared
+# with a *different* pair of numbers (driver 152 vs. installed Chrome
+# 150) even after removing the pin. The real fix:
+# _detect_installed_chrome_major_version() below actually runs
+# `<chrome binary> --version` and passes the real result as version_main
+# explicitly, every launch -- so it self-heals across Chrome auto-updates
+# instead of drifting stale (the 145 pin) or drifting ahead (the "no pin"
+# non-fix).
+#
+# selenium/undetected-chromedriver are imported lazily inside these
+# functions, not at module load, so the rest of the app works fine on a
+# machine without them installed (or without a real Chrome browser).
+# --------------------------------------------------------------------------
+
+_marketbeat_uc_driver = None
+
+
+def _wait_for_marketbeat_real_page(driver, timeout=20):
+    """Waits for document.readyState=='complete' and for the page title to
+    stop looking like a Cloudflare interstitial ('Just a moment...') --
+    ported verbatim from the reference script's _wait_for_real_page."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            ready = driver.execute_script("return document.readyState")
+            title = (driver.title or "").strip().lower()
+            is_cf = title in ("just a moment...", "just a moment", "", "attention required")
+            if ready == "complete" and not is_cf:
+                time.sleep(random.uniform(0.5, 1.0))
+                return
+        except Exception:
+            pass
+        time.sleep(0.8)
+
+
+def _detect_installed_chrome_major_version():
+    """Real detected major version of the locally installed Chrome, via
+    `<binary> --version` -- NOT auto-detected by undetected-chromedriver
+    itself despite the library's own docs implying version_main=None
+    means "auto". Verified directly against this version's source
+    (patcher.py's fetch_release_number): when version_main is falsy, it
+    fetches whatever Chrome-for-Testing's LATEST STABLE release is
+    overall, with no reference to the actually-installed browser at all --
+    which is exactly how the original ChromeDriver-mismatch bug
+    reappeared even after removing the version_main=145 pin (it started
+    grabbing 152 while the real installed Chrome was 150). Returns None
+    if detection fails, so the caller can fall back to leaving version_main
+    unset rather than crashing."""
+    import subprocess
+    import undetected_chromedriver as uc
+    try:
+        binary = uc.find_chrome_executable()
+        if not binary:
+            return None
+        out = subprocess.run([binary, "--version"], capture_output=True, text=True, timeout=10).stdout
+        match = re.search(r"(\d+)\.\d+\.\d+\.\d+", out)
+        return int(match.group(1)) if match else None
+    except Exception:
+        return None
+
+
+def _get_marketbeat_uc_driver(first_url):
+    """Lazily launches (or reuses) a real, visible Chrome window via
+    undetected-chromedriver, pinned to the REAL detected installed Chrome
+    major version (see _detect_installed_chrome_major_version -- omitting
+    version_main does NOT auto-match the installed browser in this
+    library version, contrary to what its own docstring implies). Reused
+    across multiple tickers in one session rather than relaunched (and
+    re-passing Cloudflare's challenge) on every call;
+    close_marketbeat_driver() closes it explicitly if needed."""
+    global _marketbeat_uc_driver
+    import undetected_chromedriver as uc
+    if _marketbeat_uc_driver is None:
+        options = uc.ChromeOptions()
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--window-size=1280,900")
+        options.add_argument("--lang=en-US")
+        options.add_argument("--log-level=3")
+        version_main = _detect_installed_chrome_major_version()
+        _marketbeat_uc_driver = uc.Chrome(options=options, version_main=version_main)
+        _marketbeat_uc_driver.set_page_load_timeout(60)
+        _marketbeat_uc_driver.get(first_url)
+        _wait_for_marketbeat_real_page(_marketbeat_uc_driver, timeout=45)
+    return _marketbeat_uc_driver
+
+
+def close_marketbeat_driver():
+    """Closes the shared Chrome window, if one is open. Not called
+    automatically anywhere in this app -- the driver is meant to persist
+    across calls within a session (see _get_marketbeat_uc_driver)."""
+    global _marketbeat_uc_driver
+    if _marketbeat_uc_driver is not None:
+        try:
+            _marketbeat_uc_driver.quit()
+        except Exception:
+            pass
+        _marketbeat_uc_driver = None
+
+
+_CHROMEDRIVER_VERSION_MISMATCH_RE = re.compile(
+    r"only supports Chrome version (\d+).*Current browser version is ([\d.]+)", re.IGNORECASE | re.DOTALL,
+)
+
+
+def _parse_marketbeat_institutional_page(soup, ticker):
+    """Pure HTML-parsing half of fetch_marketbeat_institutional_sentiment --
+    split out so the scraping logic is testable against a saved page
+    without a real browser.
+
+    The summary-stats section is NOT the reference script's card-scraping
+    heuristic (div.col-* text blobs) -- confirmed against a real saved
+    MarketBeat institutional-ownership page that MarketBeat has since
+    redesigned this section into a plain <dt class="stat-summary-title">/
+    <dd class="stat-summary-heading"> label/value definition-list pair,
+    which the old heuristic never matched (hence ownership_pct/buyers/
+    sellers/inflows/outflows always coming back null). This reads that
+    real, current structure directly. The transactions table extraction
+    below it was verified against the same saved page and is unchanged."""
+    summary = {}
+    label_key_map = [
+        (("OWNERSHIP", "PERCENTAGE"), "ownership_pct"),
+        (("BUYERS",), "buyers"),
+        (("SELLERS",), "sellers"),
+        (("INFLOWS",), "inflows"),
+        (("OUTFLOWS",), "outflows"),
+    ]
+    for dt in soup.find_all("dt", class_="stat-summary-title"):
+        dd = dt.find_next_sibling("dd")
+        if not dd:
+            continue
+        label_upper = dt.get_text(" ", strip=True).upper()
+        value = dd.get_text(strip=True)
+        for keywords, key in label_key_map:
+            if all(k in label_upper for k in keywords) and key not in summary:
+                summary[key] = value
+                break
+
+    # Fallback for a layout MarketBeat might revert to or vary by page --
+    # the reference script's original div.col-* card-text heuristic.
+    if not summary:
+        for card in soup.find_all("div", class_=lambda c: c and "col-" in " ".join(c) if c else False):
+            text = card.get_text(" ", strip=True)
+            for label, key in [
+                ("INSTITUTIONAL OWNERSHIP", "ownership_pct"), ("INSTITUTIONAL BUYERS", "buyers"),
+                ("INSTITUTIONAL SELLERS", "sellers"), ("INSTITUTIONAL INFLOWS", "inflows"),
+                ("INSTITUTIONAL OUTFLOWS", "outflows"),
+            ]:
+                if label in text.upper():
+                    for line in [ln.strip() for ln in text.split("\n") if ln.strip()]:
+                        if any(c.isdigit() for c in line) and line not in summary.values():
+                            summary[key] = line
+                            break
+
+    inst_table = None
+    for t in soup.find_all("table"):
+        hdrs = " ".join(th.get_text(strip=True).lower() for th in t.find_all("th"))
+        if "institution" in hdrs or ("date" in hdrs and "share" in hdrs):
+            inst_table = t
+            break
+
+    transactions = []
+    if inst_table is not None:
+        hdrs = [th.get_text(strip=True) for th in inst_table.find_all("th")]
+
+        def col_idx(keywords):
+            for i, h in enumerate(hdrs):
+                if any(k.lower() in h.lower() for k in keywords):
+                    return i
+            return None
+
+        # Keywords chosen against MarketBeat's real confirmed header set
+        # ('Reporting Date', 'Major Shareholder Name', 'Shares Held',
+        # 'Market Value', '% of Portfolio', 'Quarterly Change in Shares',
+        # 'Ownership in Company', 'Details') -- a bare "Share" or "Owner"
+        # substring-matches the WRONG column ("Major SHAREholder Name" and
+        # "OWNERship in Company" respectively), which is exactly the bug
+        # that put institution names in the shares field and percentages
+        # in the institution field. Longer, more specific phrases first.
+        i_date = col_idx(["Reporting Date", "Date"])
+        i_inst = col_idx(["Shareholder Name", "Shareholder", "Institution", "Investor Name", "Fund Name"])
+        i_shares = col_idx(["Shares Held", "Position"])
+        i_val = col_idx(["Market Value", "Value"])
+        i_change = col_idx(["Quarterly Change", "Change in Shares", "Activity", "Action", "Type"])
+
+        for row in inst_table.find_all("tr")[1:11]:
+            cols = row.find_all("td")
+            if len(cols) < 2:
+                continue
+            date = (cols[i_date].get_text(strip=True) if i_date is not None and i_date < len(cols)
+                    else cols[0].get_text(strip=True))
+            inst = (cols[i_inst].get_text(strip=True) if i_inst is not None and i_inst < len(cols)
+                    else (cols[1].get_text(strip=True) if len(cols) > 1 else None))
+            shares = cols[i_shares].get_text(strip=True) if i_shares is not None and i_shares < len(cols) else None
+            value = cols[i_val].get_text(strip=True) if i_val is not None and i_val < len(cols) else None
+            change_text = (cols[i_change].get_text(strip=True)
+                           if i_change is not None and i_change < len(cols) else "")
+            # Prefer a real signed number ("+12,340" / "-8,200") from the
+            # Quarterly Change column when present -- more precise than
+            # keyword-guessing; falls back to keyword matching (covers
+            # phrasing like "New Position" / "Sold Out") when it's not a
+            # parseable number (e.g. "N/A").
+            numeric_change = re.sub(r"[,\s]", "", change_text)
+            if re.fullmatch(r"[+-]?\d+", numeric_change):
+                action = "buy" if not numeric_change.startswith("-") and numeric_change != "0" else (
+                    "sell" if numeric_change.startswith("-") else "unknown"
+                )
+            else:
+                combined = (change_text + (shares or "")).lower()
+                if any(w in combined for w in ["buy", "bought", "new", "incr", "added"]):
+                    action = "buy"
+                elif any(w in combined for w in ["sell", "sold", "exit", "reduc", "decr"]):
+                    action = "sell"
+                else:
+                    action = "unknown"
+            transactions.append({"date": date, "institution": inst, "shares": shares, "value": value,
+                                  "action": action})
+
+    buyers = sellers = None
+    try:
+        if summary.get("buyers"):
+            buyers = int(summary["buyers"].replace(",", ""))
+        if summary.get("sellers"):
+            sellers = int(summary["sellers"].replace(",", ""))
+    except ValueError:
+        pass
+    net_flow_bias_pct = (
+        round(buyers / (buyers + sellers) * 100)
+        if buyers is not None and sellers is not None and (buyers + sellers) > 0 else None
+    )
+
+    if not summary and not transactions:
+        return None
+
+    return {
+        "ticker": ticker, "ownership_pct": summary.get("ownership_pct"), "buyers": buyers, "sellers": sellers,
+        "inflows": summary.get("inflows"), "outflows": summary.get("outflows"),
+        "net_flow_bias_pct": net_flow_bias_pct, "recent_transactions": transactions,
+        "source": "marketbeat_institutional",
+    }
+
+
+def fetch_marketbeat_institutional_sentiment(ticker):
+    """Real institutional-ownership data scraped from MarketBeat -- see the
+    module comment above for the real-Chrome-window requirement and the
+    ChromeDriver-version-mismatch fix. Tries the NASDAQ URL path first,
+    then NYSE (same exchange-fallback pattern as
+    _fetch_marketbeat_earnings_history -- this app has no exchange
+    lookup). Fails soft: returns None on any error, with a specific,
+    actionable message logged for the ChromeDriver-version-mismatch case
+    in particular rather than a generic traceback."""
+    try:
+        import undetected_chromedriver as uc  # noqa: F401
+    except ImportError as e:
+        print(f"[marketbeat_institutional] required package not installed ({e}). "
+              f"Run: pip install --upgrade undetected-chromedriver selenium")
+        return None
+
+    ticker = ticker.upper()
+    for exchange in ("NASDAQ", "NYSE"):
+        url = f"https://www.marketbeat.com/stocks/{exchange}/{ticker}/institutional-ownership/"
+        try:
+            driver = _get_marketbeat_uc_driver(url)
+            if driver.current_url.rstrip("/") != url.rstrip("/"):
+                time.sleep(2)
+                driver.set_page_load_timeout(60)
+                driver.get(url)
+                _wait_for_marketbeat_real_page(driver, timeout=45)
+            soup = BeautifulSoup(driver.page_source, "html.parser")
+        except Exception as e:
+            msg = str(e)
+            match = _CHROMEDRIVER_VERSION_MISMATCH_RE.search(msg)
+            if match:
+                print(f"[marketbeat_institutional] ChromeDriver version mismatch (driver supports "
+                      f"Chrome {match.group(1)}, installed Chrome is {match.group(2)}) -- run: "
+                      f"pip install --upgrade undetected-chromedriver")
+            else:
+                print(f"[marketbeat_institutional] fetch failed for {ticker} ({exchange}): {e}")
+            close_marketbeat_driver()  # a broken/crashed driver shouldn't be reused
+            return None
+
+        result = _parse_marketbeat_institutional_page(soup, ticker)
+        if result:
+            return result
+    return None
+
+
+def _persist_marketbeat_institutional(conn, ticker, record):
+    if not record:
+        return
+    conn.execute(
+        """INSERT INTO marketbeat_institutional
+               (ticker, ownership_pct, buyers, sellers, inflows, outflows, net_flow_bias_pct,
+                transactions_json, source, fetched_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+        (ticker, record.get("ownership_pct"), record.get("buyers"), record.get("sellers"),
+         record.get("inflows"), record.get("outflows"), record.get("net_flow_bias_pct"),
+         json.dumps(record.get("recent_transactions") or []), record.get("source"),
+         datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+
+
+def _read_marketbeat_institutional_cache(conn, ticker):
+    row = conn.execute(
+        """SELECT ownership_pct, buyers, sellers, inflows, outflows, net_flow_bias_pct,
+                  transactions_json, source
+           FROM marketbeat_institutional WHERE ticker=? ORDER BY fetched_at DESC LIMIT 1""",
+        (ticker,),
+    ).fetchone()
+    if not row:
+        return None
+    return {
+        "ticker": ticker, "ownership_pct": row[0], "buyers": row[1], "sellers": row[2],
+        "inflows": row[3], "outflows": row[4], "net_flow_bias_pct": row[5],
+        "recent_transactions": json.loads(row[6]) if row[6] else [], "source": row[7],
+    }
+
+
+def cached_marketbeat_institutional_sentiment(conn, ticker, max_age_hours=24, force_refresh=False):
+    """Same cached_*(conn, ticker, max_age_hours, force_refresh) envelope
+    shape as every other fetcher, but the underlying fetch pops open a
+    real, visible Chrome window (see fetch_marketbeat_institutional_
+    sentiment's module comment) -- the 24h default window (vs. e.g.
+    options_flow's 15min) is deliberately long so that window doesn't pop
+    up on every rerun; force_refresh (wired to the deep-dive tab's
+    explicit "Fetch live signals" button, never full_refresh) is the only
+    thing that should trigger it on demand."""
+    table = "marketbeat_institutional"
+    if not force_refresh and not should_refetch(conn, table, ticker, max_age_hours):
+        cached = _read_marketbeat_institutional_cache(conn, ticker)
+        if cached:
+            return {"data": cached, "source": cached["source"], "cache_hit": True,
+                    "fetched_at": _last_fetch_info(conn, table, ticker)}
+    try:
+        record = fetch_marketbeat_institutional_sentiment(ticker)
+        _persist_marketbeat_institutional(conn, ticker, record)
+        _log_fetch(conn, table, ticker, True, 1 if record else 0)
+        cached = record or _read_marketbeat_institutional_cache(conn, ticker)
+        return {"data": cached, "source": cached["source"] if cached else None, "cache_hit": False,
+                "fetched_at": datetime.utcnow().isoformat()}
+    except Exception as e:
+        _log_fetch(conn, table, ticker, False, 0, str(e))
+        cached = _read_marketbeat_institutional_cache(conn, ticker)
+        return {"data": cached, "source": cached["source"] if cached else None,
+                "cache_hit": bool(cached), "fetched_at": _last_fetch_info(conn, table, ticker)}
 
 
 def _parse_money_str(s):
@@ -4160,7 +4720,14 @@ _AI_BRIEF_SYSTEM_PROMPT = (
     "technicals, IV-based expected move (1-week and 4-week), options flow grouped into weekly "
     "expiry buckets, analyst targets, a real MarketBeat-sourced earnings track record (each row "
     "matched to the REAL yfinance-measured price reaction), buybacks, congressional trades, "
-    "insider trades (SEC Form 4 and Finviz, each tagged by source), real Reddit/StockTwits "
+    "insider trades (SEC Form 4 and Finviz, each tagged by source), thirteenf_filings (real SEC "
+    "EDGAR full-text-search results for recent 13F-HR filings mentioning this ticker -- each has "
+    "an institution name, filing_date, and form_type; this is 'which institutions recently filed "
+    "a 13F mentioning this name,' not a share-count/position-size diff), marketbeat_institutional "
+    "(real scraped MarketBeat institutional-ownership stats -- ownership_pct, buyers/sellers "
+    "counts, inflows/outflows, net_flow_bias_pct, and recent_transactions -- present only if "
+    "fetched for this ticker before, since it requires a manual browser-based fetch; null/absent "
+    "if not), real Reddit/StockTwits "
     "retail sentiment posts (each tagged by source and timestamp), dark pool signal, a "
     "divergence-score history, recent news headlines with publisher and date, and "
     "technical_levels -- an ALGORITHMICALLY detected (not AI-guessed) set of support/resistance "
@@ -4221,10 +4788,16 @@ _AI_BRIEF_SYSTEM_PROMPT = (
     "retail_sentiment_posts is empty, a single bullet saying 'No retail sentiment data "
     "available' -- do not infer sentiment from price action instead.\n"
     "- institutional_analysis: SHORT BULLET POINTS (markdown '- ' lines), one line per distinct "
-    "fact -- one insider sale, one buyback figure, one analyst-target datapoint -- never fold "
-    "multiple facts into one run-on sentence. Example line: '- CEO William Mosley sold 12,920 "
-    "shares ($10.38M) -- Aug 3 (finviz_scrape)'. Cite source and date on every bullet. State "
-    "explicitly when a category has no data. Max 4-5 bullets, picking the most decision-relevant.\n"
+    "fact -- one insider sale, one buyback figure, one analyst-target datapoint, one 13F filer, "
+    "one marketbeat_institutional stat if present -- never fold multiple facts into one run-on "
+    "sentence. Synthesize across ALL institutional-angle categories in the bundle (insider_trades, "
+    "buybacks, analyst_targets, thirteenf_filings, and marketbeat_institutional when present), not "
+    "just insider trades. Example lines: '- CEO William Mosley sold 12,920 shares ($10.38M) -- "
+    "Aug 3 (finviz_scrape)' and '- Tybourne Capital Management filed a 13F mentioning this ticker "
+    "-- Feb 14, 2026 (sec_edgar_free)'. Cite source and date on every bullet. State explicitly "
+    "when a category has no data -- e.g. if thirteenf_filings is empty, say so rather than "
+    "omitting 13F coverage silently. Max 4-5 bullets, picking the most decision-relevant across "
+    "all these categories combined.\n"
     "- news_summary: 3-4 sentences MAX on the single dominant narrative driving the stock right "
     "now -- not an exhaustive list of every headline's framing.\n"
     "- catalysts: specific, NAMED forward-looking events pulled from the news headlines in the "
@@ -4354,6 +4927,8 @@ def _read_ai_context_from_cache(ticker, conn, technicals=None, technical_levels=
     congress = _read_congressional_cache_by_ticker(conn, ticker, limit=15)
     earnings_track_record_real = _read_earnings_history_real_cache(conn, ticker, limit=6)
     retail_posts = _read_retail_sentiment_cache(conn, ticker, limit=30)
+    thirteenf_filings = _read_13f_cache(conn, ticker, limit=10)
+    marketbeat_institutional = _read_marketbeat_institutional_cache(conn, ticker)
 
     insider_rows = conn.execute(
         """SELECT transaction_date, insider_name, title, transaction_type, shares, value, source
@@ -4416,6 +4991,20 @@ def _read_ai_context_from_cache(ticker, conn, technicals=None, technical_levels=
              "source": r[6] or "sec_form4"}
             for r in insider_rows
         ],
+        # SEC EDGAR full-text search for recent 13F-HR filings mentioning
+        # this ticker -- "who recently filed", not a holdings-size/share-
+        # count diff (see fetch_13f_changes' module docstring). Was fully
+        # built (cached_13f_changes, thirteenf_filings table) but never
+        # actually wired into this bundle until now.
+        "thirteenf_filings": thirteenf_filings,
+        # Pure DB read, never fetched from here -- fetching pops a real,
+        # visible Chrome window (see fetch_marketbeat_institutional_
+        # sentiment's module comment), which a routine "Generate AI
+        # Briefing" click shouldn't silently trigger. Only present if the
+        # deep-dive tab's explicit MarketBeat-institutional fetch button
+        # has been used for this ticker before; None otherwise, and the
+        # prompt is written to handle that gracefully.
+        "marketbeat_institutional": marketbeat_institutional,
         "retail_sentiment_posts": retail_posts,
         "dark_pool": (
             {"date": dark_pool_row[0], "dark_pool_pct": dark_pool_row[1], "volume_zscore": dark_pool_row[2],
@@ -4441,14 +5030,15 @@ def _bundle_ai_context(ticker, conn):
     respecting its own cache window, so repeated briefings within that
     window don't re-scrape) -- MarketBeat earnings history, Finviz insider
     sales, Reddit/StockTwits retail sentiment, earnings_signal (for the IV
-    expected move) -- plus a fresh technical snapshot, then reads
-    everything via _read_ai_context_from_cache. This is the version
-    generate_deep_analysis() uses; it can make real network calls, each
-    fail-soft."""
+    expected move), SEC EDGAR 13F filings -- plus a fresh technical
+    snapshot, then reads everything via _read_ai_context_from_cache. This
+    is the version generate_deep_analysis() uses; it can make real
+    network calls, each fail-soft."""
     cached_earnings_history_real(conn, ticker, max_age_hours=12)
     cached_insider_sales_finviz(conn, ticker, max_age_hours=24)
     cached_retail_sentiment(conn, ticker, max_age_hours=2)
     cached_earnings_signal(conn, ticker, max_age_hours=12)
+    cached_13f_changes(conn, ticker, max_age_hours=168)
     technicals = _fetch_technical_snapshot(ticker)
     # DEFAULT_INTERVAL/DEFAULT_LOOKBACK (1d/6mo) -- the same daily-candle,
     # 6-month swing-horizon window the dashboard shows by default, so the
@@ -4749,6 +5339,33 @@ def _probe_sec_edgar():
         return {"status": "down", "source": "sec_edgar_free", "error": str(e)}
 
 
+def _probe_news_feeds():
+    """News is no longer a single DATA_SOURCE_CONFIG dispatch -- it's a
+    user-editable registry (news_sources). Opens its own short-lived
+    connection (every other probe is self-contained/arg-less, and
+    check_source_health() isn't otherwise passed a conn) to report
+    not_configured with zero enabled feeds, else tests the first enabled
+    feed live (same test_news_feed() used by the SETTINGS 'Test Feed'
+    button) as a representative sample -- a full per-feed probe would
+    defeat the 'lightweight, not a full data pull' point of a health
+    check as feed count grows."""
+    conn = get_connection()
+    try:
+        feeds = _read_news_sources(conn, enabled_only=True)
+    finally:
+        conn.close()
+    if not feeds:
+        return {"status": "not_configured", "source": None,
+                "error": "no enabled feeds in news_sources -- add one in SETTINGS → News Feeds"}
+    primary = feeds[0]
+    result = test_news_feed(primary["feed_url"])
+    if result["ok"]:
+        return {"status": "up", "source": primary["name"],
+                "note": f"{len(feeds)} enabled feed(s); tested '{primary['name']}'"}
+    return {"status": "down", "source": primary["name"], "error": result["error"],
+            "note": f"{len(feeds)} enabled feed(s); tested '{primary['name']}'"}
+
+
 def check_source_health():
     """Tests connectivity to every configured data source with a lightweight
     probe (not a full data pull). Returns a dict keyed by fetcher name, each
@@ -4762,11 +5379,7 @@ def check_source_health():
         results["options_flow"] = {"status": "not_configured", "source": DATA_SOURCE_CONFIG.get("options_flow"),
                                     "error": "no health probe implemented for this source"}
 
-    if DATA_SOURCE_CONFIG.get("news") == "yfinance":
-        results["news"] = _probe_yfinance()
-    else:
-        results["news"] = {"status": "not_configured", "source": DATA_SOURCE_CONFIG.get("news"),
-                            "error": "no health probe implemented for this source"}
+    results["news"] = _probe_news_feeds()
 
     if DATA_SOURCE_CONFIG.get("dark_pool") == "finra_proxy":
         results["dark_pool"] = _probe_finra_proxy()
@@ -4872,6 +5485,44 @@ def _probe_marketbeat():
         return {"status": "down", "source": "marketbeat", "error": f"{e} (scraping -- may be blocked)"}
 
 
+def _probe_marketbeat_institutional():
+    """Deliberately a capability check only, not a live scrape: actually
+    running fetch_marketbeat_institutional_sentiment pops a real, visible
+    Chrome window (Cloudflare blocks headless Chrome), which a health
+    probe shouldn't trigger unprompted -- especially not on every
+    SETTINGS-tab 'Recheck All Sources' click. Checks that the required
+    packages import and a Chrome/Chromium binary exists on this machine,
+    which is everything that CAN be verified without actually launching a
+    session; Cloudflare/page-layout issues can only surface when the
+    source is really used (see its own [marketbeat_institutional] log
+    lines when that happens)."""
+    try:
+        import undetected_chromedriver  # noqa: F401
+        import selenium  # noqa: F401
+    except ImportError as e:
+        return {"status": "not_configured", "source": "marketbeat_institutional",
+                "error": f"required package not installed ({e}). Run: pip install --upgrade "
+                         f"undetected-chromedriver selenium"}
+
+    chrome_paths = [
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/usr/bin/google-chrome", "/usr/bin/google-chrome-stable", "/usr/bin/chromium-browser",
+    ]
+    if not any(os.path.exists(p) for p in chrome_paths):
+        return {"status": "not_configured", "source": "marketbeat_institutional",
+                "error": "no Chrome/Chromium binary found on this machine"}
+
+    return {
+        "status": "degraded", "source": "marketbeat_institutional",
+        "note": ("packages + a Chrome binary are present, but this source only works with a "
+                 "real, visible (non-headless) browser window on an active desktop session -- "
+                 "never in a headless/server deployment -- and this probe doesn't launch a real "
+                 "session to confirm a live scrape actually succeeds (that would pop a browser "
+                 "window during every health check). See ChromeDriver-version-mismatch handling "
+                 "in fetch_marketbeat_institutional_sentiment if a real fetch fails."),
+    }
+
+
 def _probe_finviz():
     t0 = time.time()
     try:
@@ -4911,6 +5562,13 @@ SOURCE_REGISTRY = [
      "env_var": None, "endpoint": f"{SENATE_EFD_BASE}/search/", "probe": _probe_senate_efd},
     {"key": "sec_edgar_free", "purpose": "13F / insider filings", "env_var": None,
      "endpoint": SEC_FULLTEXT_SEARCH_URL, "probe": _probe_sec_edgar},
+    {"key": "13f_edgar", "purpose": "13F institutional filings (AI Briefing institutional_analysis)",
+     "env_var": None, "endpoint": SEC_FULLTEXT_SEARCH_URL,
+     # Same endpoint/probe as sec_edgar_free above (fetch_13f_changes hits
+     # the identical SEC full-text-search URL) -- kept as its own registry
+     # row per Part 4 so this specific AI-Briefing feature has its own
+     # visible status, not just the shared infrastructure-level one.
+     "probe": _probe_sec_edgar},
     {"key": "anthropic", "purpose": "AI briefing", "env_var": "ANTHROPIC_API_KEY",
      "endpoint": "anthropic SDK -> api.anthropic.com/v1/messages (claude-opus-5)", "probe": _probe_anthropic},
     {"key": "reddit", "purpose": "retail sentiment (Reddit)",
@@ -4921,6 +5579,12 @@ SOURCE_REGISTRY = [
      "endpoint": "https://api.stocktwits.com/api/2/streams/symbol/{ticker}.json", "probe": _probe_stocktwits},
     {"key": "marketbeat", "purpose": "earnings history scrape", "env_var": None,
      "endpoint": "https://www.marketbeat.com/stocks/NASDAQ/{ticker}/earnings/", "probe": _probe_marketbeat},
+    {"key": "marketbeat_institutional", "purpose": "institutional ownership % + recent buy/sell (AI Briefing)",
+     "env_var": None,
+     "endpoint": "Selenium/undetected-chromedriver -> https://www.marketbeat.com/stocks/{NASDAQ,NYSE}/"
+                 "{ticker}/institutional-ownership/ -- requires a real, visible desktop browser session, "
+                 "never headless/server",
+     "probe": _probe_marketbeat_institutional},
     {"key": "finviz", "purpose": "insider sales scrape", "env_var": None,
      "endpoint": "https://finviz.com/quote.ashx?t={ticker}", "probe": _probe_finviz},
     {"key": "openai", "purpose": "not currently used (legacy from new_top.py)",

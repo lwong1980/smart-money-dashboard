@@ -9,3 +9,6 @@ feedparser>=6.0
 beautifulsoup4>=4.12  # MarketBeat/Finviz scraping for the AI briefing's real-data sources
 quiverquant>=0.2.6  # optional, paid-tier: only imported when QUIVER_API_KEY is set
 anthropic>=0.122.0  # optional: only used for on-demand AI briefing, requires ANTHROPIC_API_KEY
+selenium>=4.20  # optional: MarketBeat institutional ownership scrape, desktop-only (see data_engine.py)
+undetected-chromedriver>=3.5  # optional, same as above -- auto-detects installed Chrome version
+setuptools  # optional, same as above -- provides the distutils shim undetected-chromedriver needs on Python 3.12+
