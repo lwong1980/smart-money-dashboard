@@ -434,6 +434,18 @@ CREATE TABLE IF NOT EXISTS retail_sentiment_posts (
     UNIQUE(ticker, source, text)
 );
 
+CREATE TABLE IF NOT EXISTS apewisdom_sentiment (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker TEXT NOT NULL,
+    rank INTEGER,
+    mentions INTEGER,
+    upvotes INTEGER,
+    rank_24h_ago INTEGER,
+    mentions_24h_ago INTEGER,
+    source TEXT,
+    fetched_at TEXT NOT NULL
+);
+
 -- Daily OHLCV history, the store that makes delta loading possible for
 -- price data: fetch_price_history_delta() pulls a full period="1y" only
 -- the first time a ticker is seen, then just the days after MAX(date)
@@ -4445,60 +4457,104 @@ def cached_insider_sales_finviz(conn, ticker, max_age_hours=24, force_refresh=Fa
         return {"source": None, "cache_hit": False, "fetched_at": _last_fetch_info(conn, table, ticker)}
 
 
-def _fetch_reddit_posts_devvit(ticker, limit=25):
-    """Real Reddit posts (r/wallstreetbets, r/stocks, r/investing) mentioning
-    `ticker`, via the smartmoneydashboard Devvit app's published
-    /external/sentiment endpoint -- see
-    smartmoneydashboard/src/server/sentiment.ts and devvit.json's
-    server.externalEndpoints.sentiment (scopes: ["global"], a long-lived
-    managed app token per @devvit/external-endpoints' docs). Requires
-    DEVVIT_SENTIMENT_URL (the published app's full external URL, e.g.
-    "https://smartmoneydashboard-<id>-external.devvit.net/external/sentiment")
-    and DEVVIT_APP_TOKEN in the environment. Fails soft -- [] if either is
-    unset or the call errors, so this degrades cleanly until the app is
-    published and the token is minted."""
-    base_url = os.environ.get("DEVVIT_SENTIMENT_URL")
-    app_token = os.environ.get("DEVVIT_APP_TOKEN")
-    if not base_url or not app_token:
-        print(f"[retail_sentiment] Devvit path skipped for {ticker}: "
-              f"DEVVIT_SENTIMENT_URL{'' if base_url else ' (unset)'} / "
-              f"DEVVIT_APP_TOKEN{'' if app_token else ' (unset)'} -- "
-              f"no Reddit sentiment for this ticker until published")
+def fetch_apewisdom_sentiment(ticker):
+    """Real Reddit mention-tracking data from ApeWisdom (apewisdom.io) --
+    no API key required, confirmed live. Replaces the former Devvit-based
+    Reddit path entirely: that app was blocked indefinitely in Reddit's
+    publish-review queue with no ETA (never actually produced data in
+    production), while this is a real, already-working free API.
+
+    ApeWisdom has no per-ticker filter endpoint (confirmed against their
+    real API -- only per-subreddit filters exist, e.g. "all-stocks",
+    returning a ranked list) and no sentiment score field (confirmed
+    against a real response: only rank/mentions/upvotes/24h-deltas exist)
+    -- so this pages through the "all-stocks" ranking (aggregates
+    r/wallstreetbets, r/stocks, r/options, and other finance subreddits)
+    searching for `ticker`, and never fabricates a sentiment field that
+    isn't actually there. Confirmed live: ~8 pages, ~2.3s total for a
+    full scan. Returns None if the ticker isn't currently ranked (zero
+    recent mentions -- a real, common, valid state, not an error) or on
+    any fetch error."""
+    try:
+        page = 1
+        while True:
+            resp = requests.get(f"https://apewisdom.io/api/v1.0/filter/all-stocks/page/{page}", timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            for r in data.get("results", []):
+                if (r.get("ticker") or "").upper() == ticker.upper():
+                    return {
+                        "ticker": ticker, "rank": r.get("rank"), "mentions": r.get("mentions"),
+                        "upvotes": r.get("upvotes"), "rank_24h_ago": r.get("rank_24h_ago"),
+                        "mentions_24h_ago": r.get("mentions_24h_ago"), "source": "apewisdom",
+                    }
+            total_pages = data.get("pages", page)
+            if page >= total_pages or page >= 10:  # 10-page hard cap regardless of what the API reports
+                return None
+            page += 1
+    except (requests.RequestException, ValueError) as e:
+        print(f"[retail_sentiment] ApeWisdom fetch failed for {ticker}: {e}")
+        return None
+
+
+def fetch_quiverquant_wsb(ticker, limit=25):
+    """Real WallStreetBets mention data via QuiverQuant's paid tier --
+    requires QUIVER_API_KEY AND a subscription tier that includes this
+    specific dataset. Confirmed live (2026-08-16): the current key
+    returns {"detail": "Upgrade your subscription plan to access this
+    dataset."} -- a real paid-tier gate, not a bug, so this returns []
+    under the current plan. Hits the raw REST endpoint directly rather
+    than quiverquant.quiver().wallstreetbets(), which has the same
+    missing-raise_for_status() defect as congress_trading() (confirmed
+    live: an upgrade-required response becomes a confusing
+    'ValueError: If using all scalar values, you must pass an index'
+    instead of a clean failure).
+
+    NOT independently verified against a real success response -- no
+    tier that includes this dataset has been available to test against,
+    so the field names below (date/ticker/mentions-shaped) are a
+    reasonable guess based on QuiverQuant's other endpoints' conventions,
+    not confirmed. Revisit and correct field mapping once a real
+    successful response is available to inspect."""
+    api_key = os.environ.get("QUIVER_API_KEY")
+    if not api_key:
         return []
-    print(f"[retail_sentiment] Devvit GET {base_url}?ticker={ticker}")
     try:
         resp = requests.get(
-            base_url, params={"ticker": ticker},
-            headers={"Authorization": f"bearer {app_token}"}, timeout=15,
+            "https://api.quiverquant.com/beta/live/wallstreetbets", params={"count_all": "true"},
+            headers={"Accept": "application/json", "Authorization": f"Token {api_key}"}, timeout=15,
         )
-        resp.raise_for_status()
-        mentions = resp.json().get("mentions", [])
-        print(f"[retail_sentiment] Devvit returned {len(mentions)} mentions for {ticker}")
-    except (requests.RequestException, ValueError) as e:
-        print(f"[retail_sentiment] Devvit sentiment fetch failed for {ticker}: {e}")
+    except requests.RequestException as e:
+        print(f"[retail_sentiment] QuiverQuant WSB fetch failed: {e}")
         return []
-    posts = []
-    for m in mentions[:limit]:
-        created_ms = m.get("createdAt")
-        posted_at = datetime.utcfromtimestamp(created_ms / 1000).isoformat() if created_ms else None
-        posts.append({
-            "source": "devvit", "text": m.get("title"), "url": m.get("permalink"), "posted_at": posted_at,
-        })
-    return posts
-
-
-def _fetch_reddit_posts(ticker, limit=25):
-    """Real Reddit posts mentioning `ticker`, via the Devvit app's
-    published external endpoint (source="devvit"). Fails soft to [] if
-    that's not configured or errors -- Reddit stays a secondary source;
-    StockTwits is the always-on primary retail-sentiment feed regardless.
-
-    The former PRAW/script-app fallback was removed: its REDDIT_CLIENT_ID/
-    REDDIT_CLIENT_SECRET pair was a dead, permanently-401ing credential
-    from a deleted Reddit app (confirmed live), so it never produced data
-    and only added a confusing extra hop to the trace."""
-    print(f"[retail_sentiment] _fetch_reddit_posts({ticker}) called")
-    return _fetch_reddit_posts_devvit(ticker, limit=limit)
+    # Check for the {"detail": "..."} error shape BEFORE raise_for_status()
+    # -- confirmed live this is how an upgrade-required response actually
+    # looks (HTTP 403 + a real, human-readable detail message), and
+    # checking first means the log shows that real message instead of
+    # just a generic "403 Forbidden".
+    try:
+        data = resp.json()
+    except ValueError:
+        print(f"[retail_sentiment] QuiverQuant WSB returned non-JSON (HTTP {resp.status_code})")
+        return []
+    if isinstance(data, dict) and "detail" in data:
+        print(f"[retail_sentiment] QuiverQuant WSB unavailable: {data['detail']}")
+        return []
+    try:
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        print(f"[retail_sentiment] QuiverQuant WSB fetch failed: {e}")
+        return []
+    if not isinstance(data, list):
+        print(f"[retail_sentiment] QuiverQuant WSB returned unexpected shape: {type(data)}")
+        return []
+    matches = [row for row in data if (row.get("Ticker") or row.get("ticker") or "").upper() == ticker.upper()]
+    return [
+        {"source": "quiverquant_wsb", "date": row.get("Date") or row.get("date"),
+         "mentions": row.get("Mentions") or row.get("mentions"),
+         "rank": row.get("Rank") or row.get("rank")}
+        for row in matches[:limit]
+    ]
 
 
 def _fetch_stocktwits_posts(ticker, limit=25):
@@ -4530,13 +4586,20 @@ def _fetch_stocktwits_posts(ticker, limit=25):
 
 
 def fetch_retail_sentiment(ticker):
-    """Real retail sentiment: Reddit + StockTwits posts, each tagged with
+    """Real retail sentiment posts -- StockTwits only, each tagged with
     its source name and original timestamp -- ported from new_top.py's
-    get_reddit_posts / get_stocktwits_posts. No sentiment-score guessing
-    (new_top.py's TextBlob-based analyze_sentiment/summarize_retail_sentiment
-    were not ported); the raw, source-tagged posts are handed to Claude to
-    characterize themselves, per the anti-hallucination rules."""
-    return _fetch_reddit_posts(ticker) + _fetch_stocktwits_posts(ticker)
+    get_stocktwits_posts. No sentiment-score guessing (new_top.py's
+    TextBlob-based analyze_sentiment/summarize_retail_sentiment were not
+    ported); the raw, source-tagged posts are handed to Claude to
+    characterize themselves, per the anti-hallucination rules.
+
+    Reddit is no longer sourced here as individual "posts" -- see
+    fetch_apewisdom_sentiment() and fetch_quiverquant_wsb(), which return
+    real aggregate mention/rank data (ApeWisdom has no per-post text or
+    sentiment field to fabricate; forcing it into this post-list shape
+    would mean inventing fields that don't exist) and are combined into
+    the RETAIL section separately in _bundle_ai_context/generate_deep_analysis."""
+    return _fetch_stocktwits_posts(ticker)
 
 
 def _persist_retail_sentiment(conn, ticker, posts):
@@ -4575,7 +4638,7 @@ def cached_retail_sentiment(conn, ticker, max_age_hours=2, force_refresh=False):
     table = "retail_sentiment"
     if not force_refresh and not should_refetch(conn, table, ticker, max_age_hours):
         cached = _read_retail_sentiment_cache(conn, ticker)
-        return {"data": cached, "source": "reddit+stocktwits" if cached else None,
+        return {"data": cached, "source": "stocktwits" if cached else None,
                 "cache_hit": True, "fetched_at": _last_fetch_info(conn, table, ticker)}
     try:
         posts = fetch_retail_sentiment(ticker)
@@ -4584,8 +4647,60 @@ def cached_retail_sentiment(conn, ticker, max_age_hours=2, force_refresh=False):
     except Exception as e:
         _log_fetch(conn, table, ticker, False, 0, str(e))
     cached = _read_retail_sentiment_cache(conn, ticker)
-    return {"data": cached, "source": "reddit+stocktwits" if cached else None,
+    return {"data": cached, "source": "stocktwits" if cached else None,
             "cache_hit": bool(cached), "fetched_at": _last_fetch_info(conn, table, ticker)}
+
+
+def _persist_apewisdom_sentiment(conn, ticker, record):
+    if not record:
+        return
+    conn.execute(
+        """INSERT INTO apewisdom_sentiment
+               (ticker, rank, mentions, upvotes, rank_24h_ago, mentions_24h_ago, source, fetched_at)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        (ticker, record.get("rank"), record.get("mentions"), record.get("upvotes"),
+         record.get("rank_24h_ago"), record.get("mentions_24h_ago"), record.get("source"),
+         datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+
+
+def _read_apewisdom_sentiment_cache(conn, ticker):
+    row = conn.execute(
+        """SELECT rank, mentions, upvotes, rank_24h_ago, mentions_24h_ago, source
+           FROM apewisdom_sentiment WHERE ticker=? ORDER BY fetched_at DESC LIMIT 1""",
+        (ticker,),
+    ).fetchone()
+    if not row:
+        return None
+    return {"ticker": ticker, "rank": row[0], "mentions": row[1], "upvotes": row[2],
+            "rank_24h_ago": row[3], "mentions_24h_ago": row[4], "source": row[5]}
+
+
+def cached_apewisdom_sentiment(conn, ticker, max_age_hours=2, force_refresh=False):
+    """Same cached_*(conn, ticker, max_age_hours, force_refresh) envelope
+    as every other fetcher -- unlike marketbeat_institutional, this is
+    fast/free/no-auth/no-browser-popup, so it's safe to call automatically
+    from _bundle_ai_context on every briefing generation, same cache
+    cadence as StockTwits."""
+    table = "apewisdom_sentiment"
+    if not force_refresh and not should_refetch(conn, table, ticker, max_age_hours):
+        cached = _read_apewisdom_sentiment_cache(conn, ticker)
+        if cached:
+            return {"data": cached, "source": "apewisdom", "cache_hit": True,
+                    "fetched_at": _last_fetch_info(conn, table, ticker)}
+    try:
+        record = fetch_apewisdom_sentiment(ticker)
+        _persist_apewisdom_sentiment(conn, ticker, record)
+        _log_fetch(conn, table, ticker, True, 1 if record else 0)
+        cached = record or _read_apewisdom_sentiment_cache(conn, ticker)
+        return {"data": cached, "source": "apewisdom" if cached else None, "cache_hit": False,
+                "fetched_at": datetime.utcnow().isoformat()}
+    except Exception as e:
+        _log_fetch(conn, table, ticker, False, 0, str(e))
+        cached = _read_apewisdom_sentiment_cache(conn, ticker)
+        return {"data": cached, "source": "apewisdom" if cached else None,
+                "cache_hit": bool(cached), "fetched_at": _last_fetch_info(conn, table, ticker)}
 
 
 def _bucket_options_flow(conn, ticker):
@@ -4727,8 +4842,15 @@ _AI_BRIEF_SYSTEM_PROMPT = (
     "(real scraped MarketBeat institutional-ownership stats -- ownership_pct, buyers/sellers "
     "counts, inflows/outflows, net_flow_bias_pct, and recent_transactions -- present only if "
     "fetched for this ticker before, since it requires a manual browser-based fetch; null/absent "
-    "if not), real Reddit/StockTwits "
-    "retail sentiment posts (each tagged by source and timestamp), dark pool signal, a "
+    "if not), real StockTwits "
+    "retail sentiment posts (each tagged by source and timestamp), apewisdom_sentiment (real Reddit "
+    "mention-tracking from ApeWisdom -- rank, mentions, upvotes, and each vs. 24h ago, aggregated "
+    "across r/wallstreetbets and other finance subreddits; there is NO sentiment score or post text "
+    "in this data -- never invent bullish/bearish framing for it beyond what the raw numbers show; "
+    "null if this ticker isn't currently ranked), quiverquant_wsb (real WallStreetBets mention data "
+    "from QuiverQuant's paid tier -- usually an empty list, since this dataset requires a "
+    "subscription tier beyond what's currently active; treat a non-empty list as real data same as "
+    "any other source), dark pool signal, a "
     "divergence-score history, recent news headlines with publisher and date, and "
     "technical_levels -- an ALGORITHMICALLY detected (not AI-guessed) set of support/resistance "
     "levels, trend structure, and measured-move breakdown/breakout targets, computed directly "
@@ -4783,10 +4905,16 @@ _AI_BRIEF_SYSTEM_PROMPT = (
     "If technical_levels shows 'unknown'/insufficient data, skip straight to a single sentence "
     "saying so -- do not invent a trend or levels from other technicals instead.\n"
     "- retail_analysis: SHORT BULLET POINTS (markdown '- ' lines), one line per distinct fact, "
-    "never a paragraph. Each bullet cites source and approximate recency, e.g. '- Reddit "
-    "(Aug 14): ...'. Max 4 bullets, picking the most decision-relevant. If "
-    "retail_sentiment_posts is empty, a single bullet saying 'No retail sentiment data "
-    "available' -- do not infer sentiment from price action instead.\n"
+    "never a paragraph, synthesizing across retail_sentiment_posts (StockTwits), "
+    "apewisdom_sentiment (Reddit mention/rank tracking), and quiverquant_wsb (WallStreetBets, when "
+    "non-empty) -- not StockTwits alone. Each bullet cites source and approximate recency, e.g. "
+    "'- StockTwits (Aug 14): ...' or '- ApeWisdom: ranked #3 most-mentioned on Reddit, up from #4 "
+    "yesterday (36 mentions)'. For apewisdom_sentiment specifically: describe the real rank/mention "
+    "numbers and their 24h change, never a bullish/bearish sentiment characterization -- that data "
+    "has no sentiment field, only volume. Max 4 bullets, picking the most decision-relevant. If a "
+    "category is empty (e.g. retail_sentiment_posts, or apewisdom_sentiment is null because this "
+    "ticker isn't currently ranked), state that explicitly rather than omitting it silently or "
+    "inferring sentiment from price action instead.\n"
     "- institutional_analysis: SHORT BULLET POINTS (markdown '- ' lines), one line per distinct "
     "fact -- one insider sale, one buyback figure, one analyst-target datapoint, one 13F filer, "
     "one marketbeat_institutional stat if present -- never fold multiple facts into one run-on "
@@ -4907,7 +5035,7 @@ def _persist_ai_brief(conn, ticker, brief):
     conn.commit()
 
 
-def _read_ai_context_from_cache(ticker, conn, technicals=None, technical_levels=None):
+def _read_ai_context_from_cache(ticker, conn, technicals=None, technical_levels=None, quiverquant_wsb=None):
     """Pure DB read of everything used to build the AI briefing context --
     no network calls. Used both for the cost estimate (which must never
     trigger a fetch) and as the final read step after _bundle_ai_context
@@ -4929,6 +5057,7 @@ def _read_ai_context_from_cache(ticker, conn, technicals=None, technical_levels=
     retail_posts = _read_retail_sentiment_cache(conn, ticker, limit=30)
     thirteenf_filings = _read_13f_cache(conn, ticker, limit=10)
     marketbeat_institutional = _read_marketbeat_institutional_cache(conn, ticker)
+    apewisdom = _read_apewisdom_sentiment_cache(conn, ticker)
 
     insider_rows = conn.execute(
         """SELECT transaction_date, insider_name, title, transaction_type, shares, value, source
@@ -5006,6 +5135,17 @@ def _read_ai_context_from_cache(ticker, conn, technicals=None, technical_levels=
         # prompt is written to handle that gracefully.
         "marketbeat_institutional": marketbeat_institutional,
         "retail_sentiment_posts": retail_posts,
+        # Real Reddit mention-tracking (rank/mentions/upvotes, no per-post
+        # text or sentiment score -- ApeWisdom's API doesn't provide
+        # those, so none are fabricated here). None if this ticker isn't
+        # currently ranked (zero recent mentions).
+        "apewisdom_sentiment": apewisdom,
+        # Real WallStreetBets mention data via QuiverQuant's paid tier --
+        # confirmed empty under the current subscription (see
+        # fetch_quiverquant_wsb's docstring); present and populated
+        # automatically if the plan is ever upgraded, no code change
+        # needed.
+        "quiverquant_wsb": quiverquant_wsb or [],
         "dark_pool": (
             {"date": dark_pool_row[0], "dark_pool_pct": dark_pool_row[1], "volume_zscore": dark_pool_row[2],
              "signal": dark_pool_row[3], "is_proxy": bool(dark_pool_row[4])}
@@ -5029,14 +5169,16 @@ def _bundle_ai_context(ticker, conn):
     """Refreshes the real-data sources ported from new_top.py (each
     respecting its own cache window, so repeated briefings within that
     window don't re-scrape) -- MarketBeat earnings history, Finviz insider
-    sales, Reddit/StockTwits retail sentiment, earnings_signal (for the IV
-    expected move), SEC EDGAR 13F filings -- plus a fresh technical
-    snapshot, then reads everything via _read_ai_context_from_cache. This
-    is the version generate_deep_analysis() uses; it can make real
-    network calls, each fail-soft."""
+    sales, StockTwits + ApeWisdom retail sentiment, earnings_signal (for
+    the IV expected move), SEC EDGAR 13F filings -- plus a fresh technical
+    snapshot and a live (uncached) QuiverQuant WSB check, then reads
+    everything via _read_ai_context_from_cache. This is the version
+    generate_deep_analysis() uses; it can make real network calls, each
+    fail-soft."""
     cached_earnings_history_real(conn, ticker, max_age_hours=12)
     cached_insider_sales_finviz(conn, ticker, max_age_hours=24)
     cached_retail_sentiment(conn, ticker, max_age_hours=2)
+    cached_apewisdom_sentiment(conn, ticker, max_age_hours=2)
     cached_earnings_signal(conn, ticker, max_age_hours=12)
     cached_13f_changes(conn, ticker, max_age_hours=168)
     technicals = _fetch_technical_snapshot(ticker)
@@ -5044,7 +5186,13 @@ def _bundle_ai_context(ticker, conn):
     # 6-month swing-horizon window the dashboard shows by default, so the
     # AI's narrative lines up with what a trader sees on first load.
     technical_levels = detect_technical_levels(ticker, DEFAULT_INTERVAL, DEFAULT_LOOKBACK, conn=conn)
-    return _read_ai_context_from_cache(ticker, conn, technicals=technicals, technical_levels=technical_levels)
+    # Not cached (see fetch_quiverquant_wsb's docstring -- no verified
+    # success schema yet to design a table around); cheap to call live
+    # since it returns [] instantly under the current plan tier.
+    quiverquant_wsb = fetch_quiverquant_wsb(ticker)
+    return _read_ai_context_from_cache(
+        ticker, conn, technicals=technicals, technical_levels=technical_levels, quiverquant_wsb=quiverquant_wsb,
+    )
 
 
 def _estimate_ai_briefing_cost(context):
@@ -5423,28 +5571,55 @@ def _probe_anthropic():
         return {"status": "down", "source": "anthropic", "error": str(e)}
 
 
-def _probe_reddit():
-    """Checks the Devvit external-endpoint path -- the only Reddit path
-    left (see _fetch_reddit_posts_devvit). The former PRAW/script-app
-    fallback was removed (dead credentials, see _fetch_reddit_posts)."""
-    devvit_url = os.environ.get("DEVVIT_SENTIMENT_URL")
-    devvit_token = os.environ.get("DEVVIT_APP_TOKEN")
-    if not devvit_url or not devvit_token:
-        return {"status": "not_configured", "source": "reddit",
-                "error": "DEVVIT_SENTIMENT_URL/DEVVIT_APP_TOKEN not set"}
+def _probe_reddit_deprecated():
+    """The former Devvit-based Reddit path -- kept only so the SETTINGS
+    registry can show it as explicitly deprecated (Part 4) rather than
+    just disappearing with no explanation. Blocked indefinitely in
+    Reddit's publish-review queue with no ETA and never produced data in
+    production; replaced entirely by fetch_apewisdom_sentiment (real,
+    live, no-auth) -- see _probe_apewisdom below."""
+    return {"status": "not_configured", "source": "reddit_devvit",
+            "error": "Deprecated -- replaced by ApeWisdom (see 'apewisdom' row below). "
+                     "Devvit app was never published (blocked in Reddit's review queue, no ETA)."}
+
+
+def _probe_quiverquant_wsb():
+    """Same direct-REST approach as _probe_congressional, for the same
+    reason: quiverquant.quiver().wallstreetbets() has the same missing-
+    raise_for_status() defect (confirmed live -- an upgrade-required
+    response becomes a confusing ValueError instead of a clean error)."""
+    api_key = os.environ.get("QUIVER_API_KEY")
+    if not api_key:
+        return {"status": "not_configured", "source": "quiverquant_wsb", "error": "QUIVER_API_KEY not set"}
     t0 = time.time()
     try:
         resp = requests.get(
-            devvit_url, params={"ticker": "SPY"},
-            headers={"Authorization": f"bearer {devvit_token}"}, timeout=10,
+            "https://api.quiverquant.com/beta/live/wallstreetbets", params={"count_all": "true"},
+            headers={"accept": "application/json", "Authorization": f"Token {api_key}"}, timeout=10,
         )
         latency_ms = int((time.time() - t0) * 1000)
         if resp.status_code == 200:
-            return {"status": "up", "source": "devvit", "latency_ms": latency_ms}
-        return {"status": "down", "source": "devvit", "latency_ms": latency_ms,
-                "error": f"HTTP {resp.status_code}: {resp.text[:200]}"}
+            return {"status": "up", "source": "quiverquant_wsb", "latency_ms": latency_ms}
+        if resp.status_code in (401, 402, 403):
+            return {"status": "not_configured", "source": "quiverquant_wsb", "latency_ms": latency_ms,
+                    "error": f"plan tier doesn't include this dataset: {_extract_api_error_detail(resp)}"}
+        return {"status": "down", "source": "quiverquant_wsb", "latency_ms": latency_ms,
+                "error": f"HTTP {resp.status_code}: {_extract_api_error_detail(resp)}"}
     except Exception as e:
-        return {"status": "down", "source": "devvit", "error": str(e)}
+        return {"status": "down", "source": "quiverquant_wsb", "error": str(e)}
+
+
+def _probe_apewisdom():
+    t0 = time.time()
+    try:
+        resp = requests.get("https://apewisdom.io/api/v1.0/filter/all-stocks/page/1", timeout=8)
+        latency_ms = int((time.time() - t0) * 1000)
+        if resp.status_code == 200 and isinstance(resp.json().get("results"), list):
+            return {"status": "up", "source": "apewisdom", "latency_ms": latency_ms}
+        return {"status": "degraded", "source": "apewisdom", "latency_ms": latency_ms,
+                "error": f"HTTP {resp.status_code} or unexpected response shape"}
+    except Exception as e:
+        return {"status": "down", "source": "apewisdom", "error": str(e)}
 
 
 def _probe_stocktwits():
@@ -5571,10 +5746,18 @@ SOURCE_REGISTRY = [
      "probe": _probe_sec_edgar},
     {"key": "anthropic", "purpose": "AI briefing", "env_var": "ANTHROPIC_API_KEY",
      "endpoint": "anthropic SDK -> api.anthropic.com/v1/messages (claude-opus-5)", "probe": _probe_anthropic},
-    {"key": "reddit", "purpose": "retail sentiment (Reddit)",
+    {"key": "reddit_devvit", "purpose": "DEPRECATED -- retail sentiment (Reddit), replaced by apewisdom",
      "env_var": "DEVVIT_SENTIMENT_URL, DEVVIT_APP_TOKEN",
-     "endpoint": "Devvit: $DEVVIT_SENTIMENT_URL/external/sentiment (unpublished -- not set)",
-     "probe": _probe_reddit},
+     "endpoint": "Devvit: $DEVVIT_SENTIMENT_URL/external/sentiment (never published)",
+     "probe": _probe_reddit_deprecated},
+    {"key": "apewisdom", "purpose": "retail sentiment (Reddit mention/rank tracking, no auth)",
+     "env_var": None,
+     "endpoint": "https://apewisdom.io/api/v1.0/filter/all-stocks/page/{page}",
+     "probe": _probe_apewisdom},
+    {"key": "quiverquant_wsb", "purpose": "retail sentiment (WallStreetBets mentions, bonus 3rd source)",
+     "env_var": "QUIVER_API_KEY",
+     "endpoint": "https://api.quiverquant.com/beta/live/wallstreetbets?count_all=true",
+     "probe": _probe_quiverquant_wsb},
     {"key": "stocktwits", "purpose": "retail sentiment (StockTwits)", "env_var": None,
      "endpoint": "https://api.stocktwits.com/api/2/streams/symbol/{ticker}.json", "probe": _probe_stocktwits},
     {"key": "marketbeat", "purpose": "earnings history scrape", "env_var": None,

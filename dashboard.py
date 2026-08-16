@@ -32,6 +32,7 @@ from data_engine import (
     cached_earnings_history_real,
     cached_options_flow,
     cached_retail_sentiment,
+    cached_apewisdom_sentiment,
     cached_13f_changes,
     cached_marketbeat_institutional_sentiment,
     _compute_technical_levels,
@@ -2091,8 +2092,6 @@ with tab7:
                         # actual signal.
                         substantive = [p for p in sentiment_posts if _is_substantive_post_text(p.get("text"))]
                         st_posts = [p for p in substantive if p.get("source") == "stocktwits"]
-                        reddit_posts = [p for p in substantive if p.get("source") in
-                                        ("reddit_script_app", "devvit")]
 
                         st.markdown(
                             f'<div style="margin-top:10px;font-size:11px;font-weight:700;'
@@ -2110,23 +2109,37 @@ with tab7:
                         else:
                             st.caption("No StockTwits posts cached for this ticker yet.")
 
+                        # ApeWisdom replaces the former Devvit-based Reddit
+                        # path entirely (that app was never published --
+                        # blocked indefinitely in Reddit's review queue).
+                        # It's an aggregate rank/mention stat, not a list
+                        # of individual posts -- no per-post text and no
+                        # sentiment score exist in this data, so neither
+                        # is fabricated here.
                         st.markdown(
                             f'<div style="margin-top:10px;font-size:11px;font-weight:700;'
-                            f'color:{TEXT_SECONDARY};">REDDIT</div>', unsafe_allow_html=True,
+                            f'color:{TEXT_SECONDARY};">APEWISDOM (REDDIT MENTIONS)</div>',
+                            unsafe_allow_html=True,
                         )
-                        if reddit_posts:
-                            for p in reddit_posts[:8]:
-                                st.markdown(
-                                    f'<div style="font-size:12px;padding:3px 0;border-bottom:1px solid {BORDER};">'
-                                    f'{html_safe_snippet(_truncate_post_text(p.get("text")))} '
-                                    f'<span style="color:{TEXT_MUTED};font-size:10px;">'
-                                    f'{html.escape(p.get("posted_at") or "")}</span></div>',
-                                    unsafe_allow_html=True,
-                                )
+                        ape_env = cached_apewisdom_sentiment(conn, dd_ticker, max_age_hours=2,
+                                                              force_refresh=fetch_live)
+                        ape = ape_env["data"]
+                        if ape:
+                            rank_delta = None
+                            if ape.get("rank") is not None and ape.get("rank_24h_ago"):
+                                rank_delta = ape["rank_24h_ago"] - ape["rank"]  # positive = moved up in rank
+                            delta_txt = (f" (was #{ape['rank_24h_ago']})" if rank_delta and rank_delta != 0
+                                         else "")
+                            acol1, acol2, acol3 = st.columns(3)
+                            acol1.metric("Rank", f"#{ape['rank']}" if ape.get("rank") is not None else "—",
+                                        delta_txt or None)
+                            acol2.metric("Mentions (24h)", ape.get("mentions") if ape.get("mentions") is not None
+                                        else "—")
+                            acol3.metric("Upvotes", ape.get("upvotes") if ape.get("upvotes") is not None else "—")
                         else:
                             st.caption(
-                                "No Reddit posts found (Devvit app not published yet -- "
-                                "see SETTINGS tab source registry)."
+                                "Not currently ranked on ApeWisdom (no recent Reddit mentions across "
+                                "r/wallstreetbets and other finance subreddits)."
                             )
                     with icol:
                         st.caption("Institutional")
@@ -2268,7 +2281,7 @@ with tab7:
                     st.caption(
                         "No AI briefing yet. Click '🧠 Generate AI Briefing' above to synthesize "
                         "real fundamentals, technicals, options flow, real earnings track record, "
-                        "real retail sentiment (Reddit/StockTwits), insider/congressional trades, "
+                        "real retail sentiment (StockTwits/ApeWisdom), insider/congressional trades, "
                         "dark pool, and news into a narrative read via the Claude API. Makes one "
                         "paid API call, only on request."
                     )
