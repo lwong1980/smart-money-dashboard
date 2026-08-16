@@ -1,0 +1,11 @@
+streamlit>=1.37
+yfinance>=0.2.40
+pandas>=2.0
+numpy>=1.24
+scipy>=1.11  # swing-point detection (argrelextrema) for detect_technical_levels
+plotly>=5.22
+requests>=2.31
+feedparser>=6.0
+beautifulsoup4>=4.12  # MarketBeat/Finviz scraping for the AI briefing's real-data sources
+quiverquant>=0.2.6  # optional, paid-tier: only imported when QUIVER_API_KEY is set
+anthropic>=0.122.0  # optional: only used for on-demand AI briefing, requires ANTHROPIC_API_KEY

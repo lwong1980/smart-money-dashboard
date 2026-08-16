@@ -1,0 +1,17 @@
+setup_env.sh
+
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Local SQLite data -- generated at runtime, not source
+smart_money.db
+smart_money.db-shm
+smart_money.db-wal
+
+# Local tooling/session state, not project source
+.agents/
+.claude/
+
+.DS_Store
