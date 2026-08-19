@@ -8,6 +8,7 @@ requests>=2.31
 feedparser>=6.0
 beautifulsoup4>=4.12  # MarketBeat/Finviz scraping for the AI briefing's real-data sources
 quiverquant>=0.2.6  # optional, paid-tier: only imported when QUIVER_API_KEY is set
+scikit-learn>=1.5  # optional: EARNINGS SIMULATOR's train_earnings_direction_model, gated on 15-20+ reconciled predictions
 anthropic>=0.122.0  # optional: only used for on-demand AI briefing, requires ANTHROPIC_API_KEY
 selenium>=4.20  # optional: MarketBeat institutional ownership scrape, desktop-only (see data_engine.py)
 undetected-chromedriver>=3.5  # optional, same as above -- auto-detects installed Chrome version
