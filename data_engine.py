@@ -22,12 +22,17 @@ import os
 import pickle
 import random
 import re
+import smtplib
 import sqlite3
 import time
 import urllib.parse
+import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from email.mime.image import MIMEImage as EmailMIMEImage
+from email.mime.multipart import MIMEMultipart as EmailMIMEMultipart
+from email.mime.text import MIMEText as EmailMIMEText
 
 import feedparser
 import numpy as np
@@ -72,6 +77,77 @@ def save_watchlist(tickers, path=WATCHLIST_CONFIG_PATH):
     with open(path, "w") as f:
         json.dump(cleaned, f, indent=2)
     return cleaned
+
+
+PINNED_RUNNERS_CONFIG_PATH = "pinned_runners.json"
+
+
+def load_pinned_runners(path=PINNED_RUNNERS_CONFIG_PATH):
+    """Load RUNNERS' manually-pinned tickers from a local JSON file --
+    same pattern as load_watchlist, added after a real bug report: pins
+    were session_state-only and silently vanished on every app restart
+    or even a plain browser refresh. Returns [] (not a starter default --
+    there's no sensible fallback list for "manually added" tickers) if
+    missing/empty/unreadable."""
+    try:
+        with open(path, "r") as f:
+            tickers = json.load(f)
+        if isinstance(tickers, list):
+            return [str(t).strip().upper() for t in tickers if str(t).strip()]
+    except (FileNotFoundError, json.JSONDecodeError, ValueError):
+        pass
+    return []
+
+
+def save_pinned_runners(tickers, path=PINNED_RUNNERS_CONFIG_PATH):
+    """Persist RUNNERS' pinned tickers so they survive restarts -- same
+    pattern as save_watchlist. Order-preserving (not sorted, unlike the
+    watchlist) since pin order is "the order the user added them in,"
+    a meaningful detail save_watchlist's alphabetical sort would lose."""
+    cleaned = []
+    for t in tickers:
+        u = str(t).strip().upper()
+        if u and u not in cleaned:
+            cleaned.append(u)
+    with open(path, "w") as f:
+        json.dump(cleaned, f, indent=2)
+    return cleaned
+
+
+RUNNERS_REFRESH_INTERVAL_CONFIG_PATH = "runners_refresh_interval.json"
+RUNNERS_REFRESH_INTERVAL_OPTIONS = ["On demand", "5 min", "15 min", "1 hour"]
+
+
+def load_runners_refresh_interval(path=RUNNERS_REFRESH_INTERVAL_CONFIG_PATH):
+    """RUNNERS' selected Day Prediction auto-refresh interval, persisted
+    so it survives restarts/reloads -- added after a real bug report: the
+    dropdown lived only in st.session_state, which Streamlit resets on
+    any full browser reload/reconnect (a NEW server-side session, not
+    the same one), so a selected "5 min" silently reverted to the
+    widget's own default ("On demand") with zero indication anything had
+    changed -- confirmed as the actual cause behind a "stuck, not
+    refreshing" report where the UI still visually showed a stale
+    selection from before the reload. Falls back to the safe default
+    ("On demand") if missing/invalid."""
+    try:
+        with open(path, "r") as f:
+            value = json.load(f)
+        if value in RUNNERS_REFRESH_INTERVAL_OPTIONS:
+            return value
+    except (FileNotFoundError, json.JSONDecodeError, ValueError):
+        pass
+    return "On demand"
+
+
+def save_runners_refresh_interval(value, path=RUNNERS_REFRESH_INTERVAL_CONFIG_PATH):
+    """Persist the refresh-interval choice -- same pattern as
+    save_pinned_runners/save_watchlist."""
+    if value not in RUNNERS_REFRESH_INTERVAL_OPTIONS:
+        value = "On demand"
+    with open(path, "w") as f:
+        json.dump(value, f)
+    return value
+
 
 DIVERGENCE_LABELS = [
     "SMART_BULLISH",
@@ -705,6 +781,265 @@ CREATE TABLE IF NOT EXISTS backtest_runs (
     direction_accuracy REAL
 );
 CREATE INDEX IF NOT EXISTS idx_backtest_runs_ticker ON backtest_runs(ticker, run_at);
+
+-- MACRO CALENDAR: standalone, ticker-agnostic ground-truth event log --
+-- officially scheduled economic/Fed releases only (never unscheduled
+-- events like political press conferences or tariff announcements --
+-- those are covered by NEWS/the AI Briefing's catalyst detection, not
+-- this table). event_id is stable ("FOMC_2026-09-16", "CPI_2026-09-11")
+-- so repeated fetches upsert the same row rather than duplicating it.
+CREATE TABLE IF NOT EXISTS macro_events (
+    event_id TEXT PRIMARY KEY,
+    event_type TEXT,
+    event_name TEXT,
+    scheduled_date TEXT,
+    scheduled_time_et TEXT,
+    source TEXT,
+    prior_value TEXT,
+    forecast_value TEXT,
+    actual_value TEXT,
+    impact_level TEXT,
+    fetched_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_macro_events_date ON macro_events(scheduled_date);
+
+-- SWING FORECAST -- multi-day (3/10 trading session) directional +
+-- magnitude forecast, structurally mirroring day_predictions (one row
+-- per (ticker, horizon_days, session_date), source='live'/'backtest',
+-- the same Mode 1/2/3 + reconciliation shape) but scoped to a horizon
+-- in trading days rather than a single session.
+CREATE TABLE IF NOT EXISTS swing_forecasts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker TEXT NOT NULL,
+    horizon_days INTEGER NOT NULL,
+    session_date TEXT NOT NULL,
+    target_date TEXT,
+    model_start_price REAL,
+    target_price REAL,
+    predicted_direction TEXT,
+    magnitude_estimate_pct REAL,
+    lean_pre_model REAL,
+    prob_up REAL,
+    prob_down REAL,
+    prob_flat REAL,
+    mode TEXT,
+    confidence_level TEXT,
+    recommended_strategy TEXT,
+    source_briefing_id TEXT,
+    active_macro_events TEXT,
+    earnings_collision_flag INTEGER DEFAULT 0,
+    scenario_matrix_json TEXT,
+    source TEXT,
+    predicted_at TEXT,
+    actual_close_price REAL,
+    actual_direction TEXT,
+    prediction_correct_direction INTEGER,
+    error_pct REAL,
+    reconciliation_notes TEXT,
+    reconciled_at TEXT,
+    UNIQUE(ticker, horizon_days, session_date)
+);
+CREATE INDEX IF NOT EXISTS idx_swing_forecasts_lookup ON swing_forecasts(ticker, horizon_days, session_date);
+
+-- Mirrors day_model_cache/earnings_model_cache exactly, for the Swing
+-- Forecast's own Mode 3 (train_swing_direction_model) -- keyed also by
+-- horizon_days since a 3-day model and a 10-day model are trained on
+-- different feature/outcome pairs and must never be conflated.
+CREATE TABLE IF NOT EXISTS swing_model_cache (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    horizon_days INTEGER,
+    trained_at TEXT,
+    n_samples_at_train INTEGER,
+    model_type TEXT,
+    held_out_accuracy REAL,
+    baseline_accuracy REAL,
+    beats_baseline INTEGER,
+    feature_names_json TEXT,
+    model_blob BLOB
+);
+
+-- Mirrors backtest_runs exactly, for backtest_swing_forecasts()'s own
+-- registry (Part 4).
+CREATE TABLE IF NOT EXISTS swing_backtest_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker TEXT NOT NULL,
+    horizon_days INTEGER NOT NULL,
+    run_at TEXT NOT NULL,
+    lookback_days INTEGER,
+    date_range_start TEXT,
+    date_range_end TEXT,
+    qualifying_sessions_found INTEGER,
+    sessions_backtested INTEGER,
+    mean_error_pct REAL,
+    mean_abs_error_pct REAL,
+    direction_accuracy REAL
+);
+CREATE INDEX IF NOT EXISTS idx_swing_backtest_runs_ticker ON swing_backtest_runs(ticker, horizon_days, run_at);
+
+-- Mirrors model_calibration_log exactly, plus horizon_days -- a
+-- dedicated table (not the existing model_calibration_log, which is
+-- Day Prediction-only) so Swing Forecast's own calibration history can
+-- never mix with or disturb Day Prediction's.
+CREATE TABLE IF NOT EXISTS swing_calibration_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    horizon_days INTEGER,
+    n_samples INTEGER,
+    mean_abs_error_pct REAL,
+    target_error_pct REAL,
+    drift_scale REAL,
+    vol_scale REAL,
+    magnitude_ratio REAL,
+    direction_accuracy REAL,
+    note TEXT,
+    calibrated_at TEXT
+);
+
+-- WATCHLIST SIGNALS -- user-defined entry-zone price alerts + a
+-- recurring analyst rating-change scan (see check_entry_zones/
+-- check_rating_changes near the end of this file), surfaced on the
+-- WATCHLIST SIGNALS tab and an optional daily email digest. One row per
+-- ticker (PRIMARY KEY, not an append-only log): a zone is a standing
+-- configuration the user edits in place, not a history of edits.
+-- last_zone_status/zone_entered_at exist purely to detect a genuine
+-- above/below -> in_zone transition so a ticker sitting inside its zone
+-- for days doesn't re-trigger on every check.
+-- entry_low/entry_high/target_pct/target_horizon_days/implied_target_price
+-- are now COMPUTED OUTPUTS of derive_entry_zone() (auto-derived from
+-- technical support + the ticker's own backtested forward-return
+-- distribution), never user-entered -- reasoning/computed_at record HOW
+-- and WHEN each was derived. last_zone_status/zone_entered_at are still
+-- owned exclusively by check_entry_zones() (unchanged), same as before.
+CREATE TABLE IF NOT EXISTS entry_zones (
+    ticker TEXT PRIMARY KEY,
+    entry_low REAL,
+    entry_high REAL,
+    target_pct REAL,            -- the REAL backtested mean forward-return % used, not a flat assumed default
+    target_horizon_days INTEGER,
+    implied_target_price REAL,  -- entry midpoint * (1 + target_pct/100)
+    reasoning TEXT,             -- plain-language derivation citing the specific inputs used
+    last_zone_status TEXT,      -- 'above' / 'in_zone' / 'below' / NULL (never checked yet)
+    zone_entered_at TEXT,
+    computed_at TEXT,
+    created_at TEXT,
+    updated_at TEXT
+);
+
+-- Every (ticker, firm, action_date) analyst action ever seen -- the
+-- composite PRIMARY KEY (not one row per ticker) is what lets multiple
+-- firms acting on the same ticker on the same day, or the same firm
+-- acting again later, all be tracked distinctly, so check_rating_changes
+-- can correctly flag "genuinely new since last check" per action rather
+-- than just per ticker. `action` (upgrade/downgrade/reiterated/initiated)
+-- is what synthesize_rating_signal weights into a net directional score.
+CREATE TABLE IF NOT EXISTS seen_analyst_actions (
+    ticker TEXT,
+    firm TEXT,
+    action_date TEXT,
+    from_grade TEXT,
+    to_grade TEXT,
+    action TEXT,
+    first_seen_at TEXT,
+    PRIMARY KEY (ticker, firm, action_date)
+);
+
+-- Real market-impact tier per issuing firm (Part 2 of the rating-signal
+-- rebuild) -- about attention/volume a firm's call typically generates,
+-- NOT a claim about analyst accuracy (real research finds the two don't
+-- strongly correlate). Editable from SETTINGS so the classification can
+-- be corrected/expanded over time rather than treated as fixed. A firm
+-- with no row here defaults to tier 3 / weight 0.25 wherever this table
+-- is joined against (see _get_firm_tier).
+CREATE TABLE IF NOT EXISTS firm_tiers (
+    firm_name TEXT PRIMARY KEY,
+    tier INTEGER,
+    tier_label TEXT,
+    weight REAL
+);
+
+-- One row per day a digest email actually went out -- send_daily_digest_
+-- email reads the most recent row here to scope "what's new since the
+-- last digest," and only inserts a new row when it genuinely sends
+-- (never on a skipped/empty/unconfigured attempt), so a quiet day with
+-- nothing new doesn't reset the "since last digest" window.
+-- signals_snapshot_json is the per-ticker synthesize_rating_signal()
+-- classification AS OF this send -- the next send diffs against it to
+-- report only tickers whose signal actually changed, not every action.
+CREATE TABLE IF NOT EXISTS digest_email_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sent_at TEXT,
+    recipient TEXT,
+    entry_zone_count INTEGER,
+    rating_change_count INTEGER,
+    signals_snapshot_json TEXT
+);
+
+-- Singleton in-app Email Digest configuration (Part 1) -- SMTP server
+-- credentials (SMTP_HOST/PORT/USER/PASSWORD) remain environment-variable
+-- secrets; everything a user would reasonably want to change without
+-- touching the environment (recipient, schedule, content) lives here
+-- instead. The `id=1` CHECK enforces exactly one row ever -- see
+-- get_email_config/save_email_config, the only reader/writer.
+CREATE TABLE IF NOT EXISTS email_config (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    recipient_email TEXT,
+    from_email TEXT,
+    enabled INTEGER DEFAULT 0,
+    frequency TEXT DEFAULT 'daily',
+    send_time_et TEXT DEFAULT '07:30',
+    wait_for_runners INTEGER DEFAULT 1,
+    wait_for_predictions INTEGER DEFAULT 1,
+    sections_included TEXT,
+    last_sent_date TEXT,
+    last_digest_sent_at TEXT,
+    last_send_status TEXT,
+    last_send_error TEXT,
+    updated_at TEXT
+);
+
+-- Real subscriber list (Part 4 of the SES-production-access rollout) --
+-- replaces email_config.recipient_email as a single hardcoded address.
+-- unsubscribe_token is a random UUID, unique per subscriber, embedded in
+-- that subscriber's own unsubscribe link/List-Unsubscribe header so one
+-- person clicking it can never unsubscribe anyone else. bounce_count/
+-- last_bounce_at are basic reputation protection (Part 4.4): repeated
+-- hard failures for one address auto-unsubscribe it rather than letting
+-- SES keep retrying a dead/invalid mailbox indefinitely.
+CREATE TABLE IF NOT EXISTS email_subscribers (
+    email TEXT PRIMARY KEY,
+    unsubscribe_token TEXT UNIQUE,
+    subscribed_at TEXT,
+    unsubscribed INTEGER DEFAULT 0,
+    unsubscribed_at TEXT,
+    bounce_count INTEGER DEFAULT 0,
+    last_bounce_at TEXT
+);
+
+-- One row per calendar day RUNNERS' own unusual-activity scan actually
+-- ran (see the RUNNERS tab's scan block in dashboard.py, which is the
+-- only writer) -- makes "did today's Runners scan complete" a genuine,
+-- persisted, checkable fact for is_daily_digest_ready(), rather than
+-- something only knowable if that tab happened to be open. Logging this
+-- is purely additive: it does not change what the RUNNERS tab itself
+-- computes or displays.
+CREATE TABLE IF NOT EXISTS runners_scan_log (
+    scan_date TEXT PRIMARY KEY,
+    runner_rows_json TEXT,
+    scanned_at TEXT
+);
+
+-- FRED Fed Funds Rate data (Part 7) -- one row per calendar date DFF has
+-- a value for. target_upper/target_lower (DFEDTARU/DFEDTARL) are only
+-- meaningfully different from dff_rate around FOMC decisions, but are
+-- stored on the same row/date for simplicity since the Fed's own series
+-- share the same daily cadence and the macro-reasoning surface (Part 9)
+-- wants both together.
+CREATE TABLE IF NOT EXISTS fed_rate_history (
+    date TEXT PRIMARY KEY,
+    dff_rate REAL,
+    target_upper REAL,
+    target_lower REAL,
+    fetched_at TEXT
+);
 """
 
 # Migrations for columns added after a table's original CREATE TABLE, so
@@ -751,7 +1086,47 @@ _COLUMN_MIGRATIONS = {
         # every query that reads it (COALESCE(source, 'live') / `source or
         # "live"`), since every row before backtesting existed WAS live.
         ("source", "TEXT"),
+        # MACRO CALENDAR linkage (labeling only, no impact model yet) --
+        # JSON list of macro_events.event_id values scheduled within the
+        # window around this prediction's session, so a future analysis
+        # can ask "did predictions made on FOMC days have higher error"
+        # once enough reconciled data exists. NULL, never [], when no
+        # nearby event exists or macro_events hasn't been fetched yet.
+        ("active_macro_events", "TEXT"),
     ],
+    # Same linkage, same reasoning, for the Earnings Simulator's own
+    # prediction log.
+    "earnings_predictions": [("active_macro_events", "TEXT")],
+    # SWING FORECAST bug fix -- the cached daily-step simulated path (see
+    # simulate_multiday_path), same "generate once, never regenerate on
+    # re-render" discipline as day_predictions.simulated_path_json above.
+    "swing_forecasts": [("simulated_path_json", "TEXT")],
+    # Divergence-score formula v2 (fixed signal-cancellation + earnings-
+    # weight-starvation bugs -- see compute_divergence's docstring). Old
+    # rows are on a structurally different, lower scale (clustered 4-34)
+    # and are NOT comparable to new ones, so every consumer that does
+    # trend/history math (not just point-in-time display) must filter to
+    # score_formula_version='v2' rather than silently blending scales.
+    "divergence_scores": [("score_formula_version", "TEXT")],
+    "ticker_snapshots": [("score_formula_version", "TEXT")],
+    # Entry Zones rebuild -- these columns didn't exist on entry_zones
+    # when it was still a manual-entry table; `notes` (the old manual
+    # free-text field) is left in place, unused, rather than dropped --
+    # same "never remove a column, just stop referencing it" discipline
+    # every other migration in this table follows.
+    "entry_zones": [
+        ("implied_target_price", "REAL"), ("reasoning", "TEXT"), ("computed_at", "TEXT"),
+    ],
+    "seen_analyst_actions": [("action", "TEXT")],
+    # Featured Stock repeat-avoidance (select_featured_stock) needs to know
+    # what was actually featured on past sends -- signals_snapshot_json
+    # captures per-ticker signal state, not which ticker was the lead
+    # story, so it can't answer "was X featured this week" on its own.
+    "digest_email_log": [("signals_snapshot_json", "TEXT"), ("featured_ticker", "TEXT")],
+    # Sender identity moved off a hardcoded/reused SMTP username (Part 2/4
+    # of the SES cutover) -- in-app configurable, with an EMAIL_FROM env
+    # var override for deployments that prefer that path instead.
+    "email_config": [("from_email", "TEXT")],
 }
 
 
@@ -761,6 +1136,12 @@ def _run_migrations(conn):
         for col_name, col_type in columns:
             if col_name not in existing:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_type}")
+    # One-time backfill: every row that predates the score_formula_version
+    # column (NULL) was computed by the pre-fix formula -- tag it "v1" so
+    # it's explicitly excluded from trend/training math instead of being
+    # silently treated as comparable to new v2 scores.
+    conn.execute("UPDATE divergence_scores SET score_formula_version='v1' WHERE score_formula_version IS NULL")
+    conn.execute("UPDATE ticker_snapshots SET score_formula_version='v1' WHERE score_formula_version IS NULL")
     conn.commit()
 
 
@@ -772,6 +1153,8 @@ def init_db(db_path=DEFAULT_DB_PATH):
         conn.commit()
         _run_migrations(conn)
         _seed_news_sources(conn)
+        _seed_firm_tiers(conn)
+        _migrate_recipient_to_subscribers(conn)
     finally:
         conn.close()
 
@@ -795,6 +1178,70 @@ def _seed_news_sources(conn):
          "rss", 1, datetime.utcnow().isoformat()),
     )
     conn.commit()
+
+
+# Real, citable categorization (Part 2 of the rating-signal rebuild) --
+# about MARKET IMPACT (how much attention/volume a firm's call typically
+# generates), not analyst accuracy. Seeded once; editable afterward from
+# SETTINGS -> RATING SIGNAL FIRM TIERS, same "correct/expand over time,
+# not permanently fixed" discipline as the news-source registry. Multiple
+# real yfinance spelling variants are seeded per firm (e.g. "JPMorgan" vs
+# "JP Morgan" vs "J.P. Morgan") since upgrades_downgrades' Firm field is
+# not normalized to one canonical spelling.
+_DEFAULT_FIRM_TIERS = [
+    # Tier 1 -- Bulge Bracket (highest market impact)
+    ("Goldman Sachs", 1, "Bulge Bracket", 1.0),
+    ("Morgan Stanley", 1, "Bulge Bracket", 1.0),
+    ("J.P. Morgan", 1, "Bulge Bracket", 1.0),
+    ("JPMorgan", 1, "Bulge Bracket", 1.0),
+    ("JP Morgan", 1, "Bulge Bracket", 1.0),
+    ("Bank of America", 1, "Bulge Bracket", 1.0),
+    ("BofA Securities", 1, "Bulge Bracket", 1.0),
+    ("B of A Securities", 1, "Bulge Bracket", 1.0),
+    ("Citigroup", 1, "Bulge Bracket", 1.0),
+    # Tier 2 -- Elite Boutique / major mid-tier
+    ("Evercore ISI Group", 2, "Elite Boutique", 0.6),
+    ("Evercore ISI", 2, "Elite Boutique", 0.6),
+    ("Evercore", 2, "Elite Boutique", 0.6),
+    ("Lazard", 2, "Elite Boutique", 0.6),
+    ("Jefferies", 2, "Elite Boutique", 0.6),
+    ("UBS", 2, "Elite Boutique", 0.6),
+    ("Barclays", 2, "Elite Boutique", 0.6),
+    ("Deutsche Bank", 2, "Elite Boutique", 0.6),
+    ("Wells Fargo", 2, "Elite Boutique", 0.6),
+    ("RBC Capital", 2, "Elite Boutique", 0.6),
+    ("RBC Capital Markets", 2, "Elite Boutique", 0.6),
+]
+
+# Any firm with no explicit firm_tiers row -- everything else per Part 2's
+# own spec ("everything else -- weight 0.25 default").
+_DEFAULT_FIRM_TIER, _DEFAULT_FIRM_TIER_LABEL, _DEFAULT_FIRM_WEIGHT = 3, "Smaller/Regional", 0.25
+
+
+def _seed_firm_tiers(conn):
+    """No-op once the table has any row -- same discipline as
+    _seed_news_sources, so a user's own edits/removals are never
+    silently re-seeded back in."""
+    if conn.execute("SELECT COUNT(*) FROM firm_tiers").fetchone()[0] > 0:
+        return
+    conn.executemany(
+        "INSERT INTO firm_tiers (firm_name, tier, tier_label, weight) VALUES (?,?,?,?)",
+        _DEFAULT_FIRM_TIERS,
+    )
+    conn.commit()
+
+
+def get_firm_tier(conn, firm_name):
+    """(tier, tier_label, weight) for one firm -- falls back to the
+    documented Tier 3 / 0.25 default (Part 2) for any firm with no
+    explicit firm_tiers row, rather than requiring every possible firm to
+    be pre-seeded."""
+    row = conn.execute(
+        "SELECT tier, tier_label, weight FROM firm_tiers WHERE firm_name=?", (firm_name or "",)
+    ).fetchone()
+    if row:
+        return row[0], row[1], row[2]
+    return _DEFAULT_FIRM_TIER, _DEFAULT_FIRM_TIER_LABEL, _DEFAULT_FIRM_WEIGHT
 
 
 def get_connection(db_path=DEFAULT_DB_PATH):
@@ -908,6 +1355,7 @@ def get_last_timestamp(conn, table, ticker, date_column="fetched_at"):
 # schemas. `table` is validated against this fixed allowlist before being
 # interpolated into SQL, so only these exact literal names are ever used.
 _TABLE_DATE_COLUMNS = {
+    "price_history": "date",
     "options_flow": "fetch_date",
     "dark_pool_signals": "date",
     "divergence_scores": "computed_date",
@@ -1523,6 +1971,30 @@ def _persist_price_history(conn, ticker, hist):
     conn.commit()
 
 
+def _refresh_todays_close(conn, ticker):
+    """Force-fetches TODAY's real daily bar directly and upserts it --
+    bypassing fetch_price_history_delta entirely, which can NEVER be
+    told to re-pull a date it already has a row for (its own "start >
+    today -> SKIPPED" check has no force/override path, regardless of
+    max_age_hours -- that parameter only controls how often it checks
+    for a NEW day, not whether an EXISTING day's row gets refreshed).
+    Added after a real bug report: reconcile_day_predictions was grading
+    same-day sessions against whatever price_history already had for
+    today, which could be an early-session intraday snapshot from hours
+    before close rather than the real settle price (confirmed live: STX
+    showed a $878.42 "close" fetched at 9:50 AM ET, 20 minutes into the
+    session, while the real close was $832.56). _persist_price_history's
+    own ON CONFLICT DO UPDATE correctly overwrites the stale row once
+    real data actually reaches it, which is all this function does."""
+    try:
+        hist = yf.Ticker(ticker).history(period="2d", interval="1d")
+    except Exception:
+        return
+    if not hist.empty:
+        _persist_price_history(conn, ticker, hist)
+        _log_fetch(conn, "price_history", ticker, True, len(hist))
+
+
 def _read_price_history(conn, ticker, days_back=400):
     """Reads price_history back into the same shape yfinance's own
     .history() returns (DatetimeIndex named 'Date', Open/High/Low/Close/
@@ -1665,7 +2137,8 @@ _OPTIONS_FLOW_COLUMNS = [
     "delta", "gamma", "theta", "vega", "rho", "bid", "ask",
 ]
 
-RISK_FREE_RATE_DEFAULT = 0.04  # matches fetch_leaps_candidates' own default -- one assumed rate app-wide
+RISK_FREE_RATE_DEFAULT = 0.04  # fallback ONLY -- used when the live FRED-sourced rate (get_current_risk_free_rate,
+                                # near the end of this file) is unavailable, e.g. no conn in scope or FRED unreachable
 
 
 def bs_price(S, K, T, r, sigma, option_type="call", q=0.0):
@@ -1745,18 +2218,21 @@ def bs_greeks(S, K, T, r, sigma, option_type="call", q=0.0):
 DEFAULT_OPTIONS_MAX_EXPIRATIONS = 8
 
 
-def fetch_options_flow(ticker, max_expirations=DEFAULT_OPTIONS_MAX_EXPIRATIONS):
+def fetch_options_flow(ticker, max_expirations=DEFAULT_OPTIONS_MAX_EXPIRATIONS, conn=None):
     source = DATA_SOURCE_CONFIG.get("options_flow", "yfinance")
     if source == "yfinance":
-        return _fetch_options_flow_yfinance(ticker, max_expirations=max_expirations)
+        return _fetch_options_flow_yfinance(ticker, max_expirations=max_expirations, conn=conn)
     raise NotImplementedError(
         f"options_flow source '{source}' is not implemented. Intended: e.g. "
         "Polygon.io GET /v3/snapshot/options/{ticker} or Tradier GET /v1/markets/options/chains"
     )
 
 
-def _fetch_options_flow_yfinance(ticker, max_expirations=DEFAULT_OPTIONS_MAX_EXPIRATIONS):
+def _fetch_options_flow_yfinance(ticker, max_expirations=DEFAULT_OPTIONS_MAX_EXPIRATIONS, conn=None):
     tk = yf.Ticker(ticker)
+    # Hoisted once per call (not per contract) -- a pure DB read, cheap,
+    # but still redundant to repeat for every strike/expiry in the chain.
+    risk_free_rate = get_current_risk_free_rate(conn)
 
     try:
         underlying_price = float(tk.fast_info["lastPrice"])
@@ -1793,7 +2269,7 @@ def _fetch_options_flow_yfinance(ticker, max_expirations=DEFAULT_OPTIONS_MAX_EXP
                 # smile), so a per-contract Greek needs a per-contract IV.
                 iv = _safe_num(row.get("impliedVolatility"))
                 greeks = (
-                    bs_greeks(underlying_price, strike, T, RISK_FREE_RATE_DEFAULT, iv, option_type=option_type)
+                    bs_greeks(underlying_price, strike, T, risk_free_rate, iv, option_type=option_type)
                     if T is not None and underlying_price is not None
                     else {"delta": None, "gamma": None, "theta": None, "vega": None, "rho": None}
                 )
@@ -1909,7 +2385,7 @@ def cached_options_flow(conn, ticker, max_age_hours=0.25, force_refresh=False,
             return {"data": cached_df, "source": cached_df["source"].iloc[0], "cache_hit": True,
                     "fetched_at": _last_fetch_info(conn, table, ticker)}
     try:
-        df = fetch_options_flow(ticker, max_expirations=max_expirations)
+        df = fetch_options_flow(ticker, max_expirations=max_expirations, conn=conn)
         _persist_options_flow(conn, ticker, df)
         _log_fetch(conn, table, ticker, True, len(df))
         source = df["source"].iloc[0] if not df.empty else DATA_SOURCE_CONFIG.get("options_flow")
@@ -2641,10 +3117,11 @@ def _net_buy_score(pairs):
 
 
 def compute_divergence(ticker, conn):
-    """Scoring formula (weights sum to 1.0 in each blend, documented here so
-    the math stays legible as it evolves):
+    """Scoring formula v2 (weights sum to 1.0 in each blend, documented here
+    so the math stays legible as it evolves):
 
-      smart_signal = 0.30*insider_net + 0.15*congress_net + 0.55*options_smart_net
+      smart_magnitude = 0.30*|insider_net| + 0.15*|congress_net| + 0.55*|options_smart_net|
+      smart_signal    = 0.30*insider_net   + 0.15*congress_net   + 0.55*options_smart_net   (signed, unchanged)
 
         insider_net/congress_net come from Form4/congressional trade data,
         which is high-conviction when present but sparse to the point of
@@ -2658,15 +3135,34 @@ def compute_divergence(ticker, conn):
         insider/congress-only blend does whenever neither feed happens to
         cover that ticker (the common case).
 
-      score = 100 * (0.30*|smart_signal| + 0.25*|retail_signal|
+        v1 fed |smart_signal| (the netted, THEN absolute-valued sum) into
+        the score. That let strong opposing sub-signals cancel each other
+        out before abs() ever saw them -- e.g. a max-magnitude insider SELL
+        (insider_net=-1.0) almost exactly offset a strong bullish options
+        skew (options_smart_net=+0.511), netting to smart_signal=-0.019 and
+        contributing almost nothing to conviction despite two genuinely
+        strong, merely disagreeing, signals. v2 scores conviction on
+        smart_magnitude (sum of each component's own abs value) instead,
+        and keeps the signed smart_signal only for label direction
+        (BULLISH/BEARISH) and for detecting that disagreement explicitly
+        (see CONFLICTED_SIGNALS below). retail_signal has no equivalent bug:
+        it's call_put_skew (a single net ratio, not a sum of independently-
+        signed sub-components) scaled by a non-negative confidence factor,
+        so there's nothing for it to cancel against -- no magnitude/
+        direction split needed there.
+
+      score = 100 * (0.30*smart_magnitude + 0.25*|retail_signal|
                       + 0.20*institutional_magnitude + 0.25*earnings_proximity_magnitude)
 
-        earnings_proximity_magnitude is new: unusual options activity in the
-        days just before an earnings date is a classic smart-money-
-        positioning-ahead-of-catalyst pattern, so it pushes conviction
-        (magnitude, not direction) higher independent of the other three
-        components. Reweighted down from the prior 0.40/0.35/0.25 split to
-        make room for it without diluting the others below relevance.
+        earnings_proximity_magnitude is 0.0 outside a ~5-day pre-earnings
+        window by construction -- true for the large majority of tickers on
+        any given day -- yet held 25% of the weight, structurally capping
+        every non-earnings-window score at 75 before any other math ran.
+        v2 renormalizes across the remaining three weights (0.30/0.25/0.20,
+        summing to 0.75) whenever the earnings-proximity window isn't
+        active, so a maxed-out institutional/smart/retail reading can still
+        reach 100 on an ordinary day instead of being capped by an
+        unusable quarter of the weight budget.
     """
     cur = conn.cursor()
     today = date.today().isoformat()
@@ -2728,6 +3224,10 @@ def compute_divergence(ticker, conn):
 
     W_INSIDER, W_CONGRESS, W_OPTIONS_SMART = 0.30, 0.15, 0.55
     smart_signal = W_INSIDER * insider_net + W_CONGRESS * congress_net + W_OPTIONS_SMART * options_smart_net
+    smart_magnitude = (
+        W_INSIDER * abs(insider_net) + W_CONGRESS * abs(congress_net) + W_OPTIONS_SMART * abs(options_smart_net)
+    )
+    smart_direction = 1 if smart_signal > 0 else (-1 if smart_signal < 0 else 0)
 
     # --- dark pool / institutional component ---
     dp_row = cur.execute(
@@ -2754,14 +3254,42 @@ def compute_divergence(ticker, conn):
         activity_component = min(1.0, unusual_ratio / 0.15)     # saturates at 15% unusual-by-volume
         earnings_proximity_magnitude = round(proximity_component * activity_component, 3)
 
-    score = round(
-        100 * (
-            0.30 * abs(smart_signal) + 0.25 * abs(retail_signal)
-            + 0.20 * institutional_magnitude + 0.25 * earnings_proximity_magnitude
-        ), 1,
-    )
+    # v2: earnings_proximity_magnitude only ever contributes outside its own
+    # 0.25 weight when the pre-earnings window is active -- renormalize
+    # across the other three weights (0.75 total) the rest of the time
+    # rather than structurally capping every non-earnings-window score at
+    # 75 before any other math runs. Same 0<=days_to_earnings<=5 gate
+    # earnings_proximity_magnitude itself is computed under, so "active"
+    # here means "the 0.25 slot is actually usable today."
+    earnings_window_active = days_to_earnings is not None and 0 <= days_to_earnings <= 5
+    if earnings_window_active:
+        score = round(
+            100 * (
+                0.30 * smart_magnitude + 0.25 * abs(retail_signal)
+                + 0.20 * institutional_magnitude + 0.25 * earnings_proximity_magnitude
+            ), 1,
+        )
+    else:
+        active_weight_sum = 0.30 + 0.25 + 0.20
+        score = round(
+            100 * (
+                (0.30 / active_weight_sum) * smart_magnitude + (0.25 / active_weight_sum) * abs(retail_signal)
+                + (0.20 / active_weight_sum) * institutional_magnitude
+            ), 1,
+        )
 
-    if institutional_magnitude > 0.6 and abs(smart_signal) < 0.25 and abs(retail_signal) < 0.25:
+    # v2: a high smart_magnitude that nets to a near-zero signed smart_signal
+    # means the sub-components genuinely disagree (e.g. strong insider
+    # selling against a strong bullish options skew) -- that's worth
+    # surfacing on its own rather than falling through to INSTITUTIONAL_
+    # ACTIVE/NEUTRAL and hiding the fact that two strong, opposing bets
+    # exist. Checked first so it takes priority when it applies; magnitude
+    # floor (0.35) keeps it from firing on genuinely quiet/noisy tickers,
+    # and the >=50%-cancellation ratio keeps it from firing on components
+    # that mostly agree.
+    if smart_magnitude >= 0.35 and abs(smart_signal) < 0.5 * smart_magnitude:
+        label = "CONFLICTED_SIGNALS"
+    elif institutional_magnitude > 0.6 and abs(smart_signal) < 0.25 and abs(retail_signal) < 0.25:
         label = "INSTITUTIONAL_ACTIVE"
     elif abs(retail_signal) > 0.5 and abs(smart_signal) < 0.2:
         label = "RETAIL_FRENZY"
@@ -2779,6 +3307,8 @@ def compute_divergence(ticker, conn):
         "smart_call_signals": smart_call_signals,
         "smart_put_signals": smart_put_signals,
         "smart_signal": round(smart_signal, 3),
+        "smart_magnitude": round(smart_magnitude, 3),
+        "smart_direction": smart_direction,
         "call_vol": call_vol,
         "put_vol": put_vol,
         "call_put_skew": round(call_put_skew, 3),
@@ -2790,25 +3320,28 @@ def compute_divergence(ticker, conn):
         "days_to_earnings": days_to_earnings,
         "atm_avg_iv_pct": atm_avg_iv_pct,
         "earnings_proximity_magnitude": earnings_proximity_magnitude,
+        "earnings_window_active": earnings_window_active,
         "weights": {
             "smart": 0.30, "retail": 0.25, "institutional": 0.20, "earnings_proximity": 0.25,
             "smart_insider": W_INSIDER, "smart_congress": W_CONGRESS, "smart_options": W_OPTIONS_SMART,
         },
+        "score_formula_version": "v2",
     }
 
     cur.execute(
         """
         INSERT INTO divergence_scores
             (ticker, computed_date, score, label, smart_signal, retail_signal,
-             institutional_magnitude, components_json, computed_at)
-        VALUES (?,?,?,?,?,?,?,?,?)
+             institutional_magnitude, components_json, computed_at, score_formula_version)
+        VALUES (?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(ticker, computed_date) DO UPDATE SET
             score=excluded.score, label=excluded.label, smart_signal=excluded.smart_signal,
             retail_signal=excluded.retail_signal, institutional_magnitude=excluded.institutional_magnitude,
-            components_json=excluded.components_json, computed_at=excluded.computed_at
+            components_json=excluded.components_json, computed_at=excluded.computed_at,
+            score_formula_version=excluded.score_formula_version
         """,
         (ticker, today, score, label, smart_signal, retail_signal, institutional_magnitude,
-         json.dumps(components), datetime.utcnow().isoformat()),
+         json.dumps(components), datetime.utcnow().isoformat(), "v2"),
     )
     conn.commit()
 
@@ -2820,6 +3353,7 @@ def compute_divergence(ticker, conn):
         smart_call_signals=smart_call_signals, smart_put_signals=smart_put_signals,
         retail_heat=retail_signal, iv_snapshot=atm_avg_iv_pct,
         price_snapshot=price_row[0] if price_row else None,
+        score_formula_version="v2",
     )
 
     return {"ticker": ticker, "score": score, "label": label, "components": components}
@@ -2833,7 +3367,7 @@ def compute_divergence(ticker, conn):
 # --------------------------------------------------------------------------
 
 def _persist_ticker_snapshot(conn, ticker, score, label, smart_call_signals, smart_put_signals,
-                              retail_heat, iv_snapshot, price_snapshot):
+                              retail_heat, iv_snapshot, price_snapshot, score_formula_version=None):
     earn_row = conn.execute(
         "SELECT next_earnings_date FROM earnings_signal WHERE ticker=? ORDER BY fetched_at DESC LIMIT 1",
         (ticker,),
@@ -2866,10 +3400,11 @@ def _persist_ticker_snapshot(conn, ticker, score, label, smart_call_signals, sma
         """INSERT INTO ticker_snapshots
             (ticker, snapshot_type, hours_to_earnings, conviction_score, divergence_label,
              smart_call_signals, smart_put_signals, retail_heat, iv_snapshot, price_snapshot,
-             earnings_date, fetched_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+             earnings_date, fetched_at, score_formula_version)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (ticker, snapshot_type, hours_to_earnings, score, label, smart_call_signals, smart_put_signals,
-         retail_heat, iv_snapshot, price_snapshot, earnings_date, datetime.utcnow().isoformat()),
+         retail_heat, iv_snapshot, price_snapshot, earnings_date, datetime.utcnow().isoformat(),
+         score_formula_version),
     )
     conn.commit()
 
@@ -3741,7 +4276,13 @@ class Rules:
     max_spread_pct: float = 0.05  # (ask-bid)/mid
 
 
-def build_itm_calls_table(ticker, expiry, risk_free_rate=0.04, dividend_yield=0.0):
+def build_itm_calls_table(ticker, expiry, risk_free_rate=None, dividend_yield=0.0, conn=None):
+    # risk_free_rate=None means "use the live FRED rate" -- resolved here
+    # (not as the default value itself) since a Python default is
+    # evaluated once at module-load time and would freeze whatever the
+    # rate happened to be at import, never updating afterward.
+    if risk_free_rate is None:
+        risk_free_rate = get_current_risk_free_rate(conn)
     t = yf.Ticker(ticker)
 
     hist = t.history(period="5d")
@@ -3839,12 +4380,16 @@ def _option_pl_roi_at_expiry(strike, mid, terminal):
     return pl, roi
 
 
-def fetch_leaps_candidates(ticker, rules=None, risk_free_rate=0.04, dividend_yield=0.0,
-                            terminal_prices=None, top_n=5):
+def fetch_leaps_candidates(ticker, rules=None, risk_free_rate=None, dividend_yield=0.0,
+                            terminal_prices=None, top_n=5, conn=None):
     """Deep-ITM stock-replacement LEAPS scanner. Auto-selects the nearest
     expiry >= rules.min_months_out, filters to contracts passing the
     stock-replacement rules, and returns the `top_n` candidates starting at
-    the borderline (barely-passing) strike and going deeper ITM."""
+    the borderline (barely-passing) strike and going deeper ITM.
+    risk_free_rate=None (default) resolves to the live FRED rate via
+    build_itm_calls_table/get_current_risk_free_rate -- pass conn so that
+    resolution can actually reach the cached rate; an explicit numeric
+    risk_free_rate still overrides it, same as before."""
     rules = rules or Rules()
 
     t = yf.Ticker(ticker)
@@ -3861,7 +4406,7 @@ def fetch_leaps_candidates(ticker, rules=None, risk_free_rate=0.04, dividend_yie
 
     try:
         itm_calls, spot = build_itm_calls_table(
-            ticker, expiry, risk_free_rate=risk_free_rate, dividend_yield=dividend_yield
+            ticker, expiry, risk_free_rate=risk_free_rate, dividend_yield=dividend_yield, conn=conn
         )
     except Exception:
         return pd.DataFrame()
@@ -3948,7 +4493,7 @@ def cached_leaps_candidates(conn, ticker, max_age_hours=1, force_refresh=False):
         if not df.empty:
             return {"data": df, "source": df["source"].iloc[0], "cache_hit": True, "fetched_at": fetched_at}
     try:
-        df = fetch_leaps_candidates(ticker, top_n=5)
+        df = fetch_leaps_candidates(ticker, top_n=5, conn=conn)
         source = "yfinance"
         fetched_at = _persist_leaps(conn, ticker, df, source)
         _log_fetch(conn, table, ticker, True, len(df))
@@ -5681,12 +6226,26 @@ def generate_row_insight(row):
     generation. `row` (a dict or pandas Series) needs option_type/strike/
     expiration plus the *_badge columns annotate_options_badges() adds.
     Returns None if there's no delta badge to build a sentence around."""
-    delta_badge = row.get("delta_badge")
+    # `row` is frequently a per-row pandas Series from DataFrame.iterrows()
+    # -- a well-documented pandas footgun: when a row mixes numeric
+    # columns (strike, volume_oi_ratio, ...) with object/string columns
+    # (the *_badge columns), iterrows() unifies the WHOLE row into one
+    # Series dtype, which can silently coerce a missing badge's real
+    # Python None into a float NaN. `if not badge:`/`bool(nan)` doesn't
+    # catch this -- NaN is truthy in Python -- so a NaN badge slipped
+    # through and crashed " + ".join() downstream with "sequence item N:
+    # expected str instance, float found" (confirmed live). This coerces
+    # every badge back to a real string-or-None immediately, regardless
+    # of which pandas code path produced the row.
+    def _as_badge_str(v):
+        return v if isinstance(v, str) else None
+
+    delta_badge = _as_badge_str(row.get("delta_badge"))
     if not delta_badge:
         return None
-    iv_badge = row.get("iv_badge")
-    vol_oi_badge = row.get("vol_oi_badge")
-    dte_badge = row.get("dte_badge")
+    iv_badge = _as_badge_str(row.get("iv_badge"))
+    vol_oi_badge = _as_badge_str(row.get("vol_oi_badge"))
+    dte_badge = _as_badge_str(row.get("dte_badge"))
 
     option_type = (row.get("option_type") or "").capitalize()
     strike = row.get("strike")
@@ -6431,9 +6990,15 @@ def _build_training_matrix(conn):
          catalyst_status, buyback_json, pre_iv, pre_skew) in rows:
         if actual_direction not in ("UP", "DOWN"):
             continue
+        # v2-only: a v1 divergence score is on a structurally different,
+        # lower scale (see compute_divergence's docstring / get_divergence_
+        # score_trend), so mixing v1/v2 values into one training feature
+        # would teach the model a fake scale discontinuity instead of a
+        # real signal. Falls back to the existing 0.0 default (same as
+        # "no row found at all") until enough v2 history accumulates.
         div_row = conn.execute(
             """SELECT score FROM divergence_scores WHERE ticker=? AND computed_date <= ?
-               ORDER BY computed_date DESC LIMIT 1""",
+               AND score_formula_version='v2' ORDER BY computed_date DESC LIMIT 1""",
             (ticker, earnings_date),
         ).fetchone()
         X.append([
@@ -7721,6 +8286,7 @@ def simulate_earnings_pl(ticker, conn, candidates, market=None):
     spot = market.get("current_price")
     magnitude_pct = market.get("iv_implied_move_pct")
     crush = _estimate_iv_crush_ratio(conn, ticker)
+    risk_free_rate = get_current_risk_free_rate(conn)
 
     if spot is None or magnitude_pct is None:
         return {"scenarios": [], "iv_crush": crush,
@@ -7744,7 +8310,7 @@ def simulate_earnings_pl(ticker, conn, candidates, market=None):
             scenario_spot = spot * (1 + move_pct)
 
             def _theo(sigma):
-                v = bs_price(scenario_spot, strike, T, RISK_FREE_RATE_DEFAULT, sigma, option_type=option_type)
+                v = bs_price(scenario_spot, strike, T, risk_free_rate, sigma, option_type=option_type)
                 if math.isnan(v):
                     v = max((scenario_spot - strike) if option_type == "call" else (strike - scenario_spot), 0.0)
                 return v
@@ -7807,7 +8373,8 @@ def compute_pl_curve_at_expiration(candidate, spot, price_range_pct=0.15, n_poin
 _SCENARIO_CONVENTION_ANCHORS_PCT = {"Down": -6.0, "Flat": 1.5, "Up": 6.5}
 
 
-def compute_pl_curve_at_earnings(candidate, spot, crush, earnings_date, price_range_pct=0.15, n_points=35):
+def compute_pl_curve_at_earnings(candidate, spot, crush, earnings_date, price_range_pct=0.15, n_points=35,
+                                  conn=None):
     """P/L curve valued ON THE EARNINGS DATE itself -- Black-Scholes with
     the remaining time from earnings to expiration and the MODELED post-
     earnings-crush IV (_estimate_iv_crush_ratio) -- not held to
@@ -7832,6 +8399,7 @@ def compute_pl_curve_at_earnings(candidate, spot, crush, earnings_date, price_ra
     days_remaining = max((exp_date - earnings_dt).days, 0)
     T = days_remaining / 365.0
     post_iv_frac = max(0.01, (entry_iv / 100) * crush["ratio"])
+    risk_free_rate = get_current_risk_free_rate(conn)
 
     lo, hi = spot * (1 - price_range_pct), spot * (1 + price_range_pct)
     step = (hi - lo) / (n_points - 1)
@@ -7841,7 +8409,7 @@ def compute_pl_curve_at_earnings(candidate, spot, crush, earnings_date, price_ra
         if T <= 0:
             theo = max(p - strike, 0.0) if option_type == "call" else max(strike - p, 0.0)
         else:
-            theo = bs_price(p, strike, T, RISK_FREE_RATE_DEFAULT, post_iv_frac, option_type=option_type)
+            theo = bs_price(p, strike, T, risk_free_rate, post_iv_frac, option_type=option_type)
             if math.isnan(theo):
                 theo = max(p - strike, 0.0) if option_type == "call" else max(strike - p, 0.0)
         pl_dollar.append(round((theo - entry_price) * 100, 2))
@@ -7855,7 +8423,7 @@ def compute_pl_curve_at_earnings(candidate, spot, crush, earnings_date, price_ra
         if T <= 0:
             theo = max(marker_price - strike, 0.0) if option_type == "call" else max(strike - marker_price, 0.0)
         else:
-            theo = bs_price(marker_price, strike, T, RISK_FREE_RATE_DEFAULT, post_iv_frac, option_type=option_type)
+            theo = bs_price(marker_price, strike, T, risk_free_rate, post_iv_frac, option_type=option_type)
             if math.isnan(theo):
                 theo = max(marker_price - strike, 0.0) if option_type == "call" else max(strike - marker_price, 0.0)
         marker_pl = (theo - entry_price) * 100
@@ -7885,7 +8453,7 @@ def compute_probability_of_profit(spot, breakeven, T, r, sigma, option_type):
     return round(_norm_cdf(d2) if option_type == "call" else _norm_cdf(-d2), 4)
 
 
-def compute_price_date_heatmap(candidate, spot, crush, earnings_date, n_price_levels=9, n_dates=6):
+def compute_price_date_heatmap(candidate, spot, crush, earnings_date, n_price_levels=9, n_dates=6, conn=None):
     """Price(Y) x date(X) grid of estimated P/L% per cell (Part 4) --
     Black-Scholes with time decay applied per date, and the modeled IV
     crush (_estimate_iv_crush_ratio) applied for any date on/after
@@ -7927,6 +8495,7 @@ def compute_price_date_heatmap(candidate, spot, crush, earnings_date, n_price_le
     price_levels = sorted((spot * (1 + pct) for pct in price_pcts), reverse=True)
 
     entry_iv_frac = entry_iv / 100
+    risk_free_rate = get_current_risk_free_rate(conn)
     grid = []
     for p in price_levels:
         row = []
@@ -7937,7 +8506,7 @@ def compute_price_date_heatmap(candidate, spot, crush, earnings_date, n_price_le
             if T <= 0:
                 theo = max(p - strike, 0.0) if option_type == "call" else max(strike - p, 0.0)
             else:
-                theo = bs_price(p, strike, T, RISK_FREE_RATE_DEFAULT, sigma, option_type=option_type)
+                theo = bs_price(p, strike, T, risk_free_rate, sigma, option_type=option_type)
                 if math.isnan(theo):
                     theo = max(p - strike, 0.0) if option_type == "call" else max(strike - p, 0.0)
             row.append({
@@ -8089,14 +8658,14 @@ def analyze_earnings_contract(ticker, conn, candidate, market=None, earnings_dat
     T = max(dte, 1) / 365.0 if dte else None
     pop = (
         compute_probability_of_profit(
-            spot, contract_pl.get("breakeven"), T, RISK_FREE_RATE_DEFAULT, entry_iv / 100 if entry_iv else None,
-            candidate.get("type"),
+            spot, contract_pl.get("breakeven"), T, get_current_risk_free_rate(conn),
+            entry_iv / 100 if entry_iv else None, candidate.get("type"),
         ) if spot and T else None
     )
 
     pl_curve = compute_pl_curve_at_expiration(candidate, spot)
-    pl_curve_earnings = compute_pl_curve_at_earnings(candidate, spot, pl["iv_crush"], earnings_date)
-    heatmap = compute_price_date_heatmap(candidate, spot, pl["iv_crush"], earnings_date)
+    pl_curve_earnings = compute_pl_curve_at_earnings(candidate, spot, pl["iv_crush"], earnings_date, conn=conn)
+    heatmap = compute_price_date_heatmap(candidate, spot, pl["iv_crush"], earnings_date, conn=conn)
     reasoning = generate_contract_reasoning(
         {**candidate, "ticker": ticker}, contract_pl, pop, scenario_matrix=scenario_matrix
     )
@@ -8152,19 +8721,26 @@ def log_earnings_prediction(conn, ticker, probability_result, strategy_result=No
             recommended_strategy = "No directional call -- balanced call/put both shown"
 
     briefing_id = briefing_inputs.get("briefing_id")
+    # MACRO CALENDAR linkage (Part 5, labeling only) -- same 48h-window
+    # mechanism as log_day_prediction, guarded since earnings_date can be
+    # None (no upcoming earnings verdict in the briefing yet).
+    active_macro_events = None
+    if earnings_date:
+        nearby_events = get_macro_events_near(conn, earnings_date, window_hours=48)
+        active_macro_events = json.dumps([e["event_id"] for e in nearby_events]) if nearby_events else None
     conn.execute(
         """INSERT INTO earnings_predictions
                (ticker, earnings_date, predicted_at, mode, prob_up, prob_down, prob_flat,
                 magnitude_estimate_pct, predicted_direction, recommended_strategy, source_briefing_id,
-                scenario_matrix_json, confidence_level, is_final_prediction)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                scenario_matrix_json, confidence_level, is_final_prediction, active_macro_events)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (ticker, earnings_date, datetime.utcnow().isoformat(), probability_result.get("mode"),
          probability_result.get("prob_up"), probability_result.get("prob_down"),
          probability_result.get("prob_flat"), probability_result.get("magnitude_estimate_pct"),
          probability_result.get("predicted_direction"), recommended_strategy,
          str(briefing_id) if briefing_id is not None else None,
          json.dumps(scenario_matrix, default=str) if scenario_matrix else None,
-         probability_result.get("confidence_level"), int(is_final_prediction)),
+         probability_result.get("confidence_level"), int(is_final_prediction), active_macro_events),
     )
     conn.commit()
 
@@ -9378,6 +9954,12 @@ def _read_ai_context_from_cache(ticker, conn, technicals=None, technical_levels=
     return {
         "ticker": ticker,
         "as_of": datetime.utcnow().isoformat(),
+        # Part 9 -- real current Fed funds target range (FRED DFEDTARU/
+        # DFEDTARL via fed_rate_history), pure DB read same as everything
+        # else in this bundle. None if fed_rate_history hasn't been
+        # populated yet (e.g. cached_fed_funds_rate/full_refresh hasn't
+        # run) -- never a fabricated rate.
+        "fed_funds_target_range": get_fed_target_range_text(conn),
         "fundamentals": {
             "name": fundamentals.get("shortName"),
             "sector": fundamentals.get("sector"),
@@ -9709,7 +10291,26 @@ def simulate_intraday_path(current_price, target_price, minutes_remaining, daily
       390 minutes in a trading day, the standard time-scaling -- only
       when neither real intraday source is available yet
     - each step applies np.random.normal(drift_per_step, step_vol) as a
-      log-return shock, producing genuine up/down wiggle texture
+      log-return shock, producing genuine up/down wiggle texture, THEN
+      the whole path is run through a Brownian-bridge correction (see
+      below) so the LAST point always lands exactly on target_price --
+      the earlier "lands approximately on target in expectation, no
+      artificial final-step jump" design was mathematically correct only
+      about the expectation: a single random draw's cumulative variance
+      (step_vol * sqrt(steps)) can be large enough that the realized
+      endpoint lands far from the committed target purely by chance
+      (confirmed live: a real WMT session where target_price was $117.07
+      but the unconstrained walk ended at $125.73, a ~7% miss against a
+      ~0.5% expected move) -- confusing on a chart whose entire point is
+      "a projected path TO the committed target," where the dashed FW
+      TARGET line and the path's own last point visibly disagreeing
+      looks broken. The bridge fixes this while still avoiding the
+      original "artificial final-step jump" concern: the correction
+      needed to reconcile the raw random walk's realized total with
+      total_log_return is distributed proportionally across EVERY step
+      (i/steps at step i), so it's ~0 at the start and grows smoothly,
+      never dumped entirely on the last step. This is the standard
+      technique for "realistic noise between two fixed, known endpoints."
 
     Generate this ONCE per (ticker, session_date) and cache the result
     (see log_day_prediction) -- regenerating on every refresh would mean
@@ -9745,14 +10346,23 @@ def simulate_intraday_path(current_price, target_price, minutes_remaining, daily
 
     start_time = start_time or pd.Timestamp.now(tz="America/New_York")
     rng = np.random.default_rng()
-    price = float(current_price)
+
+    # Raw per-step log-return shocks -- genuine noise texture, generated
+    # first and bridged to the target below (never a single end-of-day
+    # jump; see the docstring).
+    raw_shocks = rng.normal(drift_per_step, step_vol, size=steps)
+    cumulative_raw = np.cumsum(raw_shocks)
+    realized_total = float(cumulative_raw[-1]) if steps else 0.0
+    discrepancy = realized_total - total_log_return
+    correction = np.array([(i + 1) / steps * discrepancy for i in range(steps)])
+    bridged_cumulative = cumulative_raw - correction
+
     t = start_time
-    path = [(t, round(price, 2))]
-    for _ in range(steps):
-        shock = rng.normal(drift_per_step, step_vol)
-        price = price * math.exp(shock)
+    path = [(t, round(float(current_price), 2))]
+    for cum_log_return in bridged_cumulative:
         t = t + timedelta(minutes=step_minutes)
-        path.append((t, round(float(price), 2)))
+        bridged_price = current_price * math.exp(cum_log_return)
+        path.append((t, round(float(bridged_price), 2)))
     return path
 
 
@@ -10430,7 +11040,8 @@ def _read_cached_day_trained_model(conn):
     }
 
 
-def ensure_ticker_data_ready(ticker, conn, daily_max_age_hours=24, intraday_max_age_hours=24):
+def ensure_ticker_data_ready(ticker, conn, daily_max_age_hours=24, intraday_max_age_hours=24,
+                              bootstrap_swing_horizons=None):
     """Synchronous, blocking prerequisite (Part 2 of the data-backfill
     fix) -- called BEFORE compute_day_target for any ticker, every time,
     from the UI layer (render_day_prediction_panel, and any future Day
@@ -10439,6 +11050,15 @@ def ensure_ticker_data_ready(ticker, conn, daily_max_age_hours=24, intraday_max_
     away: this fetches whatever's missing/stale RIGHT NOW and returns
     once done -- a couple of real API calls, seconds, not a background
     job or a multi-day wait.
+
+    `bootstrap_swing_horizons`: optional list of horizon_days values
+    (e.g. [3, 5, 10]) -- SWING FORECAST's own addition, added as a new
+    parameter with a safe default (None) so every EXISTING call site
+    (which never passes this) behaves 100% identically to before. When
+    given, ALSO bootstraps backtest_swing_forecasts() for each listed
+    horizon once daily history is usable, same "once, ever, per
+    (ticker, horizon)" idempotence as the Day Prediction backtest
+    bootstrap immediately below.
 
     Checks two things:
     1. 1-year daily OHLCV (price_history) -- the hard prerequisite;
@@ -10519,6 +11139,23 @@ def ensure_ticker_data_ready(ticker, conn, daily_max_age_hours=24, intraday_max_
                     fetched_now.append(
                         f"historical backtest ({bt_result['sessions_logged']} qualifying session(s) logged "
                         f"from the last {bt_result['lookback_days']} trading days)"
+                    )
+            except Exception:
+                pass
+
+    if daily_ready and bootstrap_swing_horizons:
+        for h in bootstrap_swing_horizons:
+            already_swing_backtested = conn.execute(
+                "SELECT 1 FROM swing_backtest_runs WHERE ticker=? AND horizon_days=? LIMIT 1", (ticker, h)
+            ).fetchone()
+            if already_swing_backtested:
+                continue
+            try:
+                sbt_result = backtest_swing_forecasts(ticker, conn, h)
+                if sbt_result.get("ok"):
+                    fetched_now.append(
+                        f"{h}-day swing forecast backtest ({sbt_result['sessions_logged']} qualifying "
+                        f"session(s) logged)"
                     )
             except Exception:
                 pass
@@ -10712,6 +11349,14 @@ def log_day_prediction(conn, ticker, prediction_result):
         )
     path_json = json.dumps([[t.isoformat(), p] for t, p in simulated_path])
 
+    # MACRO CALENDAR linkage (Part 5, labeling only -- no impact model
+    # yet): whatever's scheduled within 48h of this session, so a future
+    # analysis can ask "did predictions made near FOMC/CPI have higher
+    # error" once enough reconciled history exists. Never fails the
+    # commit if macro_events isn't populated yet -- just an empty list.
+    nearby_events = get_macro_events_near(conn, prediction_result["session_date"], window_hours=48)
+    active_macro_events = json.dumps([e["event_id"] for e in nearby_events]) if nearby_events else None
+
     if promote_from_backtest:
         # Full overwrite, not just the path -- model_start_time/price,
         # target, mode, etc. all need to become the real live values;
@@ -10722,9 +11367,10 @@ def log_day_prediction(conn, ticker, prediction_result):
                    model_start_time=?, model_start_price=?, target_price=?, predicted_direction=?,
                    magnitude_estimate_pct=?, lean_pre_model=?, rsi14=?, macd_histogram=?,
                    volume_vs_20d_avg_pct=?, trend_score=?, mode=?, confidence_level=?,
-                   backtest_error_pct=?, simulated_path_json=?, source='live', predicted_at=?,
-                   actual_close_price=NULL, actual_direction=NULL, prediction_correct_direction=NULL,
-                   error_pct=NULL, reconciliation_notes=NULL, reconciled_at=NULL, path_mean_abs_error_pct=NULL
+                   backtest_error_pct=?, simulated_path_json=?, source='live', active_macro_events=?,
+                   predicted_at=?, actual_close_price=NULL, actual_direction=NULL,
+                   prediction_correct_direction=NULL, error_pct=NULL, reconciliation_notes=NULL,
+                   reconciled_at=NULL, path_mean_abs_error_pct=NULL
                WHERE ticker=? AND session_date=?""",
             (prediction_result["model_start_time"], prediction_result["model_start_price"],
              prediction_result["target_price"], prediction_result["predicted_direction"],
@@ -10732,8 +11378,8 @@ def log_day_prediction(conn, ticker, prediction_result):
              prediction_result.get("rsi14"), prediction_result.get("macd_histogram"),
              prediction_result.get("volume_vs_20d_avg_pct"), prediction_result.get("trend_score"),
              prediction_result["mode"], prediction_result["confidence_level"],
-             prediction_result.get("backtest_error_pct"), path_json, datetime.utcnow().isoformat(),
-             ticker, prediction_result["session_date"]),
+             prediction_result.get("backtest_error_pct"), path_json, active_macro_events,
+             datetime.utcnow().isoformat(), ticker, prediction_result["session_date"]),
         )
         conn.commit()
         return
@@ -10752,15 +11398,17 @@ def log_day_prediction(conn, ticker, prediction_result):
         """INSERT OR IGNORE INTO day_predictions
                (ticker, session_date, model_start_time, model_start_price, target_price, predicted_direction,
                 magnitude_estimate_pct, lean_pre_model, rsi14, macd_histogram, volume_vs_20d_avg_pct,
-                trend_score, mode, confidence_level, backtest_error_pct, simulated_path_json, source, predicted_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                trend_score, mode, confidence_level, backtest_error_pct, simulated_path_json, source,
+                active_macro_events, predicted_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (ticker, prediction_result["session_date"], prediction_result["model_start_time"],
          prediction_result["model_start_price"], prediction_result["target_price"],
          prediction_result["predicted_direction"], prediction_result["magnitude_estimate_pct"],
          prediction_result["lean_pre_model"], prediction_result.get("rsi14"),
          prediction_result.get("macd_histogram"), prediction_result.get("volume_vs_20d_avg_pct"),
          prediction_result.get("trend_score"), prediction_result["mode"], prediction_result["confidence_level"],
-         prediction_result.get("backtest_error_pct"), path_json, "live", datetime.utcnow().isoformat()),
+         prediction_result.get("backtest_error_pct"), path_json, "live", active_macro_events,
+         datetime.utcnow().isoformat()),
     )
     conn.commit()
 
@@ -10774,23 +11422,45 @@ def get_committed_day_prediction(conn, ticker, session_date):
     on every refresh. `simulated_path` is decoded back into (Timestamp,
     price) tuples -- the exact same list simulate_intraday_path returned
     at commit time, read by both the chart and the comparison table so
-    they can never disagree (Part 3)."""
+    they can never disagree (Part 3).
+
+    Also selects the reconciliation/outcome fields (actual_close_price,
+    reconciled_at, error_pct, prediction_correct_direction,
+    actual_direction, reconciliation_notes) -- added after a real bug
+    report: this function originally only carried the fields needed
+    while a session was still IN PROGRESS, so once the session actually
+    closed and reconcile_day_predictions() populated the real outcome in
+    the DB, the live panel kept showing "Pending"/"--" indefinitely (all
+    evening, until the calendar date rolled over) because compute_day_
+    target's own readiness check has no "session has ended" cutoff --
+    it just checks whether the buffer window has passed, which stays
+    true for the rest of the day. Confirmed live: STX's row had
+    reconciled_at/actual_close_price/error_pct all populated correctly
+    in the DB (close $878.42, error +4.93%) while the panel still showed
+    "Pending"/"--"/"--", because this function was never returning those
+    columns for the UI to read in the first place."""
     row = conn.execute(
         """SELECT model_start_time, model_start_price, target_price, predicted_direction,
-                  magnitude_estimate_pct, mode, confidence_level, backtest_error_pct, simulated_path_json
+                  magnitude_estimate_pct, mode, confidence_level, backtest_error_pct, simulated_path_json,
+                  active_macro_events, actual_close_price, actual_direction, prediction_correct_direction,
+                  error_pct, reconciliation_notes, reconciled_at
            FROM day_predictions WHERE ticker=? AND session_date=?""",
         (ticker, session_date),
     ).fetchone()
     if not row:
         return None
     keys = ["model_start_time", "model_start_price", "target_price", "predicted_direction",
-            "magnitude_estimate_pct", "mode", "confidence_level", "backtest_error_pct", "simulated_path_json"]
+            "magnitude_estimate_pct", "mode", "confidence_level", "backtest_error_pct", "simulated_path_json",
+            "active_macro_events", "actual_close_price", "actual_direction", "prediction_correct_direction",
+            "error_pct", "reconciliation_notes", "reconciled_at"]
     result = dict(zip(keys, row))
     path_json = result.pop("simulated_path_json")
     if path_json:
         result["simulated_path"] = [(pd.Timestamp(t), p) for t, p in json.loads(path_json)]
     else:
         result["simulated_path"] = []
+    active_events_json = result.pop("active_macro_events")
+    result["active_macro_event_ids"] = json.loads(active_events_json) if active_events_json else []
     return result
 
 
@@ -10812,7 +11482,7 @@ def get_most_recent_day_prediction(conn, ticker):
         """SELECT session_date, model_start_time, model_start_price, target_price, predicted_direction,
                   magnitude_estimate_pct, mode, confidence_level, backtest_error_pct, simulated_path_json,
                   actual_close_price, actual_direction, prediction_correct_direction, error_pct,
-                  reconciliation_notes, reconciled_at
+                  reconciliation_notes, reconciled_at, active_macro_events
            FROM day_predictions WHERE ticker=? AND COALESCE(source,'live')='live'
            ORDER BY session_date DESC LIMIT 1""",
         (ticker,),
@@ -10822,8 +11492,10 @@ def get_most_recent_day_prediction(conn, ticker):
     keys = ["session_date", "model_start_time", "model_start_price", "target_price", "predicted_direction",
             "magnitude_estimate_pct", "mode", "confidence_level", "backtest_error_pct", "simulated_path_json",
             "actual_close_price", "actual_direction", "prediction_correct_direction", "error_pct",
-            "reconciliation_notes", "reconciled_at"]
+            "reconciliation_notes", "reconciled_at", "active_macro_events"]
     result = dict(zip(keys, row))
+    active_events_json = result.pop("active_macro_events")
+    result["active_macro_event_ids"] = json.loads(active_events_json) if active_events_json else []
     path_json = result.pop("simulated_path_json")
     result["simulated_path"] = [(pd.Timestamp(t), p) for t, p in json.loads(path_json)] if path_json else []
     return result
@@ -10868,6 +11540,9 @@ def get_intraday_bars_for_session(conn, ticker, session_date):
     return hist[hist.index.date == target_date]
 
 
+DAY_PREDICTION_MIN_SNAPSHOT_SPACING_SECONDS = 60
+
+
 def should_log_day_prediction_snapshot(conn, ticker, session_date, now_et=None):
     """The hard gate a bug report confirmed was completely missing:
     real market hours (9:30-4:00 ET) on a real trading weekday, PLUS
@@ -10877,13 +11552,38 @@ def should_log_day_prediction_snapshot(conn, ticker, session_date, now_et=None):
     stale auto-refresh fragment still firing) is a no-op -- this is
     what stops the repeated identical-price rows logged hours after the
     session ended (confirmed live: MU/WDC both had 6 identical rows
-    between 6:17 PM and 7:39 PM ET)."""
+    between 6:17 PM and 7:39 PM ET).
+
+    Second gate, added after a real bug report: st.fragment(run_every=X)
+    only means "ALSO rerun on this timer" -- it still fully re-executes
+    on every OTHER rerun too (any widget touched anywhere on the page,
+    a browser reconnect, etc.), so "5 min" in the UI never actually
+    limited how often a snapshot got logged. Confirmed live: WMT logged
+    3 snapshots 7-14 seconds apart, all displayed as the same "10:02 AM"
+    minute, looking like duplicate/stuck data. This enforces a real
+    floor (DAY_PREDICTION_MIN_SNAPSHOT_SPACING_SECONDS, 60s) regardless
+    of what triggered the call -- independent of the market-hours gate
+    above, and not a replacement for the UI's own refresh-interval
+    selection (which controls the fragment's OWN timer cadence, a much
+    coarser, user-chosen interval on top of this hard floor)."""
     now_et = now_et or pd.Timestamp.now(tz="America/New_York")
     if now_et.weekday() >= 5:
         return False
     market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
     market_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
     if market_open <= now_et <= market_close:
+        last_snap = conn.execute(
+            """SELECT snapshot_time FROM day_prediction_snapshots
+               WHERE ticker=? AND session_date=? ORDER BY snapshot_time DESC LIMIT 1""",
+            (ticker, session_date),
+        ).fetchone()
+        if last_snap and last_snap[0]:
+            last_t = pd.Timestamp(last_snap[0])
+            if last_t.tzinfo is None:
+                last_t = last_t.tz_localize("UTC")
+            now_utc = now_et.tz_convert("UTC")
+            if (now_utc - last_t).total_seconds() < DAY_PREDICTION_MIN_SNAPSHOT_SPACING_SECONDS:
+                return False
         return True
     if now_et > market_close:
         close_cutoff_utc = market_close.tz_convert("UTC").tz_localize(None).isoformat()
@@ -10960,19 +11660,43 @@ def reconcile_day_predictions(conn):
     4pm ET close already happened. Now computed from real ET wall-clock
     time: today's session becomes eligible the moment close has passed,
     which is also the exact trigger point log_day_prediction_snapshot
-    calls this from right after logging the final closing print."""
+    calls this from right after logging the final closing print.
+
+    Real-close freshness fix (this bug report): allowing SAME-DAY
+    reconciliation (the fix directly above) broke an assumption this
+    docstring used to state as fact -- "populated by the normal
+    fetch_price_history_delta path once the NEXT session's fetch runs."
+    That's true for a genuinely PAST session (some routine fetch since
+    then has naturally re-pulled it as history), but for TODAY'S OWN
+    session there has been no "next session" yet, so price_history's row
+    for today could still be whatever a routine intraday fetch grabbed
+    HOURS before close -- a live snapshot, not the real settle price.
+    Confirmed live: STX's stored close was $878.42 (fetched 9:50 AM ET,
+    20 minutes into the session) while the real close was $832.56 --
+    reconciliation graded against a stale mid-morning price and called
+    the direction wrong when a same-day-aware read would have called it
+    (target $837.13 vs. real close $832.56 -- both below model_start
+    $866.5x, i.e. DOWN, matching the BEARISH call). Fixed by forcing a
+    genuinely fresh pull (max_age_hours=0) whenever the row being graded
+    is TODAY'S OWN session, before reading price_history at all."""
     now_et = pd.Timestamp.now(tz="America/New_York")
     market_close_today = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
     cutoff_date = now_et.date() if now_et >= market_close_today else (now_et - timedelta(days=1)).date()
+    today_str = now_et.date().isoformat()
     rows = conn.execute(
         """SELECT id, ticker, session_date, model_start_price, target_price, predicted_direction,
-                  simulated_path_json
+                  simulated_path_json, active_macro_events
            FROM day_predictions WHERE reconciled_at IS NULL AND session_date <= ?""",
         (cutoff_date.isoformat(),),
     ).fetchall()
     reconciled_count = 0
     for (pred_id, ticker, session_date, model_start_price, target_price, predicted_direction,
-         path_json) in rows:
+         path_json, active_macro_events_json) in rows:
+        if session_date == today_str:
+            # fetch_price_history_delta can't do this -- it never re-pulls
+            # a date it already has a row for, regardless of max_age_hours
+            # (confirmed live; see _refresh_todays_close's own docstring).
+            _refresh_todays_close(conn, ticker)
         close_row = conn.execute(
             "SELECT close FROM price_history WHERE ticker=? AND date=?", (ticker, session_date)
         ).fetchone()
@@ -11024,6 +11748,17 @@ def reconcile_day_predictions(conn):
                         f"intraday move the model's morning-only inputs couldn't have captured."
                     )
 
+        # MACRO CALENDAR linkage (Part 5.4) -- surface plainly whatever
+        # was scheduled near this session, labeling only (no claim that
+        # it explains the outcome; that needs real reconciled history to
+        # learn from, which is exactly what this labeling accumulates).
+        macro_note = ""
+        if active_macro_events_json:
+            nearby = get_macro_events_by_id(conn, json.loads(active_macro_events_json))
+            if nearby:
+                names = "; ".join(f"{e['event_name']} ({e['scheduled_date']})" for e in nearby)
+                macro_note = f" Note: {names} was scheduled within 48h of this session."
+
         notes = (
             f"Predicted {target_move_pct:+.2f}% to ${target_price:.2f}; actual close ${actual_close:.2f} "
             f"({actual_move_pct:+.2f}% vs. predicted {predicted_direction or 'n/a'}) -- "
@@ -11032,6 +11767,7 @@ def reconcile_day_predictions(conn):
                f"snapshot(s)." if path_mean_abs_error_pct is not None else " No logged snapshots to grade the "
                f"path shape against for this session.")
             + reversal_note
+            + macro_note
         )
         conn.execute(
             """UPDATE day_predictions SET actual_close_price=?, actual_direction=?,
@@ -11220,6 +11956,1900 @@ def calibrate_day_prediction_model(conn, target_error_pct=3.0):
 
 
 # --------------------------------------------------------------------------
+# MACRO CALENDAR -- a standalone, ticker-agnostic event log of officially
+# scheduled economic/Fed releases (FRED + the Federal Reserve's published
+# FOMC calendar). Deliberately scoped OUT: unscheduled events (political
+# press conferences, ad hoc announcements, tariff timing) -- no reliable
+# structured free source exists for those; NEWS and the AI Briefing's
+# catalyst detection cover them once they occur or are formally announced.
+# --------------------------------------------------------------------------
+
+FRED_API_BASE = "https://api.stlouisfed.org/fred"
+
+# The Fed publishes each year's FOMC calendar roughly a year in advance
+# and it does not change once published -- there is no live API for it,
+# so this is a stored, human-maintained table (verified directly against
+# https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm on
+# 2026-08-19), refreshed by editing this list whenever the Fed publishes
+# the next year's dates. The rate decision is announced on the SECOND day
+# of each 2-day meeting, 2:00 PM ET statement release (SEP meetings also
+# hold a 2:30 PM press conference, but 2:00 PM is the market-moving
+# instant this calendar marks).
+FOMC_MEETING_DATES = {
+    # date of the rate-decision announcement (2nd day) -> has_sep
+    "2025-01-29": False, "2025-03-19": True, "2025-05-07": False, "2025-06-18": True,
+    "2025-07-30": False, "2025-09-17": True, "2025-10-29": False, "2025-12-10": True,
+    "2026-01-28": False, "2026-03-18": True, "2026-04-29": False, "2026-06-17": True,
+    "2026-07-29": False, "2026-09-16": True, "2026-10-28": False, "2026-12-09": True,
+    "2027-01-27": False, "2027-03-17": True, "2027-04-28": False, "2027-06-09": True,
+    "2027-07-28": False, "2027-09-15": True, "2027-10-27": False, "2027-12-08": True,
+}
+
+# series_id -> (event_type, human name, FRED release-time convention).
+# FRED itself has no "forecast/consensus" concept (that's proprietary,
+# not a free official source) -- forecast_value is always left NULL for
+# these, stated plainly wherever shown, never fabricated.
+FRED_MACRO_SERIES = {
+    "CPIAUCSL": ("cpi", "Consumer Price Index (CPI)", "08:30"),
+    "PCEPILFE": ("pce", "Core PCE Price Index", "08:30"),
+    "PAYEMS": ("nfp", "Nonfarm Payrolls (Employment Situation)", "08:30"),
+    "ICSA": ("jobless_claims", "Initial Jobless Claims", "08:30"),
+    "GDP": ("gdp", "Gross Domestic Product (GDP)", "08:30"),
+    "RSAFS": ("retail_sales", "Retail Sales", "08:30"),
+}
+
+_MACRO_IMPACT_LEVEL = {
+    "fomc_rate_decision": "High", "cpi": "High", "nfp": "High",
+    "pce": "Medium", "gdp": "Medium", "retail_sales": "Medium",
+    "jobless_claims": "Low",
+}
+
+
+def _format_et_time_12h(time_24h):
+    """'08:30' -> '8:30 AM ET', '14:00' -> '2:00 PM ET'."""
+    if not time_24h:
+        return None
+    return pd.Timestamp(f"2000-01-01 {time_24h}").strftime("%-I:%M %p") + " ET"
+
+
+def fetch_fomc_schedule(conn):
+    """FOMC meeting dates published directly by the Federal Reserve --
+    small, fixed, official annual schedule (8 meetings/year), maintained
+    as FOMC_MEETING_DATES above (see that constant's docstring for the
+    refresh process). Tags source="federal_reserve". prior_value is the
+    real current fed funds target range (FRED series DFEDTARL/DFEDTARU)
+    so at least one genuinely useful number accompanies every FOMC row;
+    forecast_value/actual_value are left NULL -- reliably determining
+    whether/how the range changed at a past meeting needs more careful
+    date-matching than this integration attempts yet, and a fabricated
+    guess would be worse than an honest blank.
+
+    Returns the list of event dicts inserted/updated, same shape as
+    fetch_fred_events."""
+    prior_range = None
+    try:
+        upper = _fred_latest_observation(conn, "DFEDTARU")
+        lower = _fred_latest_observation(conn, "DFEDTARL")
+        if upper is not None and lower is not None:
+            prior_range = f"{lower:.2f}%-{upper:.2f}%"
+    except Exception:
+        prior_range = None
+
+    events = []
+    now_str = datetime.utcnow().isoformat()
+    for date_str, has_sep in FOMC_MEETING_DATES.items():
+        name = "FOMC Rate Decision" + (" + Summary of Economic Projections" if has_sep else "")
+        events.append({
+            "event_id": f"FOMC_{date_str}", "event_type": "fomc_rate_decision", "event_name": name,
+            "scheduled_date": date_str, "scheduled_time_et": "14:00", "source": "federal_reserve",
+            "prior_value": prior_range, "forecast_value": None, "actual_value": None,
+            "impact_level": _MACRO_IMPACT_LEVEL["fomc_rate_decision"], "fetched_at": now_str,
+        })
+    _upsert_macro_events(conn, events)
+    return events
+
+
+def _fred_get(path, params, api_key, timeout=10):
+    p = dict(params)
+    p["api_key"] = api_key
+    p["file_type"] = "json"
+    resp = requests.get(f"{FRED_API_BASE}/{path}", params=p, timeout=timeout)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _fred_latest_observation(conn, series_id):
+    """The single most recent real observation value for a FRED series,
+    or None on any failure -- used for FOMC's prior_value (current rate
+    range) and as the fallback "latest known reading" for a series whose
+    next scheduled release hasn't happened yet."""
+    api_key = os.environ.get("FRED_API_KEY")
+    if not api_key:
+        return None
+    data = _fred_get("series/observations", {
+        "series_id": series_id, "sort_order": "desc", "limit": 1,
+    }, api_key)
+    obs = data.get("observations") or []
+    if not obs or obs[0].get("value") in (None, "."):
+        return None
+    try:
+        return float(obs[0]["value"])
+    except (TypeError, ValueError):
+        return None
+
+
+def fetch_fred_events(conn, series_ids=None):
+    """Real FRED release schedule + values for the macro series this
+    calendar tracks (CPI/Core PCE/NFP/Jobless Claims/GDP/Retail Sales by
+    default -- see FRED_MACRO_SERIES). For each series: resolves its
+    FRED release_id (series/release), pulls both past and near-future
+    scheduled release dates (release/dates), and the series' own
+    observation history (series/observations) to attach a real prior/
+    actual value to each date -- a past release's actual_value is the
+    observation whose period most plausibly corresponds to it (nearest
+    prior observation within 45 days, a reasonable heuristic for
+    monthly/quarterly/weekly release cadences, not a guaranteed exact
+    vintage match); an upcoming release's prior_value is simply the most
+    recently known reading. forecast_value is always NULL -- FRED has no
+    consensus/forecast concept, only actuals and release dates.
+
+    Requires FRED_API_KEY (see setup_env.sh). Raises on failure (no key,
+    network error, bad response) rather than failing silently -- the
+    caller (cached_macro_events) logs this to fetch_log so SETTINGS shows
+    a clear down/error status instead of a silently empty calendar."""
+    api_key = os.environ.get("FRED_API_KEY")
+    if not api_key:
+        raise RuntimeError("FRED_API_KEY not set -- see setup_env.sh")
+    series_ids = series_ids or list(FRED_MACRO_SERIES.keys())
+
+    today = pd.Timestamp.now(tz="America/New_York").date()
+    window_start = (today - timedelta(days=120)).isoformat()
+    window_end = (today + timedelta(days=180)).isoformat()
+
+    events = []
+    now_str = datetime.utcnow().isoformat()
+    for series_id in series_ids:
+        if series_id not in FRED_MACRO_SERIES:
+            continue
+        event_type, event_name, time_et = FRED_MACRO_SERIES[series_id]
+
+        release_info = _fred_get("series/release", {"series_id": series_id}, api_key)
+        releases = release_info.get("releases") or []
+        if not releases:
+            continue
+        release_id = releases[0]["id"]
+
+        dates_info = _fred_get("release/dates", {
+            "release_id": release_id, "include_release_dates_with_no_data": "true",
+            "realtime_start": window_start, "realtime_end": window_end,
+        }, api_key)
+        release_dates = sorted(d["date"] for d in (dates_info.get("release_dates") or []))
+
+        obs_info = _fred_get("series/observations", {
+            "series_id": series_id, "sort_order": "desc", "limit": 24,
+        }, api_key)
+        observations = [
+            (o["date"], o["value"]) for o in (obs_info.get("observations") or [])
+            if o.get("value") not in (None, ".")
+        ]  # newest first
+
+        latest_value = observations[0][1] if observations else None
+
+        for date_str in release_dates:
+            is_past = date_str <= today.isoformat()
+            actual_value, prior_value = None, latest_value
+            if is_past:
+                # Nearest observation dated on/before this release, within
+                # a 45-day window -- the heuristic documented above.
+                cutoff = (pd.Timestamp(date_str) - timedelta(days=45)).date().isoformat()
+                match_idx = next(
+                    (i for i, (odate, _) in enumerate(observations) if cutoff <= odate <= date_str), None
+                )
+                if match_idx is not None:
+                    actual_value = observations[match_idx][1]
+                    prior_value = observations[match_idx + 1][1] if match_idx + 1 < len(observations) else None
+            events.append({
+                "event_id": f"{event_type.upper()}_{date_str}", "event_type": event_type,
+                "event_name": event_name, "scheduled_date": date_str, "scheduled_time_et": time_et,
+                "source": "fred", "prior_value": prior_value, "forecast_value": None,
+                "actual_value": actual_value, "impact_level": _MACRO_IMPACT_LEVEL.get(event_type, "Medium"),
+                "fetched_at": now_str,
+            })
+    _upsert_macro_events(conn, events)
+    return events
+
+
+def _upsert_macro_events(conn, events):
+    for ev in events:
+        conn.execute(
+            """INSERT INTO macro_events
+                   (event_id, event_type, event_name, scheduled_date, scheduled_time_et, source,
+                    prior_value, forecast_value, actual_value, impact_level, fetched_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(event_id) DO UPDATE SET
+                   actual_value=excluded.actual_value, prior_value=excluded.prior_value,
+                   forecast_value=excluded.forecast_value, fetched_at=excluded.fetched_at""",
+            (ev["event_id"], ev["event_type"], ev["event_name"], ev["scheduled_date"],
+             ev["scheduled_time_et"], ev["source"], ev["prior_value"], ev["forecast_value"],
+             ev["actual_value"], ev["impact_level"], ev["fetched_at"]),
+        )
+    conn.commit()
+
+
+def cached_macro_events(conn, max_age_hours=24, force_refresh=False):
+    """The single entry point the MACRO CALENDAR tab (and everything else
+    that needs event data) calls -- 24h TTL via the same fetch_log/
+    should_refetch mechanism every other cached_* wrapper uses, keyed on
+    the _MARKET_KEY sentinel since this is market-wide, not per-ticker.
+    FOMC and FRED are fetched/logged independently -- if FRED is down,
+    the FOMC schedule (which needs no network call beyond the optional
+    rate-range lookup) still succeeds and is still usable; each failure
+    is logged to fetch_log separately so SETTINGS can show FRED as down
+    without implicating the FOMC schedule."""
+    if force_refresh or should_refetch(conn, "macro_events", None, max_age_hours):
+        try:
+            fetch_fomc_schedule(conn)
+            _log_fetch(conn, "macro_events_fomc", None, True, rows_returned=len(FOMC_MEETING_DATES))
+        except Exception as e:
+            _log_fetch(conn, "macro_events_fomc", None, False, error_message=str(e))
+        try:
+            fred_events = fetch_fred_events(conn)
+            _log_fetch(conn, "macro_events", None, True, rows_returned=len(fred_events))
+        except Exception as e:
+            _log_fetch(conn, "macro_events", None, False, error_message=str(e))
+
+    rows = conn.execute(
+        """SELECT event_id, event_type, event_name, scheduled_date, scheduled_time_et, source,
+                  prior_value, forecast_value, actual_value, impact_level, fetched_at
+           FROM macro_events ORDER BY scheduled_date"""
+    ).fetchall()
+    keys = ["event_id", "event_type", "event_name", "scheduled_date", "scheduled_time_et", "source",
+            "prior_value", "forecast_value", "actual_value", "impact_level", "fetched_at"]
+    return [dict(zip(keys, r)) for r in rows]
+
+
+def get_macro_events_in_range(conn, start_date, end_date, overlay_impact_filter="auto"):
+    """Every scheduled macro_events row within [start_date, end_date].
+
+    `overlay_impact_filter` is scoped ONLY to chart-overlay rendering
+    (Fundamentals/Ticker Deep-Dive/Day Prediction price charts) -- it
+    never changes what's stored in macro_events or what the MACRO
+    CALENDAR tab shows (that tab doesn't call this function at all; it
+    reads cached_macro_events() directly and does its own, unfiltered,
+    date-range slicing).
+      - None: no filtering -- every scheduled event in range, exactly
+        the original behavior. Used internally by get_macro_events_near
+        (the day_predictions/earnings_predictions linkage), which must
+        always see the FULL event set regardless of any chart's display
+        preferences.
+      - "auto" (default): filters by how WIDE the requested range is --
+        <=5 days: every impact level; 6-90 days: High+Medium; >90 days:
+        High only. This exists solely because a wide price chart with
+        every Low-impact weekly jobless-claims marker crammed in reads
+        as visual noise, not because those events matter any less --
+        the MACRO CALENDAR tab (and the prediction linkage) are
+        unaffected and keep showing everything.
+    Any other value is treated as "no recognized filter" and returns
+    every event in range, unfiltered -- this never silently drops data
+    for an unrecognized filter mode."""
+    start = pd.Timestamp(start_date).date().isoformat()
+    end = pd.Timestamp(end_date).date().isoformat()
+    rows = conn.execute(
+        """SELECT event_id, event_type, event_name, scheduled_date, scheduled_time_et, impact_level
+           FROM macro_events WHERE scheduled_date BETWEEN ? AND ? ORDER BY scheduled_date""",
+        (start, end),
+    ).fetchall()
+    keys = ["event_id", "event_type", "event_name", "scheduled_date", "scheduled_time_et", "impact_level"]
+    results = [dict(zip(keys, r)) for r in rows]
+
+    if overlay_impact_filter != "auto":
+        return results
+    span_days = (pd.Timestamp(end) - pd.Timestamp(start)).days
+    if span_days <= 5:
+        allowed = {"High", "Medium", "Low"}
+    elif span_days <= 90:
+        allowed = {"High", "Medium"}
+    else:
+        allowed = {"High"}
+    return [e for e in results if e["impact_level"] in allowed]
+
+
+def get_macro_events_near(conn, reference_date, window_hours=48):
+    """Real, scheduled macro_events within window_hours of reference_date
+    (a date string) -- used to tag a prediction with nearby macro
+    catalysts at commit time (Part 5: labeling only, no impact model).
+    Explicitly unfiltered (overlay_impact_filter=None) -- this feeds
+    day_predictions/earnings_predictions' active_macro_events column,
+    which must always reflect the FULL real event set, never the
+    chart-display filter above."""
+    ref = pd.Timestamp(reference_date)
+    start = (ref - timedelta(hours=window_hours)).date().isoformat()
+    end = (ref + timedelta(hours=window_hours)).date().isoformat()
+    return get_macro_events_in_range(conn, start, end, overlay_impact_filter=None)
+
+
+def get_macro_events_by_id(conn, event_ids):
+    """Resolves stored macro_events.event_id values (e.g. from a
+    prediction's active_macro_events column) back to their display info
+    -- used for Part 5.4's "Note: X was scheduled this day"."""
+    if not event_ids:
+        return []
+    placeholders = ",".join("?" * len(event_ids))
+    rows = conn.execute(
+        f"""SELECT event_id, event_name, scheduled_date, scheduled_time_et, impact_level
+            FROM macro_events WHERE event_id IN ({placeholders}) ORDER BY scheduled_date""",
+        event_ids,
+    ).fetchall()
+    keys = ["event_id", "event_name", "scheduled_date", "scheduled_time_et", "impact_level"]
+    return [dict(zip(keys, r)) for r in rows]
+
+
+# Simple, defensible watchlist-relevance rules (Part 3) -- beta comes
+# from cached_fundamentals' info dict (yfinance's own beta figure);
+# sector/industry strings are matched case-insensitively since yfinance's
+# casing isn't perfectly consistent across tickers.
+_HIGH_BETA_THRESHOLD = 1.5
+_RATE_SENSITIVE_SECTORS = {"real estate", "financial services", "utilities"}
+_CONSUMER_SECTORS = {"consumer cyclical", "consumer defensive"}
+
+
+def get_watchlist_relevant_tickers(conn, event_type, watchlist):
+    """Which current watchlist tickers are most likely affected by an
+    event of this type, using simple defensible rules (Part 3):
+      - fomc_rate_decision: high-beta (>1.5), Financial Services, REITs
+      - cpi/pce: consumer discretionary/staples + rate-sensitive sectors
+      - nfp: broad market-wide -- high-beta names specifically
+      - everything else (gdp/retail_sales/jobless_claims): no rule
+        defined yet, so no tickers are flagged rather than guessing
+    Reads each ticker's already-cached fundamentals (no live fetch here
+    -- this only reads what's already in the DB, so it's always cheap to
+    call from the calendar's render path)."""
+    if not watchlist:
+        return []
+    relevant = []
+    for t in watchlist:
+        row = conn.execute(
+            "SELECT payload_json FROM fundamentals_info WHERE ticker=? ORDER BY fetched_at DESC LIMIT 1", (t,)
+        ).fetchone()
+        if not row:
+            continue
+        try:
+            info = json.loads(row[0])
+        except (TypeError, ValueError):
+            continue
+        beta = info.get("beta")
+        is_high_beta = isinstance(beta, (int, float)) and beta > _HIGH_BETA_THRESHOLD
+        sector = (info.get("sector") or "").lower()
+        industry = (info.get("industry") or "").lower()
+        is_reit = "reit" in industry or sector == "real estate"
+
+        if event_type == "fomc_rate_decision":
+            if is_high_beta or sector == "financial services" or is_reit:
+                relevant.append(t)
+        elif event_type in ("cpi", "pce"):
+            if sector in _CONSUMER_SECTORS or sector in _RATE_SENSITIVE_SECTORS:
+                relevant.append(t)
+        elif event_type == "nfp":
+            if is_high_beta:
+                relevant.append(t)
+    return relevant
+
+
+def _probe_fred():
+    api_key = os.environ.get("FRED_API_KEY")
+    if not api_key:
+        return {"status": "not_configured", "source": "fred", "error": "FRED_API_KEY not set"}
+    t0 = time.time()
+    try:
+        resp = requests.get(f"{FRED_API_BASE}/series/release", params={
+            "series_id": "CPIAUCSL", "api_key": api_key, "file_type": "json",
+        }, timeout=8)
+        if resp.status_code == 200:
+            return {"status": "up", "source": "fred", "latency_ms": int((time.time() - t0) * 1000)}
+        return {"status": "down", "source": "fred", "error": f"HTTP {resp.status_code}"}
+    except Exception as e:
+        return {"status": "down", "source": "fred", "error": str(e)}
+
+
+def _probe_fomc_schedule():
+    """No live network call -- FOMC_MEETING_DATES is a stored, human-
+    maintained table (see its docstring). "up" means the stored schedule
+    still covers at least the next 90 days; "degraded" means it's running
+    out and needs a human to add the next year's published dates."""
+    today = pd.Timestamp.now(tz="America/New_York").date()
+    horizon = (pd.Timestamp(today) + timedelta(days=90)).date().isoformat()
+    future_dates = [d for d in FOMC_MEETING_DATES if d >= today.isoformat()]
+    if not future_dates:
+        return {"status": "down", "source": "federal_reserve",
+                "error": "FOMC_MEETING_DATES has no future dates -- needs a manual update"}
+    if max(future_dates) < horizon:
+        return {"status": "degraded", "source": "federal_reserve",
+                "error": f"Stored schedule only extends to {max(future_dates)} -- add next year's "
+                         f"published dates from federalreserve.gov/monetarypolicy/fomccalendars.htm"}
+    return {"status": "up", "source": "federal_reserve", "latency_ms": 0}
+
+
+# --------------------------------------------------------------------------
+# SWING FORECAST -- multi-day (3/5/10 trading session) directional +
+# magnitude forecast, reusing Day Prediction's and Earnings Simulator's
+# architecture (backtest-first calibration, Mode 1/2/3 honesty system,
+# macro-event linkage, reconciliation loop) but scoped to a trading-day
+# horizon rather than a single session or a single earnings event. Every
+# function below is NEW/additive -- the only existing function touched
+# anywhere in this build is ensure_ticker_data_ready(), via a new
+# optional bootstrap_swing_horizons parameter (see its own docstring)
+# that defaults to None and changes nothing for any existing caller.
+# --------------------------------------------------------------------------
+
+SWING_HORIZON_OPTIONS = [3, 5, 10, 30]
+SWING_CALIBRATION_MIN_SAMPLES = 8
+SWING_CALIBRATION_DRIFT_BOUNDS = (0.5, 1.5)
+SWING_CALIBRATION_VOL_BOUNDS = (0.6, 1.8)
+SWING_BACKTEST_LOOKBACK_DAYS = 330
+
+
+def _add_trading_days(start_date, n_days):
+    """start_date + n_days TRADING days (skips weekends only -- no
+    holiday calendar exists anywhere in this codebase; same simplification
+    RUNNERS/Day Prediction already make for market hours)."""
+    d = pd.Timestamp(start_date)
+    added = 0
+    while added < n_days:
+        d += timedelta(days=1)
+        if d.weekday() < 5:
+            added += 1
+    return d.date()
+
+
+def simulate_multiday_path(current_price, target_price, horizon_days, daily_volatility_dist, step="daily"):
+    """Daily-step equivalent of simulate_intraday_path (bug fix -- the
+    swing forecast chart was drawing a literal 2-point straight-line
+    ruler from today to the target, the exact same "false precision"
+    bug already fixed for Day Prediction). Reuses that function's own
+    drift + random-shock + Brownian-bridge methodology exactly (constant
+    per-step log-return drift so the path lands on target in
+    expectation, a random log-return shock per step for genuine day-to-
+    day wiggle, then a proportionally-distributed correction across
+    every step so the LAST point lands exactly on target_price, never
+    an artificial final-step jump) -- just stepped once per TRADING day
+    instead of every 5 minutes, since a multi-day horizon has no
+    meaningful intraday granularity to draw.
+
+    `daily_volatility_dist`: the empirical N-day-forward return
+    distribution dict get_multiday_realized_volatility() already
+    computed for this exact (ticker, horizon_days) -- its std_pct IS
+    the real, ticker-specific spread of horizon_days-forward outcomes,
+    so the per-day step vol is derived from THAT (std_pct/100,
+    scaled down by sqrt(horizon_days) for one day's share of the total
+    variance) rather than a generic flat daily-vol number plugged in
+    from elsewhere. Falls back to a conservative flat 1% daily step vol
+    only if the distribution is missing/degenerate (e.g. a ticker with
+    too little history for get_multiday_realized_volatility to return a
+    real std_pct) -- so a path always renders, but with a plainly
+    read-off-the-real-data figure whenever one exists.
+
+    `step` is accepted for signature parity with a possible future
+    intraday/weekly variant -- only "daily" is implemented today.
+
+    Generate this ONCE per (ticker, horizon_days, session_date) and
+    cache it (see log_swing_forecast) -- same "never regenerate a new
+    random path on every chart re-render" discipline as the intraday
+    version, for the identical reason: a committed prediction's chart
+    must always show the same path it was graded against.
+
+    Returns a list of (date_str, price) tuples, one per trading day from
+    today (inclusive, the starting point) through horizon_days trading
+    days later."""
+    steps = max(1, int(horizon_days))
+    total_log_return = (
+        math.log(target_price / current_price) if current_price and target_price and current_price > 0 else 0.0
+    )
+    drift_per_step = total_log_return / steps
+
+    std_pct = (daily_volatility_dist or {}).get("std_pct")
+    if std_pct is not None and math.isfinite(std_pct) and std_pct > 0:
+        step_vol = (std_pct / 100) / math.sqrt(steps)
+    else:
+        step_vol = 0.01
+    step_vol = max(step_vol, 1e-5)
+
+    rng = np.random.default_rng()
+    raw_shocks = rng.normal(drift_per_step, step_vol, size=steps)
+    cumulative_raw = np.cumsum(raw_shocks)
+    realized_total = float(cumulative_raw[-1]) if steps else 0.0
+    discrepancy = realized_total - total_log_return
+    correction = np.array([(i + 1) / steps * discrepancy for i in range(steps)])
+    bridged_cumulative = cumulative_raw - correction
+
+    d = date.today()
+    path = [(d.isoformat(), round(float(current_price), 2))]
+    for cum_log_return in bridged_cumulative:
+        d = _add_trading_days(d, 1)
+        bridged_price = current_price * math.exp(cum_log_return)
+        path.append((d.isoformat(), round(float(bridged_price), 2)))
+    return path
+
+
+def _historical_multiday_realized_volatility(closes, horizon_days):
+    """Pure math half of get_multiday_realized_volatility -- the REAL
+    empirical distribution of horizon_days-forward returns computed from
+    an already-selected closes Series: for every day in it, what was the
+    actual return horizon_days (trading) days later. A genuine empirical
+    distribution (mean/median/std/p10/p90), not a single-day vol scaled
+    up by sqrt(horizon_days) -- real multi-day price paths carry serial
+    correlation, drift, and fat tails a naive scaling can't capture.
+    Split out so backtest_swing_forecasts can feed it an ALREADY-
+    TRUNCATED (strictly-before-day-D) closes series with the identical
+    formula the live path uses, guaranteeing no lookahead bias."""
+    values = closes.dropna().values
+    if len(values) < horizon_days + 20:
+        return None
+    fwd_returns = [
+        (values[i + horizon_days] / values[i] - 1) * 100
+        for i in range(len(values) - horizon_days) if values[i]
+    ]
+    if not fwd_returns:
+        return None
+    arr = np.array(fwd_returns)
+    return {
+        "n": len(arr), "mean_pct": round(float(arr.mean()), 2), "median_pct": round(float(np.median(arr)), 2),
+        "std_pct": round(float(arr.std()), 2), "p10_pct": round(float(np.percentile(arr, 10)), 2),
+        "p90_pct": round(float(np.percentile(arr, 90)), 2),
+    }
+
+
+def get_multiday_realized_volatility(ticker, conn, horizon_days):
+    """Part 3 -- live wrapper: fetches/reads this ticker's real 1-year+
+    daily price history and delegates to _historical_multiday_realized_
+    volatility for the actual math (see that function's docstring)."""
+    fetch_price_history_delta(conn, ticker, full_period="2y", days_back=500, max_age_hours=24)
+    hist = _read_price_history(conn, ticker, days_back=500)
+    if hist.empty:
+        return {"n": 0, "mean_pct": None, "median_pct": None, "std_pct": None, "p10_pct": None, "p90_pct": None}
+    result = _historical_multiday_realized_volatility(hist.sort_index()["Close"], horizon_days)
+    return result or {"n": 0, "mean_pct": None, "median_pct": None, "std_pct": None, "p10_pct": None, "p90_pct": None}
+
+
+def check_earnings_collision(ticker, conn, horizon_days):
+    """Part 3 -- whether a scheduled earnings date falls within the
+    swing window (today through today + horizon_days trading days). If
+    the Earnings Simulator has a fresh AI Briefing on record for this
+    ticker, pulls build_earnings_scenario_matrix()'s REAL scenario
+    matrix directly (same function the Earnings Simulator itself calls)
+    rather than computing a separate swing-specific estimate for that
+    portion of the window -- the two engines must never disagree about
+    the SAME event."""
+    window_end = _add_trading_days(date.today(), horizon_days)
+    result = {
+        "collision": False, "earnings_date": None, "day_of_window": None,
+        "scenario_matrix": None, "warning": None,
+    }
+    try:
+        cal_env = cached_earnings_calendar(conn, ticker, max_age_hours=24)
+        next_earnings_date = (cal_env.get("data") or {}).get("next_earnings_date")
+    except Exception:
+        next_earnings_date = None
+    if not next_earnings_date:
+        return result
+    try:
+        ed = pd.Timestamp(next_earnings_date).date()
+    except (TypeError, ValueError):
+        return result
+    if not (date.today() <= ed <= window_end):
+        return result
+
+    day_num, d = 0, date.today()
+    while d < ed:
+        d = _add_trading_days(d, 1)
+        day_num += 1
+    result.update({
+        "collision": True, "earnings_date": ed.isoformat(), "day_of_window": day_num,
+        "warning": (
+            f"This swing window includes an earnings report on {ed.isoformat()} (Day {day_num} of "
+            f"{horizon_days}) -- expect elevated uncertainty; see EARNINGS SIMULATOR for detailed "
+            f"scenario analysis."
+        ),
+    })
+    brief = get_cached_ai_brief(conn, ticker, max_age_hours=AI_BRIEF_CACHE_HOURS)
+    if brief:
+        try:
+            briefing_inputs = extract_simulator_inputs_from_briefing(ticker, conn)
+            market = get_market_pricing_signals(ticker, conn)
+            result["scenario_matrix"] = build_earnings_scenario_matrix(
+                ticker, conn, briefing_inputs=briefing_inputs, market=market
+            )
+        except Exception:
+            result["scenario_matrix"] = None
+    return result
+
+
+# Keyword match per macro event_type against polymarket_events.question --
+# only event types with an established, well-known simple market
+# convention get a directional_implication string; anything not listed
+# here (gdp/retail_sales/jobless_claims) still gets matched against
+# Polymarket if a market happens to exist, just without an asserted
+# direction beyond the market's own priced probability.
+_MACRO_EVENT_POLYMARKET_KEYWORDS = {
+    "fomc_rate_decision": ["fed", "rate cut", "rate hike", "interest rate", "fomc"],
+    "cpi": ["cpi", "inflation"],
+    "pce": ["pce", "core inflation", "inflation"],
+    "nfp": ["jobs report", "nonfarm", "payrolls", "unemployment rate"],
+    "gdp": ["gdp"],
+    "retail_sales": ["retail sales"],
+    "jobless_claims": ["jobless claims", "unemployment claims"],
+}
+
+_MACRO_EVENT_DIRECTIONAL_IMPLICATION = {
+    "fomc_rate_decision": "A cut is typically supportive for high-beta/growth names; a hold or hike typically pressures them.",
+    "cpi": "A cooler-than-forecast print typically raises rate-cut odds (supportive for high-beta/growth names); a hotter print typically pressures them.",
+    "pce": "A cooler-than-forecast print typically raises rate-cut odds (supportive for high-beta/growth names); a hotter print typically pressures them.",
+    "nfp": "A weaker-than-expected jobs report typically raises rate-cut odds (supportive for high-beta/growth names); a stronger report typically pressures them.",
+}
+
+
+def get_macro_event_market_odds(event, conn, date_window_days=3):
+    """Part 3 (anti-hallucination fix, revised) -- REAL Polymarket-
+    sourced probabilities for a macro event, read from whatever's
+    already in polymarket_events (synced by full_refresh's
+    fetch_polymarket(conn, limit=60, keywords=MACRO_KEYWORDS) call --
+    no new fetch here, same "read what's already cached, no live pull
+    from a reasoning helper" convention get_watchlist_relevant_tickers
+    already uses -- and deliberately no live Claude API call either:
+    this runs on every tab render, and this codebase's own established
+    rule is that a Claude call only ever fires from an explicit,
+    cost-confirmed user action, never implicitly from a reasoning
+    helper).
+
+    Matches by BOTH keyword (event_type -> _MACRO_EVENT_POLYMARKET_
+    KEYWORDS) AND real date proximity (polymarket_events.end_date
+    within date_window_days of event['scheduled_date']) -- date
+    matching is what actually ties multiple mutually-exclusive outcome
+    markets for the SAME real event back together (e.g. "25bps cut" /
+    "no change" / "25bps hike", all end_date=2026-09-16 for the same
+    FOMC meeting), rather than a keyword match alone surfacing one
+    arbitrary highest-volume row as if it were the whole picture.
+    Confirmed live: for the Sept 2026 FOMC meeting, the highest-VOLUME
+    single market was "decrease by 25bps" at a 1% implied probability
+    -- a low-probability tail outcome that badly misrepresents what the
+    market actually expects; "no change" at 70.5% is the real center of
+    mass. Ranking by probability (not volume) and surfacing every
+    matched outcome fixes this.
+
+    Returns None -- never a fabricated 0.50 -- when no relevant
+    Polymarket market is currently being tracked near this event's own
+    date (e.g. jobless claims rarely has a direct prediction market),
+    so the caller can fall back to get_ticker_macro_event_reaction
+    instead of inventing a number. Otherwise returns the highest-
+    PROBABILITY matched outcome plus every other matched outcome for
+    the same date, so the caller can show the full distribution instead
+    of one cherry-picked line."""
+    keywords = _MACRO_EVENT_POLYMARKET_KEYWORDS.get(event.get("event_type"))
+    if not keywords:
+        return None
+    try:
+        target_date = pd.Timestamp(event["scheduled_date"]).tz_localize(None)
+    except (KeyError, ValueError, TypeError):
+        target_date = None
+
+    rows = conn.execute(
+        "SELECT question, yes_price, volume, end_date FROM polymarket_events WHERE active=1"
+    ).fetchall()
+    matched = []
+    for question, yes_price, volume, end_date in rows:
+        q_lower = (question or "").lower()
+        if yes_price is None or not any(kw in q_lower for kw in keywords):
+            continue
+        if target_date is not None and end_date:
+            try:
+                ed = pd.Timestamp(end_date)
+                if ed.tzinfo is not None:
+                    ed = ed.tz_localize(None)
+                if abs((ed - target_date).days) > date_window_days:
+                    continue
+            except (ValueError, TypeError):
+                pass
+        matched.append({
+            "question": question, "probability_yes": round(float(yes_price), 4),
+            "volume": volume, "end_date": end_date,
+        })
+    if not matched:
+        return None
+    matched.sort(key=lambda m: m["probability_yes"], reverse=True)
+    top = matched[0]
+    return {
+        "matched_market": top["question"], "probability_yes": round(top["probability_yes"], 2),
+        "volume": top["volume"], "end_date": top["end_date"],
+        "directional_implication": _MACRO_EVENT_DIRECTIONAL_IMPLICATION.get(event.get("event_type")),
+        "all_matched_markets": matched,
+    }
+
+
+def get_ticker_macro_event_reaction(ticker, conn, event_type, horizon_days, lookback_events=8):
+    """Part 3 (anti-hallucination fix) -- fallback for when NO Polymarket
+    market exists for this event_type: grounds the reasoning in this
+    ticker's OWN real historical price reaction to past events of the
+    same event_type, instead of an unsupported generic directional
+    assumption. For every PAST macro_events row of this event_type
+    (already accumulated in the DB -- FOMC/FRED events aren't deleted
+    once they pass), reads this ticker's real close price on/nearest-
+    before that event date and the real close horizon_days TRADING days
+    after, and aggregates the % move across every such past event this
+    ticker has real price_history coverage for.
+
+    Returns None -- never a fabricated pattern -- if fewer than 2 past
+    events have usable before/after price data, so the caller states
+    plainly that there isn't enough history rather than presenting a
+    hollow one-event 'average'."""
+    past_events = conn.execute(
+        "SELECT scheduled_date FROM macro_events WHERE event_type=? AND scheduled_date < date('now') "
+        "ORDER BY scheduled_date DESC LIMIT ?",
+        (event_type, lookback_events),
+    ).fetchall()
+    moves = []
+    for (ev_date,) in past_events:
+        before_row = conn.execute(
+            "SELECT close FROM price_history WHERE ticker=? AND date <= ? ORDER BY date DESC LIMIT 1",
+            (ticker, ev_date),
+        ).fetchone()
+        after_row = conn.execute(
+            "SELECT close FROM price_history WHERE ticker=? AND date > ? ORDER BY date ASC LIMIT 1 OFFSET ?",
+            (ticker, ev_date, horizon_days - 1),
+        ).fetchone()
+        if before_row and after_row and before_row[0]:
+            moves.append((after_row[0] - before_row[0]) / before_row[0] * 100)
+    if len(moves) < 2:
+        return None
+    arr = np.array(moves)
+    return {
+        "n_events": len(moves), "mean_move_pct": round(float(arr.mean()), 2),
+        "pct_positive": round(sum(1 for m in moves if m > 0) / len(moves), 2),
+    }
+
+
+def get_macro_event_grounded_reasoning(ticker, conn, event, horizon_days):
+    """Part 3 (anti-hallucination fix) -- the single function both the
+    MACRO EVENTS table and the OVERALL VERDICT reasoning call so they
+    can never disagree: for one macro_events row, returns a plain-
+    English sentence that is ALWAYS grounded in either a real Polymarket
+    probability (get_macro_event_market_odds) or this ticker's own real
+    backtested historical reaction to past events of the same type
+    (get_ticker_macro_event_reaction) -- never a bare, unsupported
+    directional assertion. Tries Polymarket first (a live market's
+    current probability is a stronger, more current signal than a
+    historical average); falls back to the historical reaction; and if
+    NEITHER exists, says so plainly instead of guessing.
+
+    When Polymarket has more than one matched outcome market for the
+    same date (the common case for an FOMC decision -- cut/hold/hike
+    are each their own market), cites the top 2 others too, so the
+    sentence reflects the real distribution instead of a single
+    cherry-picked line.
+
+    Part 9: for an FOMC rate-decision event specifically, prepends the
+    real current Fed funds target range (get_fed_target_range_text) to
+    whichever branch's text ends up being used -- e.g. "Fed funds target
+    range is currently 3.75%-4.00% (as of ...); Polymarket currently
+    prices ... a 62% chance of a 25bp cut." Every other event type
+    (CPI/NFP/GDP/etc.) is unaffected -- the target range isn't relevant
+    context for those releases."""
+    range_prefix = ""
+    if event.get("event_type") == "fomc_rate_decision":
+        range_text = get_fed_target_range_text(conn)
+        if range_text:
+            range_prefix = f"{range_text}; "
+
+    odds = get_macro_event_market_odds(event, conn)
+    if odds:
+        direction_txt = f" {odds['directional_implication']}" if odds.get("directional_implication") else ""
+        others = odds.get("all_matched_markets", [])[1:3]
+        others_txt = (
+            " Other tracked outcomes for this same date: "
+            + "; ".join(f"\"{m['question']}\" {m['probability_yes']:.0%}" for m in others) + "."
+            if others else ""
+        )
+        return {
+            "text": (
+                f"{range_prefix}Polymarket currently prices \"{odds['matched_market']}\" at "
+                f"{odds['probability_yes']:.0%} (YES).{direction_txt}{others_txt}"
+            ),
+            "grounded_in": "polymarket", "detail": odds,
+        }
+    reaction = get_ticker_macro_event_reaction(ticker, conn, event["event_type"], horizon_days)
+    if reaction:
+        return {
+            "text": (
+                f"{range_prefix}No Polymarket market currently tracks this specific release. {ticker}'s own "
+                f"historical reaction over its last {reaction['n_events']} {event['event_name']} release(s): "
+                f"mean {reaction['mean_move_pct']:+.2f}% move over the following {horizon_days} trading "
+                f"day(s), positive in {reaction['pct_positive']:.0%} of those instances."
+            ),
+            "grounded_in": "backtest", "detail": reaction,
+        }
+    return {
+        "text": (
+            f"{range_prefix}No Polymarket market currently tracks this specific release, and not enough "
+            f"historical {ticker} price data around past {event['event_name']} releases yet to characterize "
+            f"a reaction pattern."
+        ),
+        "grounded_in": "none", "detail": None,
+    }
+
+
+def get_divergence_score_trend(ticker, conn, lookback_sessions=10):
+    """Part 3 -- trend (not just the current point-in-time value) of
+    this ticker's last N conviction_score snapshots from ticker_snapshots
+    (already accumulating via compute_divergence's own snapshot-on-every-
+    call behavior, no new fetch here).
+
+    Restricted to score_formula_version='v2' rows: v1 scores are on a
+    structurally different, lower scale (the pre-fix formula clustered
+    4-34 regardless of true signal strength -- see compute_divergence),
+    so a v1-to-v2 transition would read as a huge fake "rising" trend
+    rather than a real change in conviction. Trend history starts fresh
+    from the v2 rollout date instead of attempting to rescale v1 data."""
+    rows = conn.execute(
+        """SELECT fetched_at, conviction_score FROM ticker_snapshots
+           WHERE ticker=? AND conviction_score IS NOT NULL AND score_formula_version='v2'
+           ORDER BY fetched_at DESC LIMIT ?""",
+        (ticker, lookback_sessions),
+    ).fetchall()
+    if not rows:
+        return {"n": 0, "trend": "no_history", "current": None, "mean": None}
+    rows = list(reversed(rows))
+    scores = [r[1] for r in rows]
+    current = scores[-1]
+    if len(scores) < 3:
+        return {"n": len(scores), "trend": "insufficient_history", "current": round(current, 2),
+                "mean": round(sum(scores) / len(scores), 2)}
+    half = len(scores) // 2
+    first_half_mean = sum(scores[:half]) / half
+    second_half_mean = sum(scores[half:]) / (len(scores) - half)
+    delta = second_half_mean - first_half_mean
+    trend = "rising" if delta > 5 else "falling" if delta < -5 else "flat"
+    return {
+        "n": len(scores), "trend": trend, "current": round(current, 2),
+        "mean": round(sum(scores) / len(scores), 2), "first_half_mean": round(first_half_mean, 2),
+        "second_half_mean": round(second_half_mean, 2),
+    }
+
+
+def get_relative_strength_trend(ticker, conn, lookback_days=14):
+    """Part 3 -- short-window sibling of fetch_benchmark_relative_
+    performance() (unchanged, not called here to avoid its YTD/6mo/1y-
+    only windows): is this ticker outperforming/underperforming its
+    benchmark specifically over the last ~lookback_days TRADING sessions,
+    not just YTD. Same sector-based benchmark selection (QQQ for tech,
+    else SPY) and same apples-to-apples same-window comparison
+    methodology as that function."""
+    fundamentals = _read_fundamentals_info_cache(conn, ticker) or {}
+    sector = (fundamentals.get("sector") or "").lower()
+    benchmark = "QQQ" if "technology" in sector else "SPY"
+    fetch_price_history_delta(conn, ticker, full_period="1y", days_back=400, max_age_hours=24)
+    fetch_price_history_delta(conn, benchmark, full_period="1y", days_back=400, max_age_hours=24)
+    own_hist = _read_price_history(conn, ticker, days_back=90)
+    bench_hist = _read_price_history(conn, benchmark, days_back=90)
+
+    def _return_over_n_sessions(hist, n):
+        if hist is None or hist.empty:
+            return None
+        closes = hist.sort_index()["Close"].dropna()
+        if len(closes) < n + 1 or not closes.iloc[-(n + 1)]:
+            return None
+        return round((closes.iloc[-1] / closes.iloc[-(n + 1)] - 1) * 100, 2)
+
+    ticker_ret = _return_over_n_sessions(own_hist, lookback_days)
+    bench_ret = _return_over_n_sessions(bench_hist, lookback_days)
+    relative_pct = (ticker_ret - bench_ret) if ticker_ret is not None and bench_ret is not None else None
+    trend = None
+    if relative_pct is not None:
+        trend = "outperforming" if relative_pct > 1 else "underperforming" if relative_pct < -1 else "in line with"
+    return {
+        "benchmark": benchmark, "lookback_days": lookback_days, "ticker_return_pct": ticker_ret,
+        "benchmark_return_pct": bench_ret,
+        "relative_pct": round(relative_pct, 2) if relative_pct is not None else None, "trend": trend,
+    }
+
+
+def get_recency_weighted_activity(ticker, conn):
+    """Part 3 -- re-weights existing insider trade, congressional trade,
+    and 13F filing data (all read-only against tables already populated
+    elsewhere in this app -- no new fetch) by recency: exponential decay
+    weight (14-day half-life) based on days-since-filing, rather than
+    treating a filing from today and one from 5 months ago equally."""
+    now = pd.Timestamp.now()
+    half_life_days = 14.0
+
+    def _decay_weight(date_str):
+        try:
+            days_ago = (now - pd.Timestamp(date_str)).days
+        except (TypeError, ValueError):
+            return 0.0
+        return 0.5 ** (days_ago / half_life_days) if days_ago >= 0 else 0.0
+
+    insider_rows = conn.execute(
+        "SELECT transaction_type, value, filing_date FROM insider_trades "
+        "WHERE ticker=? AND filing_date >= date('now', '-180 day')", (ticker,)
+    ).fetchall()
+    insider_buy_weighted, insider_sell_weighted = 0.0, 0.0
+    for txn_type, value, filing_date in insider_rows:
+        w = _decay_weight(filing_date) * abs(value or 0)
+        t = (txn_type or "").lower()
+        if "purchase" in t or t.startswith("buy") or t.startswith("p"):
+            insider_buy_weighted += w
+        elif "sale" in t or t.startswith("sell") or t.startswith("s"):
+            insider_sell_weighted += w
+
+    congress_rows = conn.execute(
+        "SELECT transaction_type, disclosure_date FROM congressional_trades "
+        "WHERE ticker=? AND disclosure_date >= date('now', '-180 day')", (ticker,)
+    ).fetchall()
+    congress_buy_weighted, congress_sell_weighted = 0.0, 0.0
+    for txn_type, disclosure_date in congress_rows:
+        w = _decay_weight(disclosure_date)
+        t = (txn_type or "").lower()
+        if "purchase" in t or "buy" in t:
+            congress_buy_weighted += w
+        elif "sale" in t or "sell" in t:
+            congress_sell_weighted += w
+
+    thirteenf_rows = conn.execute(
+        "SELECT filing_date FROM thirteenf_filings WHERE ticker=? AND filing_date >= date('now', '-180 day')",
+        (ticker,),
+    ).fetchall()
+    thirteenf_weight = sum(_decay_weight(r[0]) for r in thirteenf_rows)
+
+    return {
+        "insider_net_weighted": round(insider_buy_weighted - insider_sell_weighted, 2),
+        "insider_buy_weighted": round(insider_buy_weighted, 2), "insider_sell_weighted": round(insider_sell_weighted, 2),
+        "congress_net_weighted": round(congress_buy_weighted - congress_sell_weighted, 2),
+        "congress_buy_weighted": round(congress_buy_weighted, 2), "congress_sell_weighted": round(congress_sell_weighted, 2),
+        "thirteenf_recency_weight": round(thirteenf_weight, 2),
+        "n_insider_rows": len(insider_rows), "n_congress_rows": len(congress_rows), "n_13f_rows": len(thirteenf_rows),
+    }
+
+
+def get_dark_pool_trend(ticker, conn, lookback_sessions=10):
+    """Part 3 -- trend across the last N dark_pool_signals entries:
+    accumulating (rising dark pool % + rising price) vs distributing
+    (rising dark pool % + falling/flat price) over trailing sessions."""
+    rows = conn.execute(
+        """SELECT dps.date, dps.dark_pool_pct, ph.close FROM dark_pool_signals dps
+           LEFT JOIN price_history ph ON ph.ticker = dps.ticker AND ph.date = dps.date
+           WHERE dps.ticker=? ORDER BY dps.date DESC LIMIT ?""",
+        (ticker, lookback_sessions),
+    ).fetchall()
+    if len(rows) < 3:
+        return {"n": len(rows), "pattern": "insufficient_history"}
+    rows = list(reversed(rows))
+    dp_pcts = [r[1] for r in rows if r[1] is not None]
+    closes = [r[2] for r in rows if r[2] is not None]
+    if len(dp_pcts) < 3 or len(closes) < 3:
+        return {"n": len(rows), "pattern": "insufficient_history"}
+    dp_up = dp_pcts[-1] > dp_pcts[0]
+    price_up = closes[-1] > closes[0]
+    pattern = "accumulating" if (dp_up and price_up) else "distributing" if (dp_up and not price_up) else "no_clear_trend"
+    return {
+        "n": len(rows), "pattern": pattern,
+        "dark_pool_pct_change": round(dp_pcts[-1] - dp_pcts[0], 2),
+        "price_change_pct": round((closes[-1] / closes[0] - 1) * 100, 2) if closes[0] else None,
+    }
+
+
+def get_gamma_evolution(ticker, conn, horizon_days):
+    """Part 3 -- extends get_market_pricing_signals' nearest-expiry-only
+    gamma_concentration (unchanged, not called here) across EVERY expiry
+    falling within the swing horizon, showing how gamma concentration
+    shifts across the relevant expiries in the window. Pure DB read
+    against the same cached options_flow snapshot the caller is
+    responsible for having refreshed (same convention as
+    get_market_pricing_signals) -- no new fetch here."""
+    window_end = _add_trading_days(date.today(), horizon_days)
+    latest_date_row = conn.execute(
+        "SELECT MAX(fetch_date) FROM options_flow WHERE ticker=?", (ticker,)
+    ).fetchone()
+    latest_date = latest_date_row[0] if latest_date_row else None
+    if not latest_date:
+        return {"expiries": []}
+    opt_df = pd.read_sql_query(
+        """SELECT option_type, strike, expiration, gamma, open_interest FROM options_flow
+           WHERE ticker=? AND fetch_date=?""",
+        conn, params=(ticker, latest_date),
+    )
+    if opt_df.empty:
+        return {"expiries": []}
+    opt_df = opt_df.dropna(subset=["gamma", "open_interest"])
+    opt_df["expiration_date"] = pd.to_datetime(opt_df["expiration"], errors="coerce").dt.date
+    opt_df = opt_df[opt_df["expiration_date"].notna()]
+    in_window = opt_df[(opt_df["expiration_date"] >= date.today()) & (opt_df["expiration_date"] <= window_end)]
+    if in_window.empty:
+        return {"expiries": []}
+    results = []
+    for exp, g in in_window.groupby("expiration"):
+        sign = g["option_type"].map({"call": 1, "put": -1}).fillna(0)
+        g = g.copy()
+        g["gamma_exposure"] = g["gamma"] * g["open_interest"] * 100 * sign
+        by_strike = g.groupby("strike")["gamma_exposure"].sum()
+        top = by_strike.reindex(by_strike.abs().sort_values(ascending=False).index).head(3)
+        results.append({
+            "expiration": exp, "net_gamma_exposure": round(float(g["gamma_exposure"].sum()), 1),
+            "top_strikes": [{"strike": float(s), "net_gamma_exposure": round(float(v), 1)} for s, v in top.items()],
+        })
+    results.sort(key=lambda r: r["expiration"])
+    return {"expiries": results}
+
+
+def _historical_swing_lean(hist_before):
+    """Backtest-time directional lean (reused by backtest_swing_
+    forecasts) -- reuses the SAME technical-structure primitives as Day
+    Prediction's own backtest reconstruction (_rsi, _macd,
+    _compute_technical_levels, _DAY_TREND_LEAN_SCORE, all unmodified),
+    but weights recent multi-day momentum (5-day price change) instead
+    of a single day's opening gap, since a multi-day horizon cares about
+    recent TREND, not one morning's gap."""
+    if len(hist_before) < 30:
+        return None, {}
+    h = hist_before.copy()
+    h["RSI14"] = _rsi(h["Close"])
+    _, _, macd_hist = _macd(h["Close"])
+    h["MACD_hist"] = macd_hist
+    rsi14 = float(h["RSI14"].iloc[-1]) if pd.notna(h["RSI14"].iloc[-1]) else None
+
+    trend_structure = "unknown"
+    if len(h) >= _BACKTEST_WARMUP_TRADING_DAYS:
+        cfg = dict(_INTERVAL_CONFIG["1d"])
+        cfg["interval"], cfg["lookback"] = "1d", "swing_backtest"
+        short_w, long_w = cfg["sma_windows"]
+        h["SMA_short"] = h["Close"].rolling(short_w).mean()
+        h["SMA_long"] = h["Close"].rolling(long_w).mean()
+        levels = _compute_technical_levels(h, cfg, "")
+        trend_structure = levels.get("trend_structure") or "unknown"
+
+    closes = h["Close"]
+    momentum_5d_pct = None
+    if len(closes) >= 6 and closes.iloc[-6]:
+        momentum_5d_pct = (closes.iloc[-1] / closes.iloc[-6] - 1) * 100
+
+    components = []
+    if momentum_5d_pct is not None:
+        components.append((max(-1.0, min(1.0, momentum_5d_pct / 5.0)), 0.40))
+    trend_score = _DAY_TREND_LEAN_SCORE.get(trend_structure, 0.0)
+    rsi_nudge = 0.3 if (rsi14 is not None and rsi14 <= 30) else -0.3 if (rsi14 is not None and rsi14 >= 70) else 0.0
+    components.append((max(-1.0, min(1.0, trend_score + rsi_nudge)), 0.35))
+
+    total_weight = sum(w for _, w in components)
+    lean = round(max(-1.0, min(1.0, sum(s * w for s, w in components) / total_weight)), 4) if total_weight else None
+    return lean, {"trend_score": trend_score, "trend_structure": trend_structure}
+
+
+def backtest_swing_forecasts(ticker, conn, horizon_days, lookback_days=SWING_BACKTEST_LOOKBACK_DAYS):
+    """Part 4 -- same architecture as backtest_day_predictions() (also
+    unmodified): for every trading day in the last lookback_days (NOT
+    gated on "unusual activity" the way Day Prediction's RUNNERS-scoped
+    backtest is -- Swing Forecast is general-purpose, available for any
+    ticker on demand via a search box, not scoped to unusual-activity
+    days), simulates what the swing forecast would have predicted using
+    only data strictly before that day, then compares against the REAL
+    price horizon_days trading days later (already known, since it's
+    history). Uses the SAME no-lookahead empirical N-day-forward-return
+    distribution (_historical_multiday_realized_volatility, fed a
+    truncated closes series) for magnitude, and _historical_swing_lean
+    for direction. Tagged source='backtest', reconciled immediately
+    since the outcome is already known. Idempotent per (ticker,
+    horizon_days, session_date) -- re-running only backfills genuinely
+    new days, never duplicates or overwrites an existing row."""
+    total_days_back = lookback_days + _BACKTEST_WARMUP_TRADING_DAYS + horizon_days + 140
+    fetch_price_history_delta(conn, ticker, full_period="2y", days_back=total_days_back, max_age_hours=24)
+    full_hist = _read_price_history(conn, ticker, days_back=total_days_back)
+    if full_hist.empty or len(full_hist) < 45 + horizon_days:
+        return {
+            "ticker": ticker, "ok": False,
+            "reason": f"Not enough daily price history for {ticker} to backtest a {horizon_days}-day swing "
+                      f"forecast ({len(full_hist)} trading day(s) available).",
+        }
+    full_hist = full_hist.sort_index()
+
+    candidate_start = max(30, len(full_hist) - lookback_days - horizon_days)
+    candidate_end = len(full_hist) - horizon_days
+    logged, skipped_existing = 0, 0
+    for i in range(candidate_start, max(candidate_start, candidate_end)):
+        day_row = full_hist.iloc[i]
+        hist_before = full_hist.iloc[:i]
+        session_date = full_hist.index[i].date().isoformat()
+        exists = conn.execute(
+            "SELECT 1 FROM swing_forecasts WHERE ticker=? AND horizon_days=? AND session_date=?",
+            (ticker, horizon_days, session_date),
+        ).fetchone()
+        if exists:
+            skipped_existing += 1
+            continue
+
+        lean, lean_features = _historical_swing_lean(hist_before)
+        if lean is None:
+            continue
+        vol_dist = _historical_multiday_realized_volatility(hist_before["Close"], horizon_days)
+        if not vol_dist or vol_dist.get("std_pct") is None:
+            continue
+
+        model_start_price = float(day_row["Open"])
+        expected_move_pct = vol_dist["std_pct"]
+        combined_move_pct = lean * abs(expected_move_pct) + (vol_dist.get("mean_pct") or 0.0) * 0.3
+        target_price = round(model_start_price * (1 + combined_move_pct / 100), 2)
+        predicted_direction = (
+            "UP" if target_price > model_start_price else "DOWN" if target_price < model_start_price else "FLAT"
+        )
+        future_idx = i + horizon_days
+        actual_close = float(full_hist.iloc[future_idx]["Close"])
+        actual_direction = (
+            "UP" if actual_close > model_start_price else "DOWN" if actual_close < model_start_price else "FLAT"
+        )
+        prediction_correct = int(predicted_direction == actual_direction)
+        error_pct = round((actual_close - target_price) / target_price * 100, 2) if target_price else None
+        target_date = full_hist.index[future_idx].date().isoformat()
+
+        conn.execute(
+            """INSERT OR IGNORE INTO swing_forecasts
+                   (ticker, horizon_days, session_date, target_date, model_start_price, target_price,
+                    predicted_direction, magnitude_estimate_pct, lean_pre_model, mode, source,
+                    actual_close_price, actual_direction, prediction_correct_direction, error_pct,
+                    reconciliation_notes, predicted_at, reconciled_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (ticker, horizon_days, session_date, target_date, model_start_price, target_price,
+             predicted_direction, expected_move_pct, lean, "backtest", "backtest",
+             actual_close, actual_direction, prediction_correct, error_pct,
+             f"Backtested {horizon_days}-day swing forecast from historical daily OHLCV -- model_start_price "
+             f"approximated by the session's real Open; magnitude from the empirical {horizon_days}-day-forward "
+             f"return distribution available strictly before this day (no lookahead).",
+             datetime.utcnow().isoformat(), datetime.utcnow().isoformat()),
+        )
+        logged += 1
+    conn.commit()
+
+    agg_rows = conn.execute(
+        "SELECT error_pct, prediction_correct_direction FROM swing_forecasts "
+        "WHERE ticker=? AND horizon_days=? AND source='backtest'",
+        (ticker, horizon_days),
+    ).fetchall()
+    errors = [r[0] for r in agg_rows if r[0] is not None]
+    correct = sum(1 for r in agg_rows if r[1])
+    qualifying_found = max(0, candidate_end - candidate_start)
+    result = {
+        "ticker": ticker, "ok": True, "horizon_days": horizon_days, "lookback_days": lookback_days,
+        "qualifying_sessions_found": qualifying_found, "sessions_logged": logged,
+        "sessions_skipped_existing": skipped_existing, "total_backtested_on_record": len(agg_rows),
+        "date_range_start": full_hist.index[candidate_start].date().isoformat() if qualifying_found > 0 else None,
+        "date_range_end": (
+            full_hist.index[candidate_end - 1].date().isoformat() if qualifying_found > 0 else None
+        ),
+        "mean_error_pct": round(sum(errors) / len(errors), 2) if errors else None,
+        "mean_abs_error_pct": round(sum(abs(e) for e in errors) / len(errors), 2) if errors else None,
+        "direction_accuracy": round(correct / len(agg_rows), 3) if agg_rows else None,
+    }
+    conn.execute(
+        """INSERT INTO swing_backtest_runs
+               (ticker, horizon_days, run_at, lookback_days, date_range_start, date_range_end,
+                qualifying_sessions_found, sessions_backtested, mean_error_pct, mean_abs_error_pct,
+                direction_accuracy)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+        (ticker, horizon_days, datetime.utcnow().isoformat(), lookback_days, result["date_range_start"],
+         result["date_range_end"], result["qualifying_sessions_found"], len(agg_rows),
+         result["mean_error_pct"], result["mean_abs_error_pct"], result["direction_accuracy"]),
+    )
+    conn.commit()
+    return result
+
+
+def _swing_directional_lean(daily_hist, technical_levels, technicals, briefing_inputs):
+    """LIVE directional lean for compute_swing_forecast -- blends THREE
+    signals exactly like Day Prediction's own _day_prediction_
+    directional_lean does (unmodified; renormalizes over whichever are
+    available), adapted for a multi-day horizon:
+    (a) recent 10-day momentum, weight 0.35
+    (b) technical structure (detect_technical_levels' own live
+        trend_structure + an RSI mean-reversion nudge), weight 0.35
+    (c) the AI Briefing's nearest qualitative verdict (extract_
+        simulator_inputs_from_briefing's own verdicts list, unmodified),
+        preferring a week/month-horizon verdict over "next earnings"
+        since a multi-day swing is closer to those, weight 0.30."""
+    components = []
+    closes = daily_hist["Close"].dropna()
+    momentum_10d_pct = None
+    if len(closes) >= 11 and closes.iloc[-11]:
+        momentum_10d_pct = (closes.iloc[-1] / closes.iloc[-11] - 1) * 100
+        components.append((max(-1.0, min(1.0, momentum_10d_pct / 8.0)), 0.35))
+
+    trend_structure = (technical_levels or {}).get("trend_structure")
+    if trend_structure:
+        trend_score = _DAY_TREND_LEAN_SCORE.get(trend_structure, 0.0)
+        rsi = (technicals or {}).get("rsi14")
+        rsi_nudge = 0.3 if (rsi is not None and rsi <= 30) else -0.3 if (rsi is not None and rsi >= 70) else 0.0
+        components.append((max(-1.0, min(1.0, trend_score + rsi_nudge)), 0.35))
+    else:
+        trend_score = 0.0
+
+    if briefing_inputs:
+        verdicts = briefing_inputs.get("verdicts") or []
+        nearest = (
+            next((v for v in verdicts if any(kw in (v.get("horizon") or "").lower() for kw in ("week", "month"))), None)
+            or briefing_inputs.get("next_earnings_verdict")
+        )
+        if nearest:
+            bias = (nearest.get("bias") or "NEUTRAL").upper()
+            conf_mag = {"High": 1.0, "Medium": 0.6, "Low": 0.3}.get(nearest.get("confidence"), 0.3)
+            qual_lean = conf_mag if bias == "BULLISH" else -conf_mag if bias == "BEARISH" else 0.0
+            components.append((qual_lean, 0.30))
+
+    if not components:
+        return None, {}
+    total_weight = sum(w for _, w in components)
+    lean = round(max(-1.0, min(1.0, sum(s * w for s, w in components) / total_weight)), 4)
+    return lean, {
+        "trend_score": trend_score, "trend_structure": trend_structure,
+        "momentum_10d_pct": round(momentum_10d_pct, 2) if momentum_10d_pct is not None else None,
+    }
+
+
+def _build_swing_training_matrix(conn, horizon_days):
+    """Mirrors _build_day_training_matrix (unmodified) -- reconciled
+    swing_forecasts rows for THIS horizon_days only as the training set.
+    Deliberately a minimal 2-feature set (lean_pre_model, magnitude_
+    estimate_pct) -- exactly what's stored on the row, so training and
+    live-predict-time feature vectors can never drift out of sync."""
+    rows = conn.execute(
+        """SELECT ticker, session_date, predicted_direction, actual_direction, lean_pre_model,
+                  magnitude_estimate_pct
+           FROM swing_forecasts WHERE horizon_days=? AND prediction_correct_direction IS NOT NULL
+           ORDER BY session_date""",
+        (horizon_days,),
+    ).fetchall()
+    feature_names = ["lean_pre_model", "magnitude_estimate_pct"]
+    X, y, row_meta = [], [], []
+    for (ticker, session_date, predicted_direction, actual_direction, lean, mag) in rows:
+        if actual_direction not in ("UP", "DOWN"):
+            continue
+        X.append([lean or 0.0, mag or 0.0])
+        y.append(1 if actual_direction == "UP" else 0)
+        row_meta.append({"ticker": ticker, "session_date": session_date,
+                          "predicted_direction": predicted_direction, "actual_direction": actual_direction})
+    return X, y, feature_names, row_meta
+
+
+def _read_cached_swing_trained_model(conn, horizon_days):
+    row = conn.execute(
+        """SELECT model_type, n_samples_at_train, held_out_accuracy, baseline_accuracy,
+                  feature_names_json, model_blob
+           FROM swing_model_cache WHERE horizon_days=? AND beats_baseline=1
+           ORDER BY trained_at DESC LIMIT 1""",
+        (horizon_days,),
+    ).fetchone()
+    if not row or not row[5]:
+        return None
+    model_type, n_samples, held_out_acc, baseline_acc, feature_names_json, model_blob = row
+    return {
+        "model": pickle.loads(model_blob), "model_type": model_type, "n_samples": n_samples,
+        "held_out_accuracy": held_out_acc, "bayesian_baseline_accuracy": baseline_acc,
+        "feature_names": json.loads(feature_names_json),
+    }
+
+
+def train_swing_direction_model(conn, horizon_days, min_samples=TRAINED_MODEL_MIN_SAMPLES):
+    """Mirrors train_day_direction_model (unmodified) exactly -- same
+    min_samples/GBC threshold/retrain cadence constants (all reused, not
+    redefined), same chronological 80/20 holdout, same 'must beat the
+    Mode 2 baseline's actual historical calls or stay None' gate --
+    pointed at swing_forecasts/swing_model_cache, scoped to ONE
+    horizon_days at a time (a 3-day model and a 10-day model are trained
+    on structurally different outcome distributions and must never be
+    conflated)."""
+    X, y, feature_names, row_meta = _build_swing_training_matrix(conn, horizon_days)
+    n = len(X)
+    if n < min_samples:
+        return None
+
+    last = conn.execute(
+        "SELECT n_samples_at_train FROM swing_model_cache WHERE horizon_days=? ORDER BY trained_at DESC LIMIT 1",
+        (horizon_days,),
+    ).fetchone()
+    last_n = last[0] if last else 0
+    if last_n and (n - last_n) < TRAINED_MODEL_RETRAIN_EVERY:
+        return _read_cached_swing_trained_model(conn, horizon_days)
+
+    try:
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.ensemble import GradientBoostingClassifier
+    except ImportError:
+        return None
+
+    split = max(1, int(n * 0.8))
+    X_train, X_test = X[:split], X[split:]
+    y_train, y_test = y[:split], y[split:]
+    meta_test = row_meta[split:]
+    if not X_test or len(set(y_train)) < 2:
+        return None
+
+    model_type = "gradient_boosting" if n >= TRAINED_MODEL_GBC_THRESHOLD else "logistic_regression"
+    model = (
+        GradientBoostingClassifier(n_estimators=50, max_depth=2, random_state=42)
+        if model_type == "gradient_boosting" else LogisticRegression(max_iter=1000)
+    )
+    model.fit(X_train, y_train)
+    preds = model.predict(X_test)
+    held_out_accuracy = sum(1 for p, actual in zip(preds, y_test) if p == actual) / len(y_test)
+
+    baseline_correct = sum(
+        1 for m in meta_test if (m["predicted_direction"] or "").upper() == (m["actual_direction"] or "").upper()
+    )
+    baseline_accuracy = baseline_correct / len(meta_test)
+    beats_baseline = held_out_accuracy > baseline_accuracy
+    model_blob = pickle.dumps(model) if beats_baseline else None
+
+    conn.execute(
+        """INSERT INTO swing_model_cache
+               (horizon_days, trained_at, n_samples_at_train, model_type, held_out_accuracy, baseline_accuracy,
+                beats_baseline, feature_names_json, model_blob)
+           VALUES (?,?,?,?,?,?,?,?,?)""",
+        (horizon_days, datetime.utcnow().isoformat(), n, model_type, held_out_accuracy, baseline_accuracy,
+         int(beats_baseline), json.dumps(feature_names), model_blob),
+    )
+    conn.commit()
+
+    if not beats_baseline:
+        print(f"[swing_model] {horizon_days}d: trained {model_type} on {n} samples ({held_out_accuracy:.0%} "
+              f"held-out) did NOT beat the Mode 2 baseline ({baseline_accuracy:.0%}) -- keeping Mode 2 active.")
+        return None
+    return {
+        "model": model, "model_type": model_type, "n_samples": n, "held_out_accuracy": held_out_accuracy,
+        "bayesian_baseline_accuracy": baseline_accuracy, "feature_names": feature_names,
+    }
+
+
+def get_swing_forecast_track_record(conn, ticker=None, horizon_days=None):
+    """Mirrors get_day_prediction_track_record (unmodified) -- accuracy
+    + mean |error%| across reconciled swing_forecasts rows, optionally
+    scoped to one ticker and/or one horizon_days."""
+    query = "SELECT ticker, error_pct, prediction_correct_direction FROM swing_forecasts WHERE reconciled_at IS NOT NULL"
+    params = []
+    if ticker:
+        query += " AND ticker=?"
+        params.append(ticker)
+    if horizon_days:
+        query += " AND horizon_days=?"
+        params.append(horizon_days)
+    rows = conn.execute(query, params).fetchall()
+    if not rows:
+        return {"n": 0, "accuracy": None, "mean_abs_error_pct": None}
+    n = len(rows)
+    correct = sum(1 for r in rows if r[2])
+    errors = [abs(r[1]) for r in rows if r[1] is not None]
+    return {
+        "n": n, "accuracy": round(correct / n, 3),
+        "mean_abs_error_pct": round(sum(errors) / len(errors), 2) if errors else None,
+    }
+
+
+def get_active_swing_calibration(conn, horizon_days):
+    row = conn.execute(
+        "SELECT drift_scale, vol_scale FROM swing_calibration_log WHERE horizon_days=? "
+        "ORDER BY id DESC LIMIT 1", (horizon_days,),
+    ).fetchone()
+    return {"drift_scale": row[0], "vol_scale": row[1]} if row else {"drift_scale": 1.0, "vol_scale": 1.0}
+
+
+def get_swing_calibration_history(conn, horizon_days, limit=10):
+    rows = conn.execute(
+        """SELECT calibrated_at, n_samples, mean_abs_error_pct, target_error_pct, drift_scale, vol_scale,
+                  magnitude_ratio, direction_accuracy, note
+           FROM swing_calibration_log WHERE horizon_days=? ORDER BY id DESC LIMIT ?""",
+        (horizon_days, limit),
+    ).fetchall()
+    keys = ["calibrated_at", "n_samples", "mean_abs_error_pct", "target_error_pct", "drift_scale", "vol_scale",
+            "magnitude_ratio", "direction_accuracy", "note"]
+    return [dict(zip(keys, r)) for r in rows]
+
+
+def calibrate_swing_forecast_model(conn, horizon_days, target_error_pct=3.0):
+    """Mirrors calibrate_day_prediction_model exactly (unmodified),
+    scoped to ONE horizon_days -- same magnitude-bias/direction-bias
+    detection, same bounded drift_scale/vol_scale nudges, same honest
+    below-sample-floor branch, logged to swing_calibration_log instead
+    of model_calibration_log."""
+    rows = conn.execute(
+        "SELECT model_start_price, target_price, actual_close_price, prediction_correct_direction, error_pct "
+        "FROM swing_forecasts WHERE horizon_days=? AND reconciled_at IS NOT NULL AND actual_close_price IS NOT NULL",
+        (horizon_days,),
+    ).fetchall()
+    n = len(rows)
+    result = {
+        "n": n, "horizon_days": horizon_days, "target_error_pct": target_error_pct, "mean_abs_error_pct": None,
+        "adjusted": False, "drift_scale": 1.0, "vol_scale": 1.0, "magnitude_ratio": None, "direction_accuracy": None,
+    }
+    if n < SWING_CALIBRATION_MIN_SAMPLES:
+        prev = get_active_swing_calibration(conn, horizon_days)
+        result["drift_scale"], result["vol_scale"] = prev["drift_scale"], prev["vol_scale"]
+        result["note"] = (
+            f"Only {n} reconciled {horizon_days}-day swing session(s) -- below the "
+            f"{SWING_CALIBRATION_MIN_SAMPLES}-sample floor for a real calibration adjustment. No parameters "
+            f"changed; carrying forward drift_scale={prev['drift_scale']:.2f}/vol_scale={prev['vol_scale']:.2f}."
+        )
+        _log_swing_calibration_run(conn, result)
+        return result
+
+    errors = [abs(r[4]) for r in rows if r[4] is not None]
+    mean_abs_error = sum(errors) / len(errors) if errors else None
+    result["mean_abs_error_pct"] = round(mean_abs_error, 2) if mean_abs_error is not None else None
+
+    actual_moves, target_moves = [], []
+    for msp, tp, acp, _correct, _err in rows:
+        if msp:
+            actual_moves.append(abs((acp - msp) / msp * 100))
+            target_moves.append(abs((tp - msp) / msp * 100))
+    magnitude_ratio = (sum(actual_moves) / sum(target_moves)) if target_moves and sum(target_moves) else None
+    result["magnitude_ratio"] = round(magnitude_ratio, 3) if magnitude_ratio is not None else None
+
+    correct = sum(1 for r in rows if r[3])
+    direction_accuracy = correct / n
+    result["direction_accuracy"] = round(direction_accuracy, 3)
+
+    prev = get_active_swing_calibration(conn, horizon_days)
+    drift_scale, vol_scale = prev["drift_scale"], prev["vol_scale"]
+    adjusted = False
+    if magnitude_ratio is not None:
+        if magnitude_ratio > 1.15:
+            vol_scale = min(SWING_CALIBRATION_VOL_BOUNDS[1], round(vol_scale * 1.05, 4))
+            adjusted = True
+        elif magnitude_ratio < 0.85:
+            vol_scale = max(SWING_CALIBRATION_VOL_BOUNDS[0], round(vol_scale * 0.95, 4))
+            adjusted = True
+    if direction_accuracy < 0.45:
+        drift_scale = max(SWING_CALIBRATION_DRIFT_BOUNDS[0], round(drift_scale * 0.90, 4))
+        adjusted = True
+
+    result["adjusted"], result["drift_scale"], result["vol_scale"] = adjusted, drift_scale, vol_scale
+    within_target = mean_abs_error is not None and mean_abs_error <= target_error_pct
+    result["note"] = (
+        f"{n} reconciled {horizon_days}-day session(s); mean |error| "
+        f"{mean_abs_error:.2f}% ({'within' if within_target else 'above'} the {target_error_pct:.1f}% target)"
+        + (f"; magnitude ratio {magnitude_ratio:.2f}x" if magnitude_ratio else "")
+        + f"; directional accuracy {direction_accuracy:.0%}. "
+        + ("Adjusted drift/vol scaling this run "
+           f"(drift_scale={drift_scale:.2f}, vol_scale={vol_scale:.2f})." if adjusted else
+           "No adjustment triggered this run.")
+    )
+    _log_swing_calibration_run(conn, result)
+    return result
+
+
+def _log_swing_calibration_run(conn, result):
+    conn.execute(
+        """INSERT INTO swing_calibration_log
+               (horizon_days, n_samples, mean_abs_error_pct, target_error_pct, drift_scale, vol_scale,
+                magnitude_ratio, direction_accuracy, note, calibrated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+        (result["horizon_days"], result["n"], result.get("mean_abs_error_pct"), result["target_error_pct"],
+         result["drift_scale"], result["vol_scale"], result.get("magnitude_ratio"),
+         result.get("direction_accuracy"), result["note"], datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+
+
+def compute_swing_forecast(ticker, conn, horizon_days):
+    """Part 5/9 -- the SWING FORECAST target: a full dict with
+    model_start_price, target_price, predicted_direction, magnitude_
+    estimate_pct (from the REAL empirical N-day-forward distribution,
+    Part 3 -- never linear single-day scaling), a confidence band
+    (band_low/band_high) from that same distribution's p10/p90
+    percentiles directly (Part 5's explicit "wider band, using the
+    empirical distribution directly rather than linear scaling"
+    requirement), mode/confidence_level honesty-tiered exactly like
+    compute_day_target/estimate_earnings_probability (same <10-pooled/
+    system-wide thresholds, same raw_pattern/bayesian/trained_model
+    names) -- evaluated against swing_forecasts for THIS horizon_days
+    only. Unlike Day Prediction, there's no buffer-window wait -- a
+    swing forecast isn't tied to a specific session's opening minutes,
+    so it's usable any time real daily price history exists."""
+    vol_dist = get_multiday_realized_volatility(ticker, conn, horizon_days)
+    if not vol_dist or (vol_dist.get("n") or 0) < 20:
+        return {
+            "ticker": ticker, "ready": False, "horizon_days": horizon_days, "reason": "no_price_history",
+            "wait_message": f"Not enough daily price history for {ticker} to compute a real {horizon_days}-day "
+                             f"empirical return distribution yet.",
+        }
+    daily_hist = _read_price_history(conn, ticker, days_back=400)
+    if daily_hist.empty:
+        return {
+            "ticker": ticker, "ready": False, "horizon_days": horizon_days, "reason": "no_price_history",
+            "wait_message": f"No usable daily price history for {ticker}.",
+        }
+    daily_hist = daily_hist.sort_index()
+    current_price = float(daily_hist["Close"].iloc[-1])
+    session_date = date.today().isoformat()
+    target_date = _add_trading_days(date.today(), horizon_days).isoformat()
+
+    technicals = _fetch_technical_snapshot(ticker)
+    technical_levels = detect_technical_levels(ticker, DEFAULT_INTERVAL, DEFAULT_LOOKBACK, conn=conn)
+    briefing_inputs = extract_simulator_inputs_from_briefing(ticker, conn)
+
+    lean, lean_features = _swing_directional_lean(daily_hist, technical_levels, technicals, briefing_inputs)
+    lean_pre_model = lean if lean is not None else 0.0
+
+    pooled_reconciled_count = conn.execute(
+        "SELECT COUNT(*) FROM swing_forecasts WHERE horizon_days=? AND prediction_correct_direction IS NOT NULL",
+        (horizon_days,),
+    ).fetchone()[0]
+
+    lean_final, model_meta = lean_pre_model, None
+    if pooled_reconciled_count < 10:
+        mode = "raw_pattern"
+        confidence_level = None
+    else:
+        trained = train_swing_direction_model(conn, horizon_days)
+        if trained is not None:
+            mode = "trained_model"
+            feature_row = [lean_pre_model, vol_dist.get("std_pct") or 0.0]
+            proba = trained["model"].predict_proba([feature_row])[0]
+            classes = list(trained["model"].classes_)
+            prob_up = float(proba[classes.index(1)]) if 1 in classes else 0.5
+            lean_final = round(max(-1.0, min(1.0, (prob_up - 0.5) * 2)), 4)
+            model_meta = {"model_type": trained["model_type"], "held_out_accuracy": trained["held_out_accuracy"],
+                          "baseline_accuracy": trained["bayesian_baseline_accuracy"], "n_samples": trained["n_samples"]}
+            confidence_level = "High" if abs(prob_up - 0.5) >= 0.20 else "Medium" if abs(prob_up - 0.5) >= 0.08 else "Low"
+        else:
+            mode = "bayesian"
+            confidence_level = "High" if abs(lean_pre_model) >= 0.6 else "Medium" if abs(lean_pre_model) >= 0.25 else "Low"
+
+    calibration = get_active_swing_calibration(conn, horizon_days)
+    expected_move_pct = (vol_dist.get("std_pct") or 1.0) * calibration["vol_scale"]
+    lean_calibrated = round(max(-1.0, min(1.0, lean_final * calibration["drift_scale"])), 4)
+    empirical_drift_pct = vol_dist.get("mean_pct") or 0.0
+    combined_move_pct = lean_calibrated * expected_move_pct + empirical_drift_pct * 0.3
+    target_price = round(current_price * (1 + combined_move_pct / 100), 2)
+    predicted_direction = "UP" if target_price > current_price else "DOWN" if target_price < current_price else "FLAT"
+
+    band_low = round(current_price * (1 + vol_dist["p10_pct"] / 100), 2) if vol_dist.get("p10_pct") is not None else None
+    band_high = round(current_price * (1 + vol_dist["p90_pct"] / 100), 2) if vol_dist.get("p90_pct") is not None else None
+
+    earnings_collision = check_earnings_collision(ticker, conn, horizon_days)
+    macro_events_in_window = get_macro_events_in_range(
+        conn, date.today().isoformat(), target_date, overlay_impact_filter=None
+    )
+    backtest = get_swing_forecast_track_record(conn, ticker=ticker, horizon_days=horizon_days)
+
+    return {
+        "ticker": ticker, "ready": True, "horizon_days": horizon_days, "session_date": session_date,
+        "target_date": target_date, "model_start_price": current_price, "current_price": current_price,
+        "target_price": target_price, "predicted_direction": predicted_direction,
+        "magnitude_estimate_pct": round(expected_move_pct, 2), "lean_pre_model": lean_pre_model,
+        "lean": lean_calibrated, "band_low": band_low, "band_high": band_high,
+        "empirical_distribution": vol_dist, "mode": mode, "confidence_level": confidence_level,
+        "model_meta": model_meta, "backtest_error_pct": backtest.get("mean_abs_error_pct"),
+        "backtest_n": backtest.get("n"), "earnings_collision": earnings_collision,
+        "active_macro_events": macro_events_in_window, "calibration": calibration,
+        "trend_features": lean_features, "technicals": technicals, "technical_levels": technical_levels,
+        "briefing_inputs": briefing_inputs,
+    }
+
+
+def log_swing_forecast(conn, ticker, forecast_result):
+    """Commits ONE swing forecast row per (ticker, horizon_days,
+    session_date) -- same "wait, then commit, then track" discipline as
+    log_day_prediction. Bug fix: now ALSO generates and caches a real
+    daily-step simulated path (simulate_multiday_path) at commit time,
+    same as log_day_prediction's own intraday path -- previously this
+    row carried no path at all, and the chart drew a straight 2-point
+    ruler line from today's price to the target instead.
+
+    Self-heal (same bug, second half): a row logged BEFORE this fix
+    existed (or any row that otherwise ended up with no cached path)
+    would hit the "already exists" early-return below FOREVER, since a
+    swing forecast is only ever logged once per (ticker, horizon_days,
+    session_date) -- permanently stuck on the old straight-line
+    fallback for the rest of that session_date. Confirmed live: WDC's
+    5d/10d rows from before this fix kept rendering a straight line
+    while its freshly-logged 3d/30d rows (no pre-existing row to block
+    the insert) got a real path immediately. Now backfills ONLY the
+    missing path column on an existing pathless row, using THAT ROW'S
+    OWN already-committed model_start_price/target_price (never the
+    freshly recomputed forecast_result's, which could have drifted
+    since commit as calibration/macro data changed intraday) -- so the
+    backfilled path's last point still lands exactly on the target this
+    row was actually committed to and will be graded against."""
+    if not forecast_result.get("ready"):
+        return
+    existing = conn.execute(
+        "SELECT model_start_price, target_price, simulated_path_json FROM swing_forecasts "
+        "WHERE ticker=? AND horizon_days=? AND session_date=?",
+        (ticker, forecast_result["horizon_days"], forecast_result["session_date"]),
+    ).fetchone()
+    if existing:
+        existing_start_price, existing_target_price, existing_path_json = existing
+        if not existing_path_json:
+            backfill_path = simulate_multiday_path(
+                existing_start_price, existing_target_price, forecast_result["horizon_days"],
+                forecast_result.get("empirical_distribution"),
+            )
+            if backfill_path:
+                conn.execute(
+                    "UPDATE swing_forecasts SET simulated_path_json=? "
+                    "WHERE ticker=? AND horizon_days=? AND session_date=?",
+                    (json.dumps(backfill_path), ticker, forecast_result["horizon_days"],
+                     forecast_result["session_date"]),
+                )
+                conn.commit()
+        return
+
+    macro_ids = [e["event_id"] for e in (forecast_result.get("active_macro_events") or [])]
+    active_macro_events = json.dumps(macro_ids) if macro_ids else None
+    ec = forecast_result.get("earnings_collision") or {}
+
+    simulated_path = simulate_multiday_path(
+        forecast_result["model_start_price"], forecast_result["target_price"], forecast_result["horizon_days"],
+        forecast_result.get("empirical_distribution"),
+    )
+    path_json = json.dumps(simulated_path) if simulated_path else None
+
+    conn.execute(
+        """INSERT OR IGNORE INTO swing_forecasts
+               (ticker, horizon_days, session_date, target_date, model_start_price, target_price,
+                predicted_direction, magnitude_estimate_pct, lean_pre_model, mode, confidence_level,
+                active_macro_events, earnings_collision_flag, source, predicted_at, simulated_path_json)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (ticker, forecast_result["horizon_days"], forecast_result["session_date"], forecast_result["target_date"],
+         forecast_result["model_start_price"], forecast_result["target_price"],
+         forecast_result["predicted_direction"], forecast_result["magnitude_estimate_pct"],
+         forecast_result["lean_pre_model"], forecast_result["mode"], forecast_result.get("confidence_level"),
+         active_macro_events, int(bool(ec.get("collision"))), "live", datetime.utcnow().isoformat(), path_json),
+    )
+    conn.commit()
+
+
+def get_committed_swing_path(conn, ticker, horizon_days, session_date):
+    """Reads back the exact simulated path cached by log_swing_forecast
+    for this (ticker, horizon_days, session_date) -- the chart renders
+    against THIS, never a freshly-regenerated path, so re-rendering the
+    tab (e.g. changing another widget and triggering a rerun) never
+    redraws a different random walk for the same committed prediction.
+    Returns [] if no row exists yet or it predates this fix (no cached
+    path column populated)."""
+    row = conn.execute(
+        "SELECT simulated_path_json FROM swing_forecasts WHERE ticker=? AND horizon_days=? AND session_date=?",
+        (ticker, horizon_days, session_date),
+    ).fetchone()
+    if not row or not row[0]:
+        return []
+    return [(d, p) for d, p in json.loads(row[0])]
+
+
+def reconcile_swing_forecasts(conn):
+    """Part 8 -- finds swing_forecasts rows (source='live') whose
+    target_date has passed and reconciled_at IS NULL, compares predicted
+    vs actual price at (or nearest available on/after) target_date,
+    writes a plain-language note referencing which inputs likely drove
+    the outcome (technical trend, earnings collision, macro events).
+    Force-refreshes price_history for the target date the same way
+    reconcile_day_predictions' own real-close fix does (unmodified),
+    since a target_date that just passed can have the identical stale-
+    snapshot risk a same-day close does."""
+    today_str = date.today().isoformat()
+    rows = conn.execute(
+        """SELECT id, ticker, horizon_days, session_date, target_date, model_start_price, target_price,
+                  predicted_direction, active_macro_events, earnings_collision_flag
+           FROM swing_forecasts WHERE source='live' AND reconciled_at IS NULL AND target_date <= ?""",
+        (today_str,),
+    ).fetchall()
+    reconciled_count = 0
+    for (pred_id, ticker, horizon_days, session_date, target_date, model_start_price, target_price,
+         predicted_direction, active_macro_events_json, earnings_collision_flag) in rows:
+        if target_date == today_str:
+            _refresh_todays_close(conn, ticker)
+        close_row = conn.execute(
+            "SELECT close FROM price_history WHERE ticker=? AND date=?", (ticker, target_date)
+        ).fetchone()
+        if not close_row or close_row[0] is None:
+            continue
+        actual_close = close_row[0]
+        actual_direction = (
+            "UP" if actual_close > model_start_price else "DOWN" if actual_close < model_start_price else "FLAT"
+        )
+        prediction_correct = int(predicted_direction == actual_direction) if predicted_direction else None
+        error_pct = round((actual_close - target_price) / target_price * 100, 2) if target_price else None
+        actual_move_pct = (actual_close / model_start_price - 1) * 100 if model_start_price else None
+
+        drivers = []
+        if earnings_collision_flag:
+            drivers.append("an earnings report fell inside this window")
+        if active_macro_events_json:
+            try:
+                n_events = len(json.loads(active_macro_events_json))
+                if n_events:
+                    drivers.append(f"{n_events} scheduled macro event(s) fell inside this window")
+            except (TypeError, ValueError):
+                pass
+        driver_txt = f" Likely contributing factor(s): {'; '.join(drivers)}." if drivers else ""
+
+        notes = (
+            f"{horizon_days}-day forecast from {session_date}: predicted "
+            f"{(target_price / model_start_price - 1) * 100:+.2f}% to ${target_price:.2f}; actual "
+            f"{actual_move_pct:+.2f}% to ${actual_close:.2f} by {target_date} -- "
+            + ("the directional call was correct." if prediction_correct else "the directional call was wrong.")
+            + driver_txt
+        )
+        conn.execute(
+            """UPDATE swing_forecasts SET actual_close_price=?, actual_direction=?,
+                   prediction_correct_direction=?, error_pct=?, reconciliation_notes=?, reconciled_at=?
+               WHERE id=?""",
+            (actual_close, actual_direction, prediction_correct, error_pct, notes,
+             datetime.utcnow().isoformat(), pred_id),
+        )
+        reconciled_count += 1
+    conn.commit()
+    return {"reconciled_count": reconciled_count, "checked_count": len(rows)}
+
+
+def recommend_swing_strategy(ticker, conn, forecast_result):
+    """Part 6 -- single-leg-only options picker (calls or puts, never
+    multi-leg), reusing the EXACT SAME primitives the Earnings Simulator's
+    own picker uses (_nearest_expirations_at_or_after, _earnings_
+    candidate_contracts -- both unmodified; their "days_to_earnings"
+    parameter name is generic in practice, just "days from today," so
+    horizon_days slots in directly), selecting contracts expiring at or
+    shortly after the swing horizon. If check_earnings_collision()
+    flagged an earnings date inside the window, warns about IV crush
+    risk exactly as the Earnings Simulator does."""
+    horizon_days = forecast_result["horizon_days"]
+    predicted_direction = forecast_result.get("predicted_direction")
+    direction = "Bullish" if predicted_direction == "UP" else "Bearish" if predicted_direction == "DOWN" else None
+    ec = forecast_result.get("earnings_collision") or {}
+
+    cached_options_flow(conn, ticker, max_age_hours=0.25, force_refresh=True, max_expirations=50)
+    target_expirations = _nearest_expirations_at_or_after(conn, ticker, horizon_days, n=2)
+    if not target_expirations:
+        return {"direction": direction, "candidates": {"calls": [], "puts": []}, "caution": None,
+                "note": "No cached option expirations found at or after this horizon."}
+
+    caution = None
+    if ec.get("collision"):
+        caution = (
+            f"⚠️ Earnings falls inside this window (Day {ec['day_of_window']} of {horizon_days}, "
+            f"{ec['earnings_date']}) -- these contracts carry real IV crush risk around that date, exactly "
+            f"like a same-week Earnings Simulator pick. See EARNINGS SIMULATOR for the full scenario matrix."
+        )
+
+    if direction is None:
+        candidates = {
+            "calls": _earnings_candidate_contracts(conn, ticker, "Bullish", target_expirations, top_n=3),
+            "puts": _earnings_candidate_contracts(conn, ticker, "Bearish", target_expirations, top_n=3),
+        }
+        note = "No directional lean yet -- a balanced-delta call and put both worth considering."
+    else:
+        candidates = {"calls": [], "puts": []}
+        key = "calls" if direction == "Bullish" else "puts"
+        candidates[key] = _earnings_candidate_contracts(conn, ticker, direction, target_expirations, top_n=3)
+        note = f"Leaning {direction.lower()} based on the {horizon_days}-day forecast above."
+
+    return {"direction": direction, "candidates": candidates, "caution": caution, "note": note,
+            "target_expirations": target_expirations}
+
+
+def analyze_swing_contract(ticker, conn, candidate, forecast_result, market=None):
+    """Part 6/9 -- the swing-forecast equivalent of analyze_earnings_
+    contract, reusing the same GENERIC primitives (compute_pl_curve_at_
+    expiration, compute_probability_of_profit -- both unmodified) but
+    scenario-tagged to the swing horizon rather than an earnings date:
+
+    - contract_pl's 3 scenarios (Down/Flat/Up) use the REAL empirical
+      N-day-forward distribution's p10/mean/p90 (Part 3's own numbers,
+      not the Earnings Simulator's fixed -6/+1.5/+6.5% convention, and
+      not linear scaling) as the price moves, valued via bs_price at the
+      target date's remaining time-to-expiration.
+    - No IV crush is modeled UNLESS check_earnings_collision() actually
+      found a real earnings date inside this window -- reuses compute_
+      pl_curve_at_earnings/compute_price_date_heatmap (both unmodified)
+      with the real crush ratio only in that case; otherwise sigma is
+      just held flat (pure time decay), which is the honest assumption
+      for a plain multi-day directional swing with no scheduled catalyst.
+    """
+    market = market or get_market_pricing_signals(ticker, conn)
+    spot = forecast_result.get("current_price") or market.get("current_price")
+    strike, option_type = candidate.get("strike"), candidate.get("type")
+    entry_price, entry_iv, dte = candidate.get("last_price"), candidate.get("iv_pct"), candidate.get("dte")
+    if spot is None or None in (strike, option_type, entry_price, entry_iv, dte) or entry_price <= 0:
+        return None
+
+    horizon_days = forecast_result["horizon_days"]
+    vol_dist = forecast_result.get("empirical_distribution") or {}
+    ec = forecast_result.get("earnings_collision") or {}
+    collision = bool(ec.get("collision"))
+    crush = _estimate_iv_crush_ratio(conn, ticker) if collision else {"ratio": 1.0, "source": "not_applicable", "n_events": 0}
+    earnings_date = ec.get("earnings_date") if collision else None
+
+    breakeven = (strike + entry_price) if option_type == "call" else (strike - entry_price)
+    T_entry = max(dte, 1) / 365.0
+    risk_free_rate = get_current_risk_free_rate(conn)
+    pop = compute_probability_of_profit(
+        spot, breakeven, T_entry, risk_free_rate, entry_iv / 100 if entry_iv else None, option_type,
+    )
+
+    remaining_days = max(dte - horizon_days, 1)
+    T_target = remaining_days / 365.0
+    entry_iv_frac = entry_iv / 100
+    target_iv_frac = max(0.01, entry_iv_frac * crush["ratio"])
+    scenario_moves = [
+        ("Down", vol_dist.get("p10_pct")), ("Flat", vol_dist.get("mean_pct")), ("Up", vol_dist.get("p90_pct")),
+    ]
+    scenario_pl = []
+    for label, move_pct in scenario_moves:
+        if move_pct is None:
+            continue
+        scenario_spot = spot * (1 + move_pct / 100)
+        theo = bs_price(scenario_spot, strike, T_target, risk_free_rate, target_iv_frac, option_type=option_type)
+        if math.isnan(theo):
+            theo = max(scenario_spot - strike, 0.0) if option_type == "call" else max(strike - scenario_spot, 0.0)
+        pl_dollar = (theo - entry_price) * 100
+        scenario_pl.append({
+            "scenario": label, "price_move_pct": round(move_pct, 1), "scenario_spot": round(scenario_spot, 2),
+            "target_option_price": round(theo, 2), "pl_dollar": round(pl_dollar, 2),
+            "pl_pct": round((theo - entry_price) / entry_price * 100, 1),
+        })
+    contract_pl = {
+        "expiration": candidate.get("expiration"), "strike": strike, "type": option_type,
+        "entry_price": entry_price, "entry_iv_pct": entry_iv, "spot": spot, "breakeven": round(breakeven, 2),
+        "target_iv_pct": round(target_iv_frac * 100, 1), "scenarios": scenario_pl,
+    }
+
+    pl_curve = compute_pl_curve_at_expiration(candidate, spot)
+    pl_curve_earnings = (
+        compute_pl_curve_at_earnings(candidate, spot, crush, earnings_date, conn=conn) if collision else None
+    )
+    heatmap = compute_price_date_heatmap(candidate, spot, crush, earnings_date, conn=conn)
+
+    direction_word = {"UP": "bullish", "DOWN": "bearish", "FLAT": "flat"}.get(forecast_result.get("predicted_direction"), "neutral")
+    reasoning = (
+        f"{horizon_days}-day {direction_word} lean toward ${forecast_result['target_price']:.2f} "
+        f"({forecast_result['mode']} confidence). Scenario moves above use this ticker's own real "
+        f"{vol_dist.get('n', 0)}-session {horizon_days}-day empirical return distribution "
+        f"(p10 {vol_dist.get('p10_pct', 0):+.1f}% / mean {vol_dist.get('mean_pct', 0):+.1f}% / "
+        f"p90 {vol_dist.get('p90_pct', 0):+.1f}%), not a hand-picked range."
+        + (f" Earnings falls inside this window ({earnings_date}) -- IV crush is modeled." if collision else
+           " No earnings date inside this window -- no IV crush modeled, just time decay.")
+    )
+
+    net_debit = round(entry_price * 100, 2)
+    return {
+        "candidate": candidate, "net_debit": net_debit, "max_loss": net_debit,
+        "breakeven": round(breakeven, 2), "probability_of_profit": pop,
+        "pl_curve": pl_curve, "pl_curve_earnings": pl_curve_earnings, "heatmap": heatmap,
+        "contract_pl": contract_pl, "iv_crush": crush, "reasoning": reasoning, "collision": collision,
+    }
+
+
+def get_swing_backtest_report_data(conn, ticker, horizon_days):
+    """Mirrors get_backtest_report_data (unmodified) -- every backtested
+    swing_forecasts row for (ticker, horizon_days), plus the latest
+    swing_backtest_runs summary row."""
+    rows = conn.execute(
+        """SELECT session_date, model_start_price, target_price, actual_close_price, error_pct,
+                  prediction_correct_direction
+           FROM swing_forecasts WHERE ticker=? AND horizon_days=? AND source='backtest' AND error_pct IS NOT NULL
+           ORDER BY session_date""",
+        (ticker, horizon_days),
+    ).fetchall()
+    keys = ["session_date", "model_start_price", "target_price", "actual_close_price", "error_pct",
+            "prediction_correct_direction"]
+    rows = [dict(zip(keys, r)) for r in rows]
+    latest_run = conn.execute(
+        """SELECT run_at, lookback_days, date_range_start, date_range_end, qualifying_sessions_found,
+                  sessions_backtested, mean_error_pct, mean_abs_error_pct, direction_accuracy
+           FROM swing_backtest_runs WHERE ticker=? AND horizon_days=? ORDER BY id DESC LIMIT 1""",
+        (ticker, horizon_days),
+    ).fetchone()
+    if latest_run:
+        run_keys = ["run_at", "lookback_days", "date_range_start", "date_range_end",
+                    "qualifying_sessions_found", "sessions_backtested", "mean_error_pct",
+                    "mean_abs_error_pct", "direction_accuracy"]
+        latest_run = dict(zip(run_keys, latest_run))
+    return rows, latest_run
+
+
+# --------------------------------------------------------------------------
 # Orchestration
 # --------------------------------------------------------------------------
 
@@ -11262,6 +13892,21 @@ def full_refresh(tickers=None, db_path=DEFAULT_DB_PATH, progress_callback=None, 
             _report(f"Polymarket macro-relevant events: {n} synced")
         except Exception as e:
             _report(f"Polymarket macro fetch failed: {e}")
+
+        try:
+            # Populates fed_rate_history BEFORE the per-ticker options-flow
+            # loop below, since get_current_risk_free_rate (used by that
+            # loop's Greeks calc) only ever reads this table, never
+            # fetches live itself -- ordering here is what actually gets a
+            # live rate into today's Greeks instead of the 0.04 fallback.
+            fed_result = cached_fed_funds_rate(conn, max_age_hours=24, force_refresh=force_refresh)
+            if fed_result["data"]:
+                _report(f"Fed Funds Rate: {fed_result['data']['dff_rate']:.2f}% "
+                        f"({'cached' if fed_result['cache_hit'] else 'fetched'})")
+            else:
+                _report("Fed Funds Rate: unavailable -- Greeks will use the RISK_FREE_RATE_DEFAULT fallback")
+        except Exception as e:
+            _report(f"Fed Funds Rate failed: {e}")
 
         for i, ticker in enumerate(tickers):
             _report(f"[{i + 1}/{len(tickers)}] {ticker}: options flow...")
@@ -11692,6 +14337,51 @@ def _probe_openai():
             "note": "key present but not used by any feature in this app (legacy from new_top.py)"}
 
 
+def _probe_fed_funds_rate():
+    """Part 10 -- distinct registry row from the existing 'fred_api' one
+    (MACRO CALENDAR's CPI/NFP/etc. schedule), since this is a different
+    consumer (Black-Scholes risk-free rate + Fed target range framing)
+    even though both hit the same underlying FRED API/key. Real live
+    check against the DFF series specifically, not just a generic FRED
+    ping, so a problem isolated to this one series is visible."""
+    api_key = os.environ.get("FRED_API_KEY")
+    if not api_key:
+        return {"status": "not_configured", "source": "fed_funds_rate", "error": "FRED_API_KEY not set"}
+    t0 = time.time()
+    try:
+        resp = requests.get(f"{FRED_API_BASE}/series/observations", params={
+            "series_id": "DFF", "api_key": api_key, "file_type": "json", "sort_order": "desc", "limit": 1,
+        }, timeout=8)
+        if resp.status_code == 200:
+            return {"status": "up", "source": "fed_funds_rate", "latency_ms": int((time.time() - t0) * 1000)}
+        return {"status": "down", "source": "fed_funds_rate", "error": f"HTTP {resp.status_code}"}
+    except Exception as e:
+        return {"status": "down", "source": "fed_funds_rate", "error": str(e)}
+
+
+def _probe_email_digest():
+    """Real (but side-effect-free: connect + STARTTLS + login, never a
+    send) SMTP connectivity probe -- same 'actually test it' discipline
+    as _probe_anthropic's free Models API call, just scoped to auth
+    instead of a billed action."""
+    smtp_host = os.environ.get("SMTP_HOST")
+    smtp_port = os.environ.get("SMTP_PORT")
+    smtp_user = os.environ.get("SMTP_USER")
+    smtp_password = os.environ.get("SMTP_PASSWORD")
+    recipient = os.environ.get("EMAIL_RECIPIENT")
+    if not (smtp_host and smtp_port and smtp_user and smtp_password and recipient):
+        return {"status": "not_configured", "source": "smtp",
+                "error": "SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASSWORD/EMAIL_RECIPIENT not all set"}
+    t0 = time.time()
+    try:
+        with smtplib.SMTP(smtp_host, int(smtp_port), timeout=8) as server:
+            server.starttls()
+            server.login(smtp_user, smtp_password)
+        return {"status": "up", "source": "smtp", "latency_ms": int((time.time() - t0) * 1000)}
+    except Exception as e:
+        return {"status": "down", "source": "smtp", "error": str(e)}
+
+
 SOURCE_REGISTRY = [
     {"key": "yfinance", "purpose": "options / price / technicals / fundamentals",
      "env_var": None, "endpoint": "yfinance lib -> query2.finance.yahoo.com (no raw URL in this codebase)",
@@ -11746,6 +14436,23 @@ SOURCE_REGISTRY = [
      "probe": _probe_openai},
     {"key": "financialjuice", "purpose": "reference links only, no API", "env_var": None,
      "endpoint": "https://www.financialjuice.com/home (manual link, not fetched)", "probe": None},
+    {"key": "fred_api", "purpose": "MACRO CALENDAR -- CPI/Core PCE/NFP/jobless claims/GDP/retail sales "
+                                    "schedule + values", "env_var": "FRED_API_KEY",
+     "endpoint": "https://api.stlouisfed.org/fred/* (release/dates, series/observations)",
+     "probe": _probe_fred},
+    {"key": "fomc_schedule", "purpose": "MACRO CALENDAR -- FOMC meeting/rate-decision dates", "env_var": None,
+     "endpoint": "federalreserve.gov/monetarypolicy/fomccalendars.htm (stored table, no live API)",
+     "probe": _probe_fomc_schedule},
+    {"key": "fed_funds_rate", "purpose": "Live risk-free rate for Black-Scholes Greeks (replaces the prior "
+                                          "hardcoded 0.04) + Fed target range for macro reasoning",
+     "env_var": "FRED_API_KEY",
+     "endpoint": "https://api.stlouisfed.org/fred/series/observations?series_id={DFF,DFEDTARU,DFEDTARL,FEDFUNDS}",
+     "probe": _probe_fed_funds_rate},
+    {"key": "email_digest", "purpose": "WATCHLIST SIGNALS -- optional daily digest email (entry zones "
+                                        "triggered + new analyst rating changes)",
+     "env_var": "SMTP_HOST / SMTP_PORT / SMTP_USER / SMTP_PASSWORD / EMAIL_RECIPIENT",
+     "endpoint": "smtplib SMTP+STARTTLS (e.g. smtp.gmail.com:587 with a Gmail App Password)",
+     "probe": _probe_email_digest},
 ]
 
 
@@ -11761,6 +14468,2225 @@ def check_full_source_registry():
             continue
         results.append({**row, **entry["probe"]()})
     return {"sources": results, "checked_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")}
+
+
+# --------------------------------------------------------------------------
+# WATCHLIST SIGNALS -- entry-zone price triggers + a recurring analyst
+# rating-change scan, surfaced on the WATCHLIST SIGNALS tab and an
+# optional daily email digest (never a webhook -- see send_daily_digest_
+# email below). Additive: new tables (entry_zones, seen_analyst_actions,
+# digest_email_log), reuses fetch_analyst_actions()/cached_analyst_
+# actions() and _read_price_history() unchanged.
+# --------------------------------------------------------------------------
+
+def get_latest_cached_price(conn, ticker):
+    """Pure DB read (no network) of this ticker's most recent daily close
+    from price_history -- the "already-cached data" source both the entry-
+    zone check and the tab's zone-status badge use. Returns None if this
+    ticker has no price history cached yet (e.g. never refreshed)."""
+    hist = _read_price_history(conn, ticker, days_back=5)
+    if hist.empty:
+        return None
+    return float(hist["Close"].iloc[-1])
+
+
+def compute_implied_target_price(entry_low, entry_high, target_pct):
+    """entry midpoint * (1 + target_pct/100) -- computed on demand (not
+    stored) since it's a pure function of three already-stored fields,
+    matching Part 2's exact entry_zones schema (no implied_target_price
+    column)."""
+    midpoint = (float(entry_low) + float(entry_high)) / 2.0
+    return round(midpoint * (1 + float(target_pct) / 100.0), 2)
+
+
+def get_entry_zones(conn):
+    """All auto-derived entry zones on record, alphabetical by ticker."""
+    cols = ["ticker", "entry_low", "entry_high", "target_pct", "target_horizon_days",
+            "implied_target_price", "reasoning", "last_zone_status", "zone_entered_at",
+            "computed_at", "created_at", "updated_at"]
+    rows = conn.execute(f"SELECT {', '.join(cols)} FROM entry_zones ORDER BY ticker").fetchall()
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def _classify_zone_status(price, entry_low, entry_high):
+    if price is None or entry_low is None or entry_high is None:
+        return None
+    if price < entry_low:
+        return "below"
+    if price > entry_high:
+        return "above"
+    return "in_zone"
+
+
+def check_entry_zones(conn):
+    """Part 2. For every configured entry_zones row, compares the current
+    cached price against [entry_low, entry_high] and updates
+    last_zone_status on EVERY call (so the next check always has an
+    accurate prior state, including detecting a future re-entry after
+    price has left and come back). zone_entered_at is set -- and this
+    zone is returned as newly triggered -- only on a genuine above/below
+    -> in_zone transition; a zone already 'in_zone' last check is left
+    alone, so it doesn't re-trigger on every check while price just sits
+    inside."""
+    newly_triggered = []
+    for zone in get_entry_zones(conn):
+        ticker = zone["ticker"]
+        price = get_latest_cached_price(conn, ticker)
+        status = _classify_zone_status(price, zone["entry_low"], zone["entry_high"])
+        if status is None:
+            continue  # no cached price yet for this ticker -- nothing to evaluate
+        now = datetime.utcnow().isoformat()
+        if status == "in_zone" and zone["last_zone_status"] != "in_zone":
+            conn.execute(
+                "UPDATE entry_zones SET last_zone_status=?, zone_entered_at=?, updated_at=? WHERE ticker=?",
+                (status, now, now, ticker),
+            )
+            newly_triggered.append({**zone, "last_zone_status": status, "zone_entered_at": now,
+                                     "current_price": price})
+        else:
+            conn.execute(
+                "UPDATE entry_zones SET last_zone_status=?, updated_at=? WHERE ticker=?", (status, now, ticker)
+            )
+        conn.commit()
+    return newly_triggered
+
+
+def check_rating_changes(conn, tickers):
+    """Part 3. For every ticker in `tickers` (the current watchlist),
+    reuses cached_analyst_actions() -- which itself calls the existing
+    fetch_analyst_actions() (never rewritten here) -- and inserts any
+    (ticker, firm, action_date) combination not already in
+    seen_analyst_actions. The composite PRIMARY KEY makes this a natural
+    INSERT OR IGNORE: no separate read-then-compare needed, and multiple
+    firms acting on the same ticker the same day are all tracked
+    distinctly rather than only the single latest action. Returns every
+    row genuinely newly inserted this call (rowcount>0), which the
+    WATCHLIST SIGNALS tab uses for its 'NEW' badge and the digest email
+    re-derives independently from first_seen_at against its own baseline."""
+    newly_seen = []
+    for ticker in tickers:
+        result = cached_analyst_actions(conn, ticker, max_age_hours=12)
+        actions = (result.get("data") or {}).get("most_recent_actions") or []
+        now = datetime.utcnow().isoformat()
+        for a in actions:
+            cur = conn.execute(
+                """INSERT OR IGNORE INTO seen_analyst_actions
+                       (ticker, firm, action_date, from_grade, to_grade, action, first_seen_at)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (ticker, a.get("firm"), a["date"], a.get("from_grade"), a.get("to_grade"), a.get("action"), now),
+            )
+            if cur.rowcount:
+                newly_seen.append({"ticker": ticker, "firm": a.get("firm"), "action_date": a["date"],
+                                    "from_grade": a.get("from_grade"), "to_grade": a.get("to_grade"),
+                                    "action": a.get("action"), "first_seen_at": now})
+        conn.commit()
+    return newly_seen
+
+
+# --------------------------------------------------------------------------
+# Entry Zones rebuild (Part 1): auto-derived from data already computed
+# elsewhere -- detect_technical_levels (support), get_multiday_realized_
+# volatility (real backtested forward-return distribution, replacing a
+# flat 20% assumption), get_swing_backtest_report_data/
+# backtest_swing_forecasts (confidence gate), compute_divergence (smart-
+# money context). No manual entry_low/entry_high input anywhere.
+# --------------------------------------------------------------------------
+
+# 30 trading days -- the longest of SWING_HORIZON_OPTIONS, reused here as
+# the confidence/accuracy gate (via backtest_swing_forecasts, bootstrapped
+# through ensure_ticker_data_ready exactly like Swing Forecast/Day
+# Prediction already do). Deliberately separate from the 90-day window
+# below: this one asks "how good has this model's OWN prediction process
+# been for this ticker," not "what's the real forward-return magnitude."
+ENTRY_ZONE_SWING_HORIZON_DAYS = 30
+# ~3 months in trading days -- the actual empirical forward-return window
+# get_multiday_realized_volatility measures, matching the "~20% move over
+# ~3 months" framing this feature started from, except the % is now real
+# and backtested per-ticker instead of a flat assumption.
+ENTRY_ZONE_TARGET_HORIZON_DAYS = 90
+ENTRY_ZONE_SUPPORT_BAND_PCT = 2.0
+# Widest band, used ONLY for the lowest-confidence anchor tier (current
+# price itself, when neither a confirmed swing support nor a high-volume
+# node exists below it) -- double the normal band, since there's no real
+# level here to be tight around, just the current price as a placeholder
+# center.
+ENTRY_ZONE_NO_ANCHOR_BAND_PCT = 4.0
+ENTRY_ZONE_MIN_FORWARD_RETURN_SAMPLES = 10
+ENTRY_ZONE_MIN_BACKTEST_SESSIONS = 5
+ENTRY_ZONE_RECOMPUTE_MAX_AGE_HOURS = 1
+
+
+def derive_entry_zone(ticker, conn):
+    """Synthesizes an entry-zone recommendation entirely from data already
+    computed elsewhere in this dashboard (see the four numbered inputs
+    below) -- never a user-entered range. Mode 1/2/3 honesty framework,
+    same as Earnings Simulator/Day Prediction/Swing Forecast: a thin or
+    missing input is stated plainly in `reasoning`, never papered over
+    with a confident-looking number computed from insufficient data.
+
+    Three-tier anchor, always resolving to SOME entry zone rather than
+    ever dead-ending on "can't compute" just because the best-case anchor
+    isn't available -- accuracy degrades honestly instead of coverage
+    dropping to nothing:
+      1. The strongest confirmed (>=2-touch) swing-point support below
+         the current price, when one exists.
+      2. Otherwise, the heaviest-volume price node below current price
+         (real historical trading interest, just not a confirmed swing
+         low).
+      3. Otherwise (confirmed live: LULU/OKLO/WMT -- genuinely nothing
+         below price by either method, since price itself is the lowest
+         point in the whole lookback window), a wider band around the
+         current price itself as an explicit lowest-confidence
+         placeholder.
+    Each tier is labeled via anchor_support["kind"] and spelled out
+    plainly in `reasoning` -- lower tiers are never dressed up to look
+    like a confirmed support. Returns {"ticker", "ready": False,
+    "reason": ...} only when there's no price/history data at all to work
+    with (readiness gate above, or no current_price) -- not merely
+    because no support level was found.
+    """
+    readiness = ensure_ticker_data_ready(ticker, conn, bootstrap_swing_horizons=[ENTRY_ZONE_SWING_HORIZON_DAYS])
+    if not readiness["ready"]:
+        return {"ticker": ticker, "ready": False,
+                "reason": " ".join(readiness["still_missing"]) or "No reliable price history available."}
+
+    # 1 + 4: technical support levels + current price relative to them.
+    levels = detect_technical_levels(ticker, DEFAULT_INTERVAL, DEFAULT_LOOKBACK, conn=conn)
+    current_price = levels.get("current_price")
+    if current_price is None:
+        return {"ticker": ticker, "ready": False,
+                "reason": "No current price available from technical-levels detection."}
+
+    supports_below = [lv for lv in levels.get("support_levels", []) if lv["level"] < current_price]
+    if supports_below:
+        # The strongest (most-touched) support within 20% of current price
+        # -- a genuinely nearby level, not just whichever is technically
+        # closest, which could be a single barely-confirmed 2-touch
+        # cluster passed over a much stronger level just slightly farther
+        # away. Falls back to the single nearest support below price if
+        # none qualify within that band.
+        nearby = [lv for lv in supports_below if (current_price - lv["level"]) / current_price * 100 <= 20]
+        anchor = dict(max(nearby, key=lambda lv: lv["touches"]) if nearby
+                       else max(supports_below, key=lambda lv: lv["level"]))
+        anchor["kind"] = "swing_support"
+    else:
+        # Fallback (confirmed live: NOW -- support_levels was [] entirely
+        # in the 6mo window; OKLO -- its only two swing supports were both
+        # ABOVE current price, i.e. already broken) -- a confirmed 2-touch
+        # swing low isn't the only real signal available. volume_profile_
+        # nodes (already computed by detect_technical_levels, previously
+        # unused here) mark where the heaviest historical trading actually
+        # happened; a node below the current price is a real, if weaker,
+        # anchor than a confirmed swing support.
+        nodes_below = [n for n in levels.get("volume_profile_nodes", []) if n["level"] < current_price]
+        if nodes_below:
+            best_node = max(nodes_below, key=lambda n: n["volume"])
+            anchor = {"level": best_node["level"], "touches": None, "volume": best_node["volume"],
+                      "kind": "volume_node"}
+        else:
+            # Last resort (confirmed live: LULU, OKLO, WMT -- genuinely
+            # nothing below price by either method, since price itself is
+            # the lowest point in the whole 6mo window). There's still
+            # always something to state: the current price, with a wider
+            # band since there's no real level to be tight around. This is
+            # the honesty framework's "less accuracy, never no answer"
+            # tier -- explicitly labeled as such below, never presented as
+            # a real support.
+            anchor = {"level": current_price, "touches": None, "kind": "current_price_fallback"}
+
+    band_pct = ENTRY_ZONE_NO_ANCHOR_BAND_PCT if anchor["kind"] == "current_price_fallback" else ENTRY_ZONE_SUPPORT_BAND_PCT
+    band = anchor["level"] * (band_pct / 100.0)
+    entry_low, entry_high = round(anchor["level"] - band, 2), round(anchor["level"] + band, 2)
+    midpoint = (entry_low + entry_high) / 2.0
+
+    # 2: real backtested ~90-trading-day forward-return distribution --
+    # NOT a flat assumed 20%.
+    forward_dist = get_multiday_realized_volatility(ticker, conn, ENTRY_ZONE_TARGET_HORIZON_DAYS)
+    has_forward_dist = (
+        (forward_dist.get("n") or 0) >= ENTRY_ZONE_MIN_FORWARD_RETURN_SAMPLES
+        and forward_dist.get("mean_pct") is not None
+    )
+
+    # Confidence gate: Swing Forecast's OWN backtested accuracy for this
+    # ticker, read from the same registry the SWING FORECAST tab's
+    # Backtest Report reads (get_swing_backtest_report_data) -- never
+    # re-run backtest_swing_forecasts() live here; that only ever runs via
+    # ensure_ticker_data_ready's one-time bootstrap above.
+    _, swing_backtest = get_swing_backtest_report_data(conn, ticker, ENTRY_ZONE_SWING_HORIZON_DAYS)
+    has_swing_backtest = bool(swing_backtest) and (swing_backtest.get("sessions_backtested") or 0) >= (
+        ENTRY_ZONE_MIN_BACKTEST_SESSIONS
+    )
+
+    # 3: current divergence score/label -- post-fix v2 formula. Reads the
+    # LATEST already-computed row rather than calling compute_divergence()
+    # live here (that already runs on its own cadence via full_refresh/
+    # the deep-dive's "Fetch live signals"; re-running it again on every
+    # entry-zone scan tick would just redundantly recompute the same-day
+    # row) -- score_formula_version='v2' only, same reasoning as
+    # get_divergence_score_trend.
+    div_row = conn.execute(
+        """SELECT score, label FROM divergence_scores WHERE ticker=? AND score_formula_version='v2'
+           ORDER BY computed_date DESC LIMIT 1""",
+        (ticker,),
+    ).fetchone()
+
+    if anchor["kind"] == "swing_support":
+        reasoning_parts = [
+            f"Suggested entry: ${entry_low:.2f}-${entry_high:.2f}, anchored on the {anchor['touches']}-touch "
+            f"support level at ${anchor['level']:.2f} (detected via technical structure)."
+        ]
+    elif anchor["kind"] == "volume_node":
+        reasoning_parts = [
+            f"Suggested entry: ${entry_low:.2f}-${entry_high:.2f}, anchored on a high-volume price node at "
+            f"${anchor['level']:.2f} -- no confirmed 2-touch swing support exists below the current price in "
+            f"the {DEFAULT_LOOKBACK} window, so this uses the heaviest historical trading level below price "
+            f"instead (a real but lower-confidence anchor than a confirmed swing support)."
+        ]
+    else:
+        reasoning_parts = [
+            f"Suggested entry: ${entry_low:.2f}-${entry_high:.2f}, a wider band around the current price of "
+            f"${anchor['level']:.2f} -- no confirmed support or high-volume node exists below price at all in "
+            f"the {DEFAULT_LOOKBACK} window (price is at/near a multi-{DEFAULT_LOOKBACK} low), so there's no "
+            f"real level to anchor on. LOWEST-CONFIDENCE tier: this is a placeholder band around price itself, "
+            f"not a level with any historical significance."
+        ]
+
+    if has_forward_dist:
+        target_pct = forward_dist["mean_pct"]
+        implied_target_price = compute_implied_target_price(entry_low, entry_high, target_pct)
+        reasoning_parts.append(
+            f"Backtested {ENTRY_ZONE_TARGET_HORIZON_DAYS}-day forward returns from {forward_dist['n']} similar "
+            f"historical windows average {target_pct:+.1f}% (target ~${implied_target_price:.2f})."
+        )
+    else:
+        target_pct, implied_target_price = None, None
+        n = forward_dist.get("n") or 0
+        reasoning_parts.append(
+            f"Only {n} historical {ENTRY_ZONE_TARGET_HORIZON_DAYS}-day forward-return window(s) on record -- "
+            f"too thin to state a reliable target % yet (needs >={ENTRY_ZONE_MIN_FORWARD_RETURN_SAMPLES})."
+        )
+
+    if has_swing_backtest:
+        reasoning_parts.append(
+            f"Swing Forecast's own {ENTRY_ZONE_SWING_HORIZON_DAYS}-day backtest on this ticker: "
+            f"{swing_backtest['direction_accuracy']:.0%} directional accuracy across "
+            f"{swing_backtest['sessions_backtested']} sessions."
+        )
+    else:
+        reasoning_parts.append(
+            f"Swing Forecast has fewer than {ENTRY_ZONE_MIN_BACKTEST_SESSIONS} backtested "
+            f"{ENTRY_ZONE_SWING_HORIZON_DAYS}-day sessions on record for this ticker yet -- not enough to "
+            f"characterize model accuracy here."
+        )
+
+    if div_row:
+        score, label = div_row
+        smart_money_note = (
+            " — smart money showing accumulation-style signals near this level."
+            if label in ("SMART_BULLISH", "INSTITUTIONAL_ACTIVE") else "."
+        )
+        reasoning_parts.append(f"Current divergence score: {score:.0f} ({label.replace('_', ' ')}){smart_money_note}")
+    else:
+        reasoning_parts.append("No divergence score on record yet for this ticker.")
+
+    return {
+        "ticker": ticker, "ready": True, "entry_low": entry_low, "entry_high": entry_high,
+        "target_pct": target_pct, "target_horizon_days": ENTRY_ZONE_TARGET_HORIZON_DAYS,
+        "implied_target_price": implied_target_price, "current_price": current_price,
+        "anchor_support": anchor, "divergence_score": div_row[0] if div_row else None,
+        "divergence_label": div_row[1] if div_row else None,
+        "swing_backtest": swing_backtest, "forward_return_dist": forward_dist,
+        "reasoning": " ".join(reasoning_parts),
+    }
+
+
+def refresh_entry_zone(conn, ticker, force_refresh=False):
+    """Persists derive_entry_zone()'s output into entry_zones -- on a
+    genuine failure (derived["ready"] is False, e.g. no confirmed support
+    below the current price) as much as on success, storing entry_low/
+    entry_high/target_pct/target_horizon_days/implied_target_price as
+    NULL and `reasoning` as the real failure reason. This matters for two
+    real reasons, not just tidiness:
+      1. Without a persisted computed_at, a ticker that keeps failing to
+         derive a zone would bypass the TTL gate below on every single
+         call (nothing to compare against), so the background scan would
+         retry it EVERY tick forever instead of respecting ENTRY_ZONE_
+         RECOMPUTE_MAX_AGE_HOURS like every other ticker.
+      2. The WATCHLIST SIGNALS tab's own rendering already has a branch
+         for "a row exists but entry_low is NULL" (shows the real
+         `reasoning`) vs. "no row at all" (shows a generic "not yet
+         computed" placeholder) -- with nothing ever persisted on
+         failure, a ticker that genuinely CAN'T derive a zone (confirmed
+         live: NOW/LULU, both with no detected support below their
+         current price) always fell into the wrong branch, showing "not
+         yet computed... will populate it shortly" forever, even
+         immediately after a real, honest computation that correctly
+         found nothing to anchor on. Clicking Recompute never fixed this
+         since nothing was ever written for that branch to read.
+
+    Gated by ENTRY_ZONE_RECOMPUTE_MAX_AGE_HOURS (same cached_*-style TTL
+    discipline as everything else in this file) unless force_refresh=True
+    (the per-ticker "Recompute" button) -- support levels/backtested
+    distributions don't meaningfully change minute to minute, so
+    recomputing on every scheduler tick (which can be every 5 min) would
+    be pure waste. Returns None when skipped for freshness (distinct from
+    a real {"ready": ...} result, success or failure). Never touches
+    last_zone_status/zone_entered_at -- those remain exclusively owned by
+    check_entry_zones (unchanged); if entry_low/entry_high just went NULL
+    here, the next check_entry_zones() tick reads a None status from
+    _classify_zone_status and simply leaves last_zone_status as whatever
+    it last was, rather than erroring."""
+    if not force_refresh:
+        existing_computed_at = conn.execute(
+            "SELECT computed_at FROM entry_zones WHERE ticker=?", (ticker,)
+        ).fetchone()
+        if existing_computed_at and existing_computed_at[0]:
+            computed_at = pd.Timestamp(existing_computed_at[0])
+            computed_at = computed_at.tz_localize("UTC") if computed_at.tzinfo is None else computed_at
+            age_hours = (pd.Timestamp.now(tz="UTC") - computed_at).total_seconds() / 3600.0
+            if age_hours < ENTRY_ZONE_RECOMPUTE_MAX_AGE_HOURS:
+                return None
+
+    derived = derive_entry_zone(ticker, conn)
+    now = datetime.utcnow().isoformat()
+    prior = conn.execute("SELECT created_at FROM entry_zones WHERE ticker=?", (ticker,)).fetchone()
+
+    if derived["ready"]:
+        entry_low, entry_high = derived["entry_low"], derived["entry_high"]
+        target_pct, target_horizon_days = derived["target_pct"], derived["target_horizon_days"]
+        implied_target_price, reasoning = derived["implied_target_price"], derived["reasoning"]
+    else:
+        entry_low = entry_high = target_pct = target_horizon_days = implied_target_price = None
+        reasoning = derived["reason"]
+
+    conn.execute(
+        """INSERT INTO entry_zones
+               (ticker, entry_low, entry_high, target_pct, target_horizon_days, implied_target_price,
+                reasoning, computed_at, created_at, updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(ticker) DO UPDATE SET
+               entry_low=excluded.entry_low, entry_high=excluded.entry_high, target_pct=excluded.target_pct,
+               target_horizon_days=excluded.target_horizon_days,
+               implied_target_price=excluded.implied_target_price, reasoning=excluded.reasoning,
+               computed_at=excluded.computed_at, updated_at=excluded.updated_at""",
+        (ticker, entry_low, entry_high, target_pct, target_horizon_days, implied_target_price, reasoning,
+         now, prior[0] if prior else now, now),
+    )
+    conn.commit()
+    return derived
+
+
+def refresh_all_entry_zones(conn, tickers):
+    """Part 1: runs derive_entry_zone (via refresh_entry_zone's TTL gate)
+    for every watchlist ticker automatically -- the scheduler-driven
+    replacement for the old manual add-a-zone form. Returns only the
+    zones actually (re)computed this call (skips excluded)."""
+    return [r for r in (refresh_entry_zone(conn, t) for t in tickers) if r is not None]
+
+
+# --------------------------------------------------------------------------
+# Rating-signal rebuild (Part 3): collapses every individual analyst
+# action into ONE weighted, attributed signal per ticker, instead of a
+# flat list treating a Tier 3 shop identically to Goldman Sachs.
+# --------------------------------------------------------------------------
+
+_DIRECTION_SCORE = {"upgrade": 1, "downgrade": -1, "reiterated": 0, "initiated": 0}
+# A single real Tier 2 upgrade (weight 0.6) alone should register as a
+# real signal; a couple of Tier 3 downgrades (0.25 each) should not
+# outweigh one genuine Tier 1/2 call -- 0.5 is the documented threshold
+# for "meaningfully" positive/negative net weight.
+_RATING_SIGNAL_THRESHOLD = 0.5
+
+
+def synthesize_rating_signal(ticker, conn, lookback_days=30):
+    """Part 3. One weighted net signal per ticker instead of a flat list
+    of every individual action (the prior, broken behavior -- a Freedom
+    Broker reiteration shown identically to a Goldman Sachs upgrade).
+    Reads seen_analyst_actions (populated by check_rating_changes(), which
+    itself calls the existing fetch_analyst_actions() -- never re-fetched
+    here), joins each action's issuing firm against firm_tiers for its
+    market-impact weight, and reports ONE classification with explicit
+    attribution to the single highest-tier action, never a faceless
+    aggregate."""
+    cutoff = (datetime.utcnow() - timedelta(days=lookback_days)).date().isoformat()
+    rows = conn.execute(
+        """SELECT firm, action_date, from_grade, to_grade, action FROM seen_analyst_actions
+           WHERE ticker=? AND action_date >= ? ORDER BY action_date DESC""",
+        (ticker, cutoff),
+    ).fetchall()
+
+    if not rows:
+        return {
+            "ticker": ticker, "signal": "QUIET", "weighted_net": 0.0, "n_actions": 0, "n_tier12_actions": 0,
+            "driving_action": None, "all_actions": [],
+            "reasoning": f"No analyst rating activity on record in the last {lookback_days} days.",
+        }
+
+    actions = []
+    weighted_net = 0.0
+    for firm, action_date, from_grade, to_grade, action in rows:
+        tier, tier_label, weight = get_firm_tier(conn, firm)
+        # `action` is NULL on rows persisted before that column existed
+        # (Part 3 migration) -- re-derive it the same way fetch_analyst_
+        # actions' own _classify_analyst_action does, via the from/to
+        # grade-rank fallback it already implements, rather than treating
+        # old rows as unclassifiable.
+        action = action or _classify_analyst_action(None, from_grade, to_grade)
+        direction_score = _DIRECTION_SCORE.get(action, 0)
+        weighted_net += weight * direction_score
+        actions.append({
+            "firm": firm, "action_date": action_date, "from_grade": from_grade, "to_grade": to_grade,
+            "action": action, "tier": tier, "tier_label": tier_label, "weight": weight,
+            "direction_score": direction_score,
+        })
+
+    n_tier12 = sum(1 for a in actions if a["tier"] <= 2)
+    # The single most notable action for attribution: best tier first,
+    # then directional (upgrade/downgrade) over a reiteration, then most
+    # recent -- named regardless of what the overall classification ends
+    # up being, so QUIET/MIXED still cite real context, not silence.
+    # Two-pass stable sort (action_date is a "YYYY-MM-DD" string, not a
+    # number, so it can't be negated for a single mixed-order sort key):
+    # sort by recency first, then a STABLE sort by (tier, -|direction|)
+    # preserves that recency ordering among ties.
+    by_recency = sorted(actions, key=lambda a: a["action_date"], reverse=True)
+    driving = sorted(by_recency, key=lambda a: (a["tier"], -abs(a["direction_score"])))[0]
+
+    if n_tier12 == 0:
+        signal = "QUIET"
+        reasoning = (
+            f"{len(actions)} smaller-firm rating change(s) on record (Tier 3) in the last {lookback_days} "
+            f"days — limited expected market impact absent a large-firm confirmation. Most recent: "
+            f"{driving['firm']} {driving['action']} ({driving['action_date']})."
+        )
+    elif weighted_net >= _RATING_SIGNAL_THRESHOLD:
+        signal = "UPGRADE"
+        reasoning = (
+            f"Driven primarily by {driving['firm']}'s {driving['action_date']} {driving['action']} to "
+            f"{driving['to_grade'] or '—'} — a {driving['tier_label']} firm."
+        )
+    elif weighted_net <= -_RATING_SIGNAL_THRESHOLD:
+        signal = "DOWNGRADE"
+        reasoning = (
+            f"Driven primarily by {driving['firm']}'s {driving['action_date']} {driving['action']} to "
+            f"{driving['to_grade'] or '—'} — a {driving['tier_label']} firm."
+        )
+    else:
+        signal = "MIXED"
+        reasoning = (
+            f"{n_tier12} large/mid-tier rating action(s) in the last {lookback_days} days, roughly balanced "
+            f"(net weight {weighted_net:+.2f}). Most notable: {driving['firm']}'s {driving['action_date']} "
+            f"{driving['action']} — a {driving['tier_label']} firm."
+        )
+
+    return {
+        "ticker": ticker, "signal": signal, "weighted_net": round(weighted_net, 3), "n_actions": len(actions),
+        "n_tier12_actions": n_tier12, "driving_action": driving, "all_actions": actions,
+        "reasoning": reasoning, "lookback_days": lookback_days,
+    }
+
+
+def get_watchlist_signals_since(conn, since_iso):
+    """Entry-zone triggers + newly-seen rating changes at/after `since_iso`
+    -- the one query both the WATCHLIST SIGNALS tab's 'since your last
+    visit' summary and send_daily_digest_email's 'since the last digest'
+    body run, just against different baselines (a session-local
+    last-viewed marker vs. digest_email_log's last sent_at)."""
+    zone_rows = conn.execute(
+        """SELECT ticker, entry_low, entry_high, target_pct, target_horizon_days, implied_target_price,
+                  reasoning, zone_entered_at
+           FROM entry_zones WHERE last_zone_status='in_zone' AND zone_entered_at >= ?
+           ORDER BY zone_entered_at DESC""",
+        (since_iso,),
+    ).fetchall()
+    action_rows = conn.execute(
+        """SELECT ticker, firm, action_date, from_grade, to_grade, first_seen_at FROM seen_analyst_actions
+           WHERE first_seen_at >= ? ORDER BY first_seen_at DESC""",
+        (since_iso,),
+    ).fetchall()
+    zcols = ["ticker", "entry_low", "entry_high", "target_pct", "target_horizon_days", "implied_target_price",
+             "reasoning", "zone_entered_at"]
+    acols = ["ticker", "firm", "action_date", "from_grade", "to_grade", "first_seen_at"]
+    return {
+        "triggered_zones": [dict(zip(zcols, r)) for r in zone_rows],
+        "new_actions": [dict(zip(acols, r)) for r in action_rows],
+    }
+
+
+WATCHLIST_SIGNALS_LAST_VIEWED_PATH = "watchlist_signals_last_viewed.json"
+
+
+def load_watchlist_signals_last_viewed(path=WATCHLIST_SIGNALS_LAST_VIEWED_PATH):
+    """Persisted 'last time the WATCHLIST SIGNALS tab was actually
+    opened' marker -- same small-JSON-file pattern as load_pinned_runners/
+    load_runners_refresh_interval, so it survives restarts/reloads like
+    those do. Drives the tab's 'since your last visit' summary and which
+    rating-change rows get a NEW badge. Returns None (not today) if
+    missing, so a genuine first-ever visit reads as 'everything currently
+    triggered/seen is new,' not 'nothing is new.'"""
+    try:
+        with open(path, "r") as f:
+            value = json.load(f)
+        if isinstance(value, str) and value:
+            return value
+    except (FileNotFoundError, json.JSONDecodeError, ValueError):
+        pass
+    return None
+
+
+def save_watchlist_signals_last_viewed(value=None, path=WATCHLIST_SIGNALS_LAST_VIEWED_PATH):
+    value = value or datetime.utcnow().isoformat()
+    with open(path, "w") as f:
+        json.dump(value, f)
+    return value
+
+
+# --------------------------------------------------------------------------
+# Email Digest configuration + scheduling (this feature's own rebuild):
+# recipient/frequency/schedule/content-selection move off env-var-only
+# into an in-app singleton config row (Part 1); SMTP server credentials
+# remain environment secrets. See the long honesty note on
+# should_send_daily_digest_now for exactly how (and how unreliably) this
+# actually fires in a plain Streamlit deployment.
+# --------------------------------------------------------------------------
+
+DEFAULT_DIGEST_SECTIONS = [
+    "featured_stock", "todays_runners", "day_prediction_targets", "watchlist_signals",
+    "swing_forecast_highlights", "macro_events_week", "earnings_alerts",
+]
+DIGEST_SECTION_LABELS = {
+    "featured_stock": "Featured Stock", "todays_runners": "Today's Runners",
+    "day_prediction_targets": "Day Prediction targets",
+    "watchlist_signals": "Watchlist Signals (full table)",
+    "swing_forecast_highlights": "Swing Forecast highlights",
+    "macro_events_week": "Macro Calendar — This Week & Next Week",
+    "earnings_alerts": "Earnings Simulator alerts",
+}
+# Copied from dashboard.py's _MACRO_IMPACT_COLORS (COLOR_BEARISH/amber/
+# TEXT_SECONDARY) so the digest's impact badges match the Macro Calendar
+# tab's own color coding exactly -- data_engine.py can't import from
+# dashboard.py, so these are the same literal hex values, not re-derived.
+_MACRO_IMPACT_COLORS_HEX = {"High": "#e66767", "Medium": "#e8c547", "Low": "#8b9bab"}
+# Last-resort default sender when NEITHER EMAIL_FROM (env var) nor
+# email_config.from_email (in-app setting) is set -- monotrading.io is
+# the domain identity actually verified in SES right now (see the SES
+# cutover this constant was added for), not a placeholder.
+DEFAULT_DIGEST_FROM_EMAIL = "digest@monotrading.io"
+
+_EMAIL_CONFIG_COLS = [
+    "recipient_email", "from_email", "enabled", "frequency", "send_time_et", "wait_for_runners",
+    "wait_for_predictions", "sections_included", "last_sent_date", "last_digest_sent_at", "last_send_status",
+    "last_send_error",
+]
+
+
+def get_email_config(conn):
+    """Reads the singleton email_config row (id=1), seeding it with safe
+    defaults on first-ever call -- so every other function here can
+    assume the row already exists rather than each handling a missing-row
+    case separately. `from_email` here is the raw STORED value (possibly
+    NULL) -- see get_effective_from_email for the env-var-override
+    resolution actually used when sending."""
+    row = conn.execute(f"SELECT {', '.join(_EMAIL_CONFIG_COLS)} FROM email_config WHERE id=1").fetchone()
+    if not row:
+        conn.execute(
+            """INSERT INTO email_config
+                   (id, recipient_email, from_email, enabled, frequency, send_time_et, wait_for_runners,
+                    wait_for_predictions, sections_included, updated_at)
+               VALUES (1, NULL, ?, 0, 'daily', '07:30', 1, 1, ?, ?)""",
+            (DEFAULT_DIGEST_FROM_EMAIL, json.dumps(DEFAULT_DIGEST_SECTIONS), datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+        return get_email_config(conn)
+    cfg = dict(zip(_EMAIL_CONFIG_COLS, row))
+    cfg["enabled"] = bool(cfg["enabled"])
+    cfg["wait_for_runners"] = bool(cfg["wait_for_runners"])
+    cfg["wait_for_predictions"] = bool(cfg["wait_for_predictions"])
+    try:
+        cfg["sections_included"] = (
+            json.loads(cfg["sections_included"]) if cfg["sections_included"] else list(DEFAULT_DIGEST_SECTIONS)
+        )
+    except (TypeError, ValueError):
+        cfg["sections_included"] = list(DEFAULT_DIGEST_SECTIONS)
+    return cfg
+
+
+def get_effective_from_email(conn):
+    """Part 4: EMAIL_FROM (env var) > email_config.from_email (in-app
+    setting) > DEFAULT_DIGEST_FROM_EMAIL, in that order -- the same
+    precedence style as everything else in this file that has both an
+    env var and a DB-backed setting (env var wins, since it represents
+    whoever controls the deployment overriding the in-app default).
+    Never the SMTP username (Part 2's actual bug): SES's SMTP username is
+    an IAM-derived auth credential, not a mailbox -- it's what you LOG IN
+    as, completely independent of which verified identity you SEND FROM,
+    and using it as a From: address either isn't a valid verified sender
+    (rejected) or isn't even a syntactically valid email address at all."""
+    return os.environ.get("EMAIL_FROM") or get_email_config(conn)["from_email"] or DEFAULT_DIGEST_FROM_EMAIL
+
+
+def save_email_config(conn, **fields):
+    """Updates only the passed keyword fields on the singleton row;
+    anything not passed keeps its current value. `sections_included` may
+    be passed as a plain list (JSON-encoded here); enabled/wait_for_*
+    accept any truthy/falsy value (coerced to 0/1)."""
+    get_email_config(conn)  # ensures the row exists before UPDATE
+    sets, params = [], []
+    for k, v in fields.items():
+        if k not in _EMAIL_CONFIG_COLS:
+            continue
+        if k == "sections_included" and isinstance(v, list):
+            v = json.dumps(v)
+        if k in ("enabled", "wait_for_runners", "wait_for_predictions"):
+            v = int(bool(v))
+        sets.append(f"{k}=?")
+        params.append(v)
+    if not sets:
+        return
+    sets.append("updated_at=?")
+    params.append(datetime.utcnow().isoformat())
+    conn.execute(f"UPDATE email_config SET {', '.join(sets)} WHERE id=1", params)
+    conn.commit()
+
+
+# --------------------------------------------------------------------------
+# Subscriber list (Part 4 of the newsletter restructure) -- replaces
+# email_config.recipient_email's single hardcoded address now that SES
+# production access is live and real, multi-recipient bulk sending is
+# possible. email_config still owns schedule/content-selection; this
+# table owns WHO receives it and their unsubscribe state.
+# --------------------------------------------------------------------------
+
+def _migrate_recipient_to_subscribers(conn):
+    """One-time migration: if email_config still has a recipient_email
+    and that address has no email_subscribers row yet, create one. No-op
+    on every call after the first real migration (or if there was never
+    a recipient_email to migrate) -- safe to call unconditionally from
+    init_db, same idempotent-seed discipline as _seed_news_sources/
+    _seed_firm_tiers."""
+    row = conn.execute("SELECT recipient_email FROM email_config WHERE id=1").fetchone()
+    if not row or not row[0]:
+        return
+    add_email_subscriber(conn, row[0])
+
+
+def add_email_subscriber(conn, email):
+    """Idempotent: an already-subscribed (or already-unsubscribed --
+    re-adding doesn't silently re-subscribe someone who opted out) address
+    just returns its existing token unchanged. Returns the subscriber's
+    unsubscribe_token, or None if `email` fails is_valid_email_format's
+    basic sanity check (Part 1: 'validate basic format') -- the caller
+    (SETTINGS' Add Subscriber button) is what surfaces that as a real
+    error message; this function just refuses to insert garbage."""
+    email = (email or "").strip().lower()
+    if not is_valid_email_format(email):
+        return None
+    existing = conn.execute("SELECT unsubscribe_token FROM email_subscribers WHERE email=?", (email,)).fetchone()
+    if existing:
+        return existing[0]
+    token = uuid.uuid4().hex
+    conn.execute(
+        "INSERT INTO email_subscribers (email, unsubscribe_token, subscribed_at, unsubscribed) VALUES (?,?,?,0)",
+        (email, token, datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+    return token
+
+
+def get_active_subscribers(conn):
+    """Every subscriber who hasn't unsubscribed -- what send_daily_
+    digest_email actually iterates over for a real (non-test) send."""
+    rows = conn.execute(
+        "SELECT email, unsubscribe_token FROM email_subscribers WHERE unsubscribed=0 ORDER BY subscribed_at"
+    ).fetchall()
+    return [{"email": r[0], "unsubscribe_token": r[1]} for r in rows]
+
+
+_EMAIL_FORMAT_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def is_valid_email_format(email):
+    """Basic sanity check (something@something.something, no whitespace)
+    -- deliberately NOT a full RFC 5322 validator (those are notoriously
+    over-engineered and still can't confirm a mailbox actually exists);
+    this just catches an obvious typo before it takes up a subscriber
+    slot, real deliverability is what SES bounce handling is for."""
+    return bool(_EMAIL_FORMAT_RE.match((email or "").strip()))
+
+
+def get_all_subscribers(conn):
+    """Every subscriber row, active AND unsubscribed alike (Part 1) --
+    the SETTINGS table shows both so who opted out stays visible instead
+    of silently disappearing. Ordered active-first (most actionable),
+    then by subscribed_at within each group."""
+    rows = conn.execute(
+        """SELECT email, unsubscribe_token, subscribed_at, unsubscribed, unsubscribed_at, bounce_count
+           FROM email_subscribers ORDER BY unsubscribed ASC, subscribed_at ASC"""
+    ).fetchall()
+    cols = ["email", "unsubscribe_token", "subscribed_at", "unsubscribed", "unsubscribed_at", "bounce_count"]
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def remove_email_subscriber(conn, email):
+    """Hard delete -- Part 1's own distinction from unsubscribe (which
+    just flips a flag, preserving history/dedup-of-re-adds): this is the
+    admin removing someone outright, e.g. a typo'd address that should
+    never have been added. Returns True if a row was actually deleted."""
+    email = (email or "").strip().lower()
+    cur = conn.execute("DELETE FROM email_subscribers WHERE email=?", (email,))
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def resubscribe_email(conn, email):
+    """Re-activates a previously-unsubscribed address (Part 1: 'in case
+    someone asks to be re-added') -- clears unsubscribed/unsubscribed_at
+    and resets bounce_count (a stale bounce history from before shouldn't
+    count against them going forward), but keeps the ORIGINAL
+    subscribed_at, since that's genuinely when they first joined."""
+    email = (email or "").strip().lower()
+    conn.execute(
+        "UPDATE email_subscribers SET unsubscribed=0, unsubscribed_at=NULL, bounce_count=0 WHERE email=?",
+        (email,),
+    )
+    conn.commit()
+
+
+def unsubscribe_by_token(conn, token):
+    """Marks the matching subscriber unsubscribed. Returns the email that
+    was unsubscribed, or None if the token doesn't match any subscriber
+    (an invalid/tampered/already-used-differently link) -- the caller
+    (dashboard.py's query-param handler) uses this to show an honest
+    confirmation vs. an honest "that link isn't valid" message, never a
+    generic success for a token that matched nothing."""
+    row = conn.execute("SELECT email FROM email_subscribers WHERE unsubscribe_token=?", (token,)).fetchone()
+    if not row:
+        return None
+    conn.execute(
+        "UPDATE email_subscribers SET unsubscribed=1, unsubscribed_at=? WHERE unsubscribe_token=?",
+        (datetime.utcnow().isoformat(), token),
+    )
+    conn.commit()
+    return row[0]
+
+
+# Consecutive hard-bounce threshold before auto-unsubscribing an address
+# (Part 4.4) -- protects SES sender reputation from repeatedly retrying a
+# dead/invalid mailbox; 1 genuine SMTP-level hard failure (vs. e.g. a
+# transient timeout) is already a strong signal, but a single flaky
+# failure shouldn't nuke a real subscriber, hence a small threshold
+# rather than unsubscribing on the very first failure.
+EMAIL_BOUNCE_AUTO_UNSUBSCRIBE_THRESHOLD = 3
+
+
+def record_send_bounce(conn, email, error):
+    """Increments this subscriber's bounce_count and auto-unsubscribes
+    them once EMAIL_BOUNCE_AUTO_UNSUBSCRIBE_THRESHOLD is reached, logging
+    clearly either way. Called from send_daily_digest_email's per-
+    recipient send loop on a hard SMTP failure for that specific address
+    (distinct from a whole-batch connection failure, which isn't any one
+    subscriber's fault and never bounces anyone)."""
+    email = (email or "").strip().lower()
+    row = conn.execute("SELECT bounce_count FROM email_subscribers WHERE email=?", (email,)).fetchone()
+    if not row:
+        return
+    new_count = (row[0] or 0) + 1
+    now = datetime.utcnow().isoformat()
+    conn.execute(
+        "UPDATE email_subscribers SET bounce_count=?, last_bounce_at=? WHERE email=?", (new_count, now, email)
+    )
+    if new_count >= EMAIL_BOUNCE_AUTO_UNSUBSCRIBE_THRESHOLD:
+        conn.execute(
+            "UPDATE email_subscribers SET unsubscribed=1, unsubscribed_at=? WHERE email=?", (now, email)
+        )
+        print(f"[record_send_bounce] {email} auto-unsubscribed after {new_count} hard bounces: {error}")
+    else:
+        print(f"[record_send_bounce] {email} bounce {new_count}/{EMAIL_BOUNCE_AUTO_UNSUBSCRIBE_THRESHOLD}: {error}")
+    conn.commit()
+
+
+def log_runners_scan(conn, runner_rows):
+    """The RUNNERS tab's own unusual-activity scan block (dashboard.py) is
+    this function's ONLY call site -- a purely additive logging side-
+    effect alongside that tab's existing computation, changing nothing
+    about what it displays. `runner_rows`: list of plain dicts (ticker,
+    price, chg_pct, vol_ratio, ...) -- whatever that scan already
+    computed. Upserts once per calendar day so a later same-day rerun
+    (e.g. price moved further) keeps the freshest read, not the first."""
+    today = date.today().isoformat()
+    conn.execute(
+        """INSERT INTO runners_scan_log (scan_date, runner_rows_json, scanned_at) VALUES (?,?,?)
+           ON CONFLICT(scan_date) DO UPDATE SET
+               runner_rows_json=excluded.runner_rows_json, scanned_at=excluded.scanned_at""",
+        (today, json.dumps(runner_rows, default=str), datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+
+
+def get_todays_runner_rows(conn, as_of_date=None):
+    """None if today's Runners scan hasn't logged anything yet (the
+    genuine 'not ready' state is_daily_digest_ready checks for) -- an
+    empty list is a real, different state ('scan ran, found zero
+    runners today')."""
+    scan_date = (as_of_date or date.today()).isoformat() if not isinstance(as_of_date, str) else as_of_date
+    row = conn.execute("SELECT runner_rows_json FROM runners_scan_log WHERE scan_date=?", (scan_date,)).fetchone()
+    if not row:
+        return None
+    try:
+        return json.loads(row[0])
+    except (TypeError, ValueError):
+        return []
+
+
+def get_todays_runner_tickers(conn, as_of_date=None):
+    rows = get_todays_runner_rows(conn, as_of_date=as_of_date)
+    return None if rows is None else [r["ticker"] for r in rows]
+
+
+# --------------------------------------------------------------------------
+# US market holidays (Part 4) -- computed from the standard federal-
+# holiday weekday rules (Nth-weekday-of-month) rather than a hardcoded
+# per-year date list, so this never goes stale across years. Good Friday
+# (a real NYSE closure, NOT a federal holiday, so it can't be derived
+# from those rules) uses the standard Easter computation instead.
+# --------------------------------------------------------------------------
+
+def _nth_weekday_of_month(year, month, weekday, n):
+    """weekday: 0=Monday..6=Sunday. n>0: the nth occurrence (1=first).
+    n=-1: the LAST occurrence in the month (e.g. Memorial Day)."""
+    if n > 0:
+        d = date(year, month, 1)
+        d += timedelta(days=(weekday - d.weekday()) % 7 + 7 * (n - 1))
+        return d
+    d = (date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)) - timedelta(days=1)
+    d -= timedelta(days=(d.weekday() - weekday) % 7)
+    return d
+
+
+def _easter_sunday(year):
+    """Anonymous Gregorian algorithm (standard, widely-used closed-form
+    Easter computation) -- Good Friday is 2 days before this."""
+    a, b, c = year % 19, year // 100, year % 100
+    d, e = b // 4, b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = c // 4, c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month = (h + l - 7 * m + 114) // 31
+    day = ((h + l - 7 * m + 114) % 31) + 1
+    return date(year, month, day)
+
+
+def _observed(d):
+    """NYSE shifts a holiday landing on Saturday to the preceding Friday,
+    and one landing on Sunday to the following Monday."""
+    if d.weekday() == 5:
+        return d - timedelta(days=1)
+    if d.weekday() == 6:
+        return d + timedelta(days=1)
+    return d
+
+
+_US_MARKET_HOLIDAY_NAMES = {
+    "new_years": "New Year's Day", "mlk": "Martin Luther King Jr. Day", "presidents": "Presidents Day",
+    "good_friday": "Good Friday", "memorial": "Memorial Day", "juneteenth": "Juneteenth",
+    "independence": "Independence Day", "labor": "Labor Day", "thanksgiving": "Thanksgiving",
+    "christmas": "Christmas Day",
+}
+
+
+def _us_market_holidays_for_year(year):
+    """{date: holiday_key} for every NYSE closure this file recognizes."""
+    easter = _easter_sunday(year)
+    return {
+        _observed(date(year, 1, 1)): "new_years",
+        _nth_weekday_of_month(year, 1, 0, 3): "mlk",
+        _nth_weekday_of_month(year, 2, 0, 3): "presidents",
+        easter - timedelta(days=2): "good_friday",
+        _nth_weekday_of_month(year, 5, 0, -1): "memorial",
+        _observed(date(year, 6, 19)): "juneteenth",
+        _observed(date(year, 7, 4)): "independence",
+        _nth_weekday_of_month(year, 9, 0, 1): "labor",
+        _nth_weekday_of_month(year, 11, 3, 4): "thanksgiving",
+        _observed(date(year, 12, 25)): "christmas",
+    }
+
+
+def is_market_holiday(d):
+    """True if NYSE is closed for a major holiday on `d` (a date, datetime,
+    or ISO date string) -- does NOT check for a plain Saturday/Sunday,
+    that's a separate, simpler weekday check wherever it's needed."""
+    if isinstance(d, str):
+        d = pd.Timestamp(d).date()
+    elif isinstance(d, datetime):
+        d = d.date()
+    return d in _us_market_holidays_for_year(d.year)
+
+
+def get_market_holiday_name(d):
+    """Human-readable holiday name for `d`, or None if it isn't one."""
+    if isinstance(d, str):
+        d = pd.Timestamp(d).date()
+    elif isinstance(d, datetime):
+        d = d.date()
+    key = _us_market_holidays_for_year(d.year).get(d)
+    return _US_MARKET_HOLIDAY_NAMES.get(key)
+
+
+def is_daily_digest_ready(conn):
+    """Part 4. Returns (ready: bool, reasons: list[str]) -- reasons is
+    empty iff ready. Only checks the gates the user has actually enabled
+    in email_config (wait_for_runners/wait_for_predictions); with both
+    disabled this is trivially always ready. 'Today's Runners scan' means
+    a genuinely persisted runners_scan_log row for today (see
+    log_runners_scan) -- not merely 'the RUNNERS tab happens to be open
+    right now,' which would make this unusable as a background gate."""
+    config = get_email_config(conn)
+    reasons = []
+    today = date.today().isoformat()
+    runner_tickers = get_todays_runner_tickers(conn) if (config["wait_for_runners"] or config["wait_for_predictions"]) else None
+
+    if config["wait_for_runners"] and runner_tickers is None:
+        reasons.append("Today's Runners scan has not run yet.")
+
+    if config["wait_for_predictions"]:
+        if runner_tickers is None:
+            reasons.append("Cannot check Day Predictions yet -- today's Runners scan has not run.")
+        elif runner_tickers:
+            missing = [
+                t for t in runner_tickers
+                if not conn.execute(
+                    "SELECT 1 FROM day_predictions WHERE ticker=? AND session_date=? "
+                    "AND COALESCE(source,'live')='live'",
+                    (t, today),
+                ).fetchone()
+            ]
+            if missing:
+                reasons.append(f"Day Predictions not yet generated for: {', '.join(missing)}.")
+    return (len(reasons) == 0, reasons)
+
+
+def _fmt_pct(v, digits=1):
+    return f"{v:+.{digits}f}%" if v is not None else "—"
+
+
+# --------------------------------------------------------------------------
+# Newsletter rebuild -- Featured Stock selection + deep-dive, and a
+# technical bullish/bearish one-liner per Runner. Both are pure
+# digest-assembly logic built ON TOP of existing functions
+# (generate_deep_analysis, cached_news, compute_divergence's stored
+# output, _add_technicals) -- none of their core logic is touched here.
+# --------------------------------------------------------------------------
+
+_DAY_PREDICTION_MODE_LABEL = {"raw_pattern": "Mode 1", "bayesian": "Mode 2", "trained_model": "Mode 3"}
+_DAY_PREDICTION_MODE_SCORE = {"raw_pattern": 1, "bayesian": 2, "trained_model": 3}
+
+
+def get_recently_featured_tickers(conn, days_back=6):
+    """Tickers that were the Featured Stock in any digest actually sent in
+    the last `days_back` days -- read from digest_email_log.featured_ticker
+    (populated by send_daily_digest_email as of the repeat-avoidance fix
+    below). Rows from before that column existed have featured_ticker=NULL
+    and are correctly ignored -- there's no way to know what they featured,
+    and treating NULL as "not recently featured" is the safe default (it
+    can only under-exclude, never wrongly block a ticker forever)."""
+    cutoff = (pd.Timestamp.now(tz="UTC") - timedelta(days=days_back)).isoformat()
+    rows = conn.execute(
+        "SELECT DISTINCT featured_ticker FROM digest_email_log "
+        "WHERE featured_ticker IS NOT NULL AND sent_at >= ?",
+        (cutoff,),
+    ).fetchall()
+    return {r[0] for r in rows}
+
+
+def select_featured_stock(conn):
+    """Part 1. Ranks today's Runners (falling back to the full watchlist
+    if Runners hasn't found -- or hasn't yet scanned for -- anything
+    today) by a simple combined score: largest same-day |% move| +
+    highest Day Prediction confidence mode (Mode 3 > Mode 2 > Mode 1,
+    weighted x3 so a real model-graded signal outweighs a few points of
+    raw price movement) + most news headlines in the last 24h
+    (cached_news) + highest v2 divergence score (compute_divergence's
+    stored output, /10 to keep it on a roughly comparable scale to the
+    other terms) + real StockTwits chatter volume (cached_retail_sentiment,
+    x0.5 -- a genuine popularity signal, not a guessed one: more cached
+    posts means more people are actually talking about that ticker right
+    now). Returns the single highest-scoring ticker, or None if the
+    watchlist is empty.
+
+    Repeat-avoidance: without this, the same highest-conviction ticker
+    (confirmed live: MU, day after day) can dominate this score every
+    single time it's a Runner, since its Mode-3/divergence/move numbers
+    stay structurally strong even when nothing NEW is happening with it --
+    a stale pick, not a wrong one. Tickers featured in ANY digest sent in
+    the last 6 days (get_recently_featured_tickers) are excluded from
+    `candidates` before scoring, so a repeat within the same week can only
+    happen if EVERY candidate was recently featured (a tiny watchlist edge
+    case) -- in which case the exclusion is dropped entirely for this run
+    rather than returning None, since a stale pick beats no pick."""
+    watchlist = load_watchlist()
+    if not watchlist:
+        return None
+
+    runner_rows = get_todays_runner_rows(conn) or []
+    candidates = [r["ticker"] for r in runner_rows] if runner_rows else watchlist
+
+    recently_featured = get_recently_featured_tickers(conn, days_back=6)
+    fresh_candidates = [t for t in candidates if t not in recently_featured]
+    if fresh_candidates:
+        candidates = fresh_candidates
+
+    today = date.today().isoformat()
+
+    scored = []
+    for ticker in candidates:
+        chg_pct = next((r["chg_pct"] for r in runner_rows if r["ticker"] == ticker), None)
+        if chg_pct is None:
+            hist = _read_price_history(conn, ticker, days_back=5)
+            if len(hist) >= 2:
+                chg_pct = float((hist["Close"].iloc[-1] / hist["Close"].iloc[-2] - 1) * 100)
+        move_score = abs(chg_pct) if chg_pct is not None else 0.0
+
+        mode_row = conn.execute(
+            "SELECT mode FROM day_predictions WHERE ticker=? AND session_date=? AND COALESCE(source,'live')='live'",
+            (ticker, today),
+        ).fetchone()
+        mode_score = _DAY_PREDICTION_MODE_SCORE.get(mode_row[0], 0) if mode_row else 0
+
+        news_df = cached_news(conn, ticker, limit=20, max_age_hours=2).get("data")
+        news_count = 0
+        if news_df is not None and not news_df.empty and "published_at" in news_df.columns:
+            cutoff = pd.Timestamp.now(tz="UTC") - timedelta(hours=24)
+            news_count = int((news_df["published_at"] >= cutoff).sum())
+
+        div_row = conn.execute(
+            "SELECT score FROM divergence_scores WHERE ticker=? AND score_formula_version='v2' "
+            "ORDER BY computed_date DESC LIMIT 1",
+            (ticker,),
+        ).fetchone()
+        divergence_score = div_row[0] if div_row else 0.0
+
+        try:
+            popularity_count = len(cached_retail_sentiment(conn, ticker, max_age_hours=2).get("data") or [])
+        except Exception:
+            popularity_count = 0
+
+        total = (move_score + mode_score * 3 + news_count * 1.5 + divergence_score / 10.0
+                 + popularity_count * 0.5)
+        scored.append((ticker, total))
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return scored[0][0]
+
+
+def _get_institutional_signal_table(ticker, conn):
+    """Part 2 of the newsletter restructure. Reads the SAME cached tables
+    the AI Briefing bundle already reads (insider_trades, buybacks,
+    analyst_targets, dark_pool_signals, congressional_trades -- no new
+    fetch, no rewritten read logic) but returns short, structured
+    {"label", "detail"} rows instead of feeding them into one LLM-written
+    paragraph. Each of the first four rows is OMITTED entirely if its
+    underlying data is genuinely unavailable (never a printed "None");
+    Congressional is the one exception -- its own real absence ("No
+    trades on record") is itself meaningful/expected information (see
+    compute_divergence's own docstring on how structurally sparse this
+    feed is), so it always renders."""
+    rows = []
+
+    insider_rows = conn.execute(
+        """SELECT transaction_date, insider_name, title, transaction_type, value FROM insider_trades
+           WHERE ticker=? AND transaction_date >= date('now','-90 day') ORDER BY transaction_date DESC""",
+        (ticker,),
+    ).fetchall()
+    if insider_rows:
+        buys = sum(1 for r in insider_rows if (r[3] or "").upper() == "BUY")
+        sells = sum(1 for r in insider_rows if (r[3] or "").upper() == "SELL")
+        largest = max(insider_rows, key=lambda r: abs(r[4] or 0))
+        largest_date = pd.Timestamp(largest[0]).strftime("%b %-d")
+        largest_who = largest[2] or largest[1] or "insider"
+        detail = f"{sells} sell(s), {buys} buy(s) (last 90d)"
+        if largest[4]:
+            detail += f" — largest: {largest_who}, ${abs(largest[4]) / 1e6:.1f}M, {largest_date}"
+        rows.append({"label": "Insider activity", "detail": detail})
+
+    buybacks_df = _read_buybacks_cache(conn, ticker, limit=2)
+    if not buybacks_df.empty:
+        latest = buybacks_df.iloc[-1]
+        latest_year = str(latest["period"])[:4]
+        latest_val = abs(latest["buyback_value"] or 0)
+        detail = f"${latest_val / 1e6:.0f}M FY{latest_year}"
+        if len(buybacks_df) > 1:
+            prior = buybacks_df.iloc[-2]
+            prior_year, prior_val = str(prior["period"])[:4], abs(prior["buyback_value"] or 0)
+            direction = "up from" if latest_val > prior_val else "down from" if latest_val < prior_val else "flat vs."
+            detail += f", {direction} ${prior_val / 1e6:.0f}M FY{prior_year}"
+        fundamentals = _read_fundamentals_info_cache(conn, ticker) or {}
+        market_cap = fundamentals.get("marketCap")
+        if market_cap:
+            detail += f" — ~{latest_val / market_cap * 100:.2f}% of market cap"
+        rows.append({"label": "Buybacks", "detail": detail})
+
+    target_row = conn.execute(
+        """SELECT current_price, target_mean, recommendation_key, recommendation_mean, num_analysts
+           FROM analyst_targets WHERE ticker=? ORDER BY fetched_at DESC LIMIT 1""",
+        (ticker,),
+    ).fetchone()
+    if target_row and target_row[4]:
+        current_price, target_mean, rec_key, rec_mean, num_analysts = target_row
+        rec_label = (rec_key or "—").replace("_", " ").title()
+        detail = f"{num_analysts} analysts, {rec_label}"
+        if rec_mean is not None:
+            detail += f" (mean {rec_mean:.2f})"
+        if target_mean is not None and current_price is not None:
+            detail += f" — target ${target_mean:.0f} vs ${current_price:.0f} spot"
+        rows.append({"label": "Analyst consensus", "detail": detail})
+
+    dp_row = conn.execute(
+        "SELECT dark_pool_pct, signal FROM dark_pool_signals WHERE ticker=? ORDER BY date DESC LIMIT 1",
+        (ticker,),
+    ).fetchone()
+    if dp_row and dp_row[0] is not None:
+        rows.append({"label": "Dark pool", "detail": f"{dp_row[0]:.1f}% of volume, {dp_row[1] or '—'} signal"})
+
+    congress = _read_congressional_cache_by_ticker(conn, ticker, limit=5)
+    if congress:
+        latest = congress[0]
+        rows.append({
+            "label": "Congressional",
+            "detail": f"{latest['senator']} {latest['trade_type']} ({latest['amount']}), {latest['trade_date']}",
+        })
+    else:
+        rows.append({"label": "Congressional", "detail": "No trades on record"})
+
+    return rows
+
+
+def get_featured_stock_section(ticker, conn):
+    """Part 1. Pulls (or, if the cached one is >4h old, freshly generates
+    via generate_deep_analysis -- unmodified, including its own
+    [CLAUDE API] cost logging) this ticker's AI Briefing, plus its 5 most
+    recent real news headlines (cached_news -- unmodified) and a
+    structured institutional-signal table (Part 2 -- see
+    _get_institutional_signal_table). A REAL, billed Claude API call can
+    happen here since this runs as part of SCHEDULED digest assembly
+    (send_daily_digest_email/run_daily_digest_send), not an on-demand
+    user click -- unlike the Ticker Deep-Dive tab's briefing button,
+    there is no separate cost-confirmation popup for this path; the
+    existing [CLAUDE API] log line is what surfaces the cost, printed
+    clearly before the call.
+
+    `brief` is None (not a fabricated placeholder) if the AI Briefing
+    genuinely can't be produced (e.g. ANTHROPIC_API_KEY unset) -- the
+    digest then renders the Featured Stock section without the AI
+    narrative rather than inventing one."""
+    brief = get_cached_ai_brief(conn, ticker, max_age_hours=AI_BRIEF_CACHE_HOURS)
+    if brief is None:
+        try:
+            print(f"[CLAUDE API] Daily Digest auto-generating AI Briefing for {ticker} (Featured Stock section)")
+            brief = generate_deep_analysis(ticker, conn)
+        except Exception as e:
+            print(f"[get_featured_stock_section] AI Briefing generation failed for {ticker}: {e}")
+            brief = None
+
+    news_result = cached_news(conn, ticker, limit=5)
+    news_df = news_result.get("data")
+    news_items = []
+    if news_df is not None and not news_df.empty:
+        for _, r in news_df.head(5).iterrows():
+            news_items.append({
+                "title": r["title"], "publisher": r["publisher"],
+                "published_at": r["published_at"].isoformat() if pd.notna(r.get("published_at")) else None,
+            })
+
+    return {
+        "ticker": ticker, "brief": brief, "news": news_items,
+        "current_price": get_latest_cached_price(conn, ticker),
+        "institutional_table": _get_institutional_signal_table(ticker, conn),
+    }
+
+
+def _runner_technical_read(conn, ticker):
+    """Part 5. One plain-language RSI + MACD-histogram line per Runner.
+    The ONLY decision thresholds here (RSI<=30 / RSI>=70) are the exact
+    ones already established elsewhere in this file for directional-lean
+    nudging (see e.g. the rsi_nudge lines in _day_prediction_directional_
+    lean and its Swing Forecast/Earnings Simulator equivalents) -- not
+    new thresholds invented for the digest. The near-boundary "approaching
+    overbought/oversold" phrasing is presentational only; it never
+    changes which side of 30/70 the actual bias classification below
+    keys off of. MACD histogram sign+slope (positive/negative,
+    rising/falling vs. the prior session) is standard technical reading."""
+    hist = _read_price_history(conn, ticker, days_back=60)
+    if len(hist) < 3:
+        return None
+    hist = _add_technicals(hist)
+    rsi, macd_now, macd_prev = hist["RSI14"].iloc[-1], hist["MACD_hist"].iloc[-1], hist["MACD_hist"].iloc[-2]
+    if pd.isna(rsi) or pd.isna(macd_now) or pd.isna(macd_prev):
+        return None
+
+    if rsi >= 70:
+        rsi_txt = f"RSI {rsi:.0f} (overbought)"
+    elif rsi >= 60:
+        rsi_txt = f"RSI {rsi:.0f} (approaching overbought)"
+    elif rsi <= 30:
+        rsi_txt = f"RSI {rsi:.0f} (oversold)"
+    elif rsi <= 40:
+        rsi_txt = f"RSI {rsi:.0f} (approaching oversold)"
+    else:
+        rsi_txt = f"RSI {rsi:.0f} (neutral)"
+
+    macd_sign, macd_slope = ("positive" if macd_now > 0 else "negative"), ("rising" if macd_now > macd_prev else "falling")
+    macd_txt = f"MACD histogram {macd_sign} and {macd_slope}"
+
+    if rsi >= 70:
+        bias = "short-term bearish-reversal-risk bias" if macd_slope == "falling" else "short-term bullish bias, but stretched (overbought)"
+    elif rsi <= 30:
+        bias = "short-term bullish-reversal-risk bias" if macd_slope == "rising" else "short-term bearish bias, but stretched (oversold)"
+    elif macd_sign == "positive" and macd_slope == "rising":
+        bias = "short-term bullish bias"
+    elif macd_sign == "negative" and macd_slope == "falling":
+        bias = "short-term bearish bias"
+    else:
+        bias = "short-term mixed/neutral bias"
+
+    return f"{rsi_txt}, {macd_txt} → {bias}"
+
+
+# --------------------------------------------------------------------------
+# Substack-style HTML newsletter template (Part 7) -- a real serif
+# reading font, generous line-height, a 600px max-width (the standard
+# email-client width), a header banner, and a footer link. Plain
+# constants/small helpers, not a templating engine -- this file has no
+# other HTML-templating dependency to reuse.
+# --------------------------------------------------------------------------
+
+_DIGEST_HTML_OPEN = (
+    "<html><head><style>@media (max-width:480px){.digest-week-col{display:block!important;"
+    "width:100%!important;padding:0!important;border:none!important;}}</style></head>"
+    "<body style=\"font-family:Georgia,'Times New Roman',serif;font-size:15px;line-height:1.65;"
+    "color:#1a1a1a;max-width:600px;margin:0 auto;padding:0 16px 24px;background:#ffffff;\">"
+)
+_DIGEST_HTML_CLOSE = "</body></html>"
+
+# Part 5: footer order is unsubscribe link, then the Substack link. The
+# unsubscribe href is a placeholder here -- build_digest_content runs
+# ONCE per send (not once per subscriber, since the AI Briefing/chart
+# work is shared), so the real per-subscriber URL (a different token for
+# every recipient) is substituted in by send_daily_digest_email's own
+# per-recipient loop, never baked in at content-build time.
+DIGEST_UNSUBSCRIBE_PLACEHOLDER = "{{UNSUBSCRIBE_URL}}"
+_DIGEST_HTML_FOOTER = (
+    "<hr style='border:none;border-top:1px solid #e5e5e5;margin:28px 0 12px;'>"
+    "<p style='font-family:-apple-system,Segoe UI,Arial,sans-serif;color:#888;font-size:12px;text-align:center;'>"
+    f"<a href='{DIGEST_UNSUBSCRIBE_PLACEHOLDER}' style='color:#888;'>Unsubscribe</a>"
+    " &nbsp;·&nbsp; Read more analysis at <a href='https://monotrading.substack.com' style='color:#d4590c;'>"
+    "monotrading.substack.com</a></p>"
+)
+
+
+def _digest_html_banner(as_of_date):
+    date_str = as_of_date.strftime("%A, %B %-d, %Y")
+    return (
+        "<div style=\"font-family:-apple-system,Segoe UI,Arial,sans-serif;text-align:center;"
+        "padding:20px 0 16px;border-bottom:3px solid #1a1a1a;margin-bottom:8px;\">"
+        "<div style='font-size:12px;letter-spacing:0.12em;color:#888;text-transform:uppercase;'>"
+        "Smart Money Intelligence</div>"
+        f"<div style='font-size:24px;font-weight:700;margin-top:4px;'>Daily Digest</div>"
+        f"<div style='font-size:13px;color:#666;margin-top:4px;'>{html.escape(date_str)}</div></div>"
+    )
+
+
+def _digest_html_callout(text, bg_color):
+    return f"<p style='background:{bg_color};padding:10px 14px;border-radius:6px;margin:12px 0;'>{text}</p>"
+
+
+def build_digest_content(conn, sections_included, since_iso, as_of_date=None, incomplete_reasons=None,
+                          featured_stock=None, chart_cid=None):
+    """The SINGLE content-generation path for both the real send and the
+    "Preview Today's Digest" button -- guaranteeing they can never
+    disagree, since neither ever builds its own copy of this logic.
+    `since_iso` is always an explicit caller-supplied timestamp (never an
+    implicit or hardcoded window) -- the caller resolves it from email_
+    config.last_digest_sent_at (24h-ago bootstrap ONLY when that field is
+    genuinely still NULL). `as_of_date` lets a test/preview simulate a
+    specific calendar date (e.g. a known holiday). `incomplete_reasons`:
+    when run_daily_digest_send (dashboard.py) sends anyway past its readiness cutoff,
+    the unmet gates are embedded directly into the email body, not just
+    returned as metadata.
+
+    `featured_stock` / `chart_cid`: this function has NO plotting
+    dependency (data_engine.py never imports plotly/kaleido) -- the
+    caller (dashboard.py, the only place with access to the Streamlit
+    chart-building function) computes the Featured Stock's AI-briefing
+    content via get_featured_stock_section() and, separately, renders its
+    price chart to PNG bytes, then passes the resulting dict + a `cid:`
+    reference string in here. This function only ever emits an
+    `<img src="cid:{chart_cid}">` tag -- attaching the actual image bytes
+    under that Content-ID is send_daily_digest_email's job (via its
+    `inline_images` param), so build_digest_content itself stays
+    chart-library-agnostic.
+
+    Returns {"subject", "text_body", "html_body", "sections" (raw data
+    per included section, for programmatic use), "market_holiday": bool,
+    "holiday_name": str|None}."""
+    as_of_date = as_of_date or date.today()
+    holiday_name = get_market_holiday_name(as_of_date)
+    market_holiday = holiday_name is not None
+    watchlist = load_watchlist()
+    today_iso = as_of_date.isoformat()
+
+    sections = {}
+
+    # Computed unconditionally (not gated by sections_included) since
+    # send_daily_digest_email always needs the current per-ticker signal
+    # snapshot to persist for the NEXT digest's "what changed" diff,
+    # regardless of whether the Watchlist Signals section itself is
+    # toggled on for THIS render.
+    last_row = conn.execute(
+        "SELECT signals_snapshot_json FROM digest_email_log ORDER BY sent_at DESC LIMIT 1"
+    ).fetchone()
+    prev_signals = json.loads(last_row[0]) if last_row and last_row[0] else {}
+    triggered_zone_tickers = {z["ticker"] for z in get_watchlist_signals_since(conn, since_iso)["triggered_zones"]}
+    current_signals = {t: synthesize_rating_signal(t, conn)["signal"] for t in watchlist}
+    sections["_current_signals_snapshot"] = current_signals
+
+    if "featured_stock" in sections_included and featured_stock:
+        sections["featured_stock"] = featured_stock
+
+    # Market-session-dependent sections (Part 4: "skip Runners/Day
+    # Prediction/Swing Forecast sections" on a holiday -- nothing
+    # meaningful to report when the market never opened).
+    if not market_holiday:
+        if "todays_runners" in sections_included:
+            runners = get_todays_runner_rows(conn, as_of_date=as_of_date) or []
+            for r in runners:
+                r["technical_read"] = _runner_technical_read(conn, r["ticker"])
+            sections["todays_runners"] = runners
+
+        if "day_prediction_targets" in sections_included:
+            runner_tickers = get_todays_runner_tickers(conn, as_of_date=as_of_date) or []
+            targets = []
+            for t in runner_tickers:
+                row = conn.execute(
+                    """SELECT target_price, predicted_direction, mode, confidence_level, model_start_price,
+                              session_date
+                       FROM day_predictions WHERE ticker=? AND session_date=? AND COALESCE(source,'live')='live'""",
+                    (t, today_iso),
+                ).fetchone()
+                if not row:
+                    continue
+                target_price, direction, mode, confidence_level, current_price, session_date = row
+                move_pct = (target_price / current_price - 1) * 100 if current_price else None
+                track = get_day_prediction_track_record(conn, ticker=t)
+                targets.append({
+                    "ticker": t, "target_price": target_price, "predicted_direction": direction, "mode": mode,
+                    "confidence_level": confidence_level, "current_price": current_price, "move_pct": move_pct,
+                    "session_date": session_date, "backtest_n": track.get("n") or 0,
+                })
+            sections["day_prediction_targets"] = targets
+
+        if "swing_forecast_highlights" in sections_included:
+            cutoff = (as_of_date - timedelta(days=5)).isoformat()
+            rows = conn.execute(
+                """SELECT ticker, horizon_days, target_price, predicted_direction, model_start_price, session_date
+                   FROM swing_forecasts
+                   WHERE COALESCE(source,'live')='live' AND confidence_level='High' AND session_date >= ?
+                   ORDER BY session_date DESC""",
+                (cutoff,),
+            ).fetchall()
+            # Latest row per (ticker, horizon_days) only -- multiple stale
+            # High-confidence calls for the same setup shouldn't repeat.
+            seen_keys, highlights = set(), []
+            for ticker, horizon_days, target_price, direction, start_price, session_date in rows:
+                key = (ticker, horizon_days)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                highlights.append({"ticker": ticker, "horizon_days": horizon_days, "target_price": target_price,
+                                    "predicted_direction": direction, "model_start_price": start_price,
+                                    "session_date": session_date})
+            sections["swing_forecast_highlights"] = highlights
+    elif any(k in sections_included for k in ("todays_runners", "day_prediction_targets", "swing_forecast_highlights")):
+        sections["_market_closed_sections_skipped"] = True
+
+    if "watchlist_signals" in sections_included:
+        zones_by_ticker = {z["ticker"]: z for z in get_entry_zones(conn)}
+        table_rows = []
+        for ticker in watchlist:
+            price = get_latest_cached_price(conn, ticker)
+            zone = zones_by_ticker.get(ticker)
+            status, distance_pct, zone_txt = None, None, "—"
+            if zone and zone.get("entry_low") is not None:
+                zone_txt = f"${zone['entry_low']:.2f}-${zone['entry_high']:.2f}"
+                status = zone.get("last_zone_status")
+                if status == "in_zone":
+                    distance_pct = 0.0
+                elif status == "above" and price is not None and zone["entry_high"]:
+                    distance_pct = (price - zone["entry_high"]) / zone["entry_high"] * 100
+                elif status == "below" and price is not None and zone["entry_low"]:
+                    distance_pct = -((zone["entry_low"] - price) / zone["entry_low"] * 100)
+            div_row = conn.execute(
+                "SELECT score FROM divergence_scores WHERE ticker=? AND score_formula_version='v2' "
+                "ORDER BY computed_date DESC LIMIT 1",
+                (ticker,),
+            ).fetchone()
+            table_rows.append({
+                "ticker": ticker, "price": price, "zone_txt": zone_txt, "status": status,
+                "distance_pct": distance_pct, "signal": current_signals.get(ticker, "QUIET"),
+                "divergence_score": div_row[0] if div_row else None,
+                "zone_changed_today": ticker in triggered_zone_tickers,
+                "signal_changed_today": prev_signals.get(ticker) != current_signals.get(ticker),
+            })
+        # Closest-to-entry first (Part 4: "most actionable at the top") --
+        # a ticker with no derivable zone sorts to the very end.
+        table_rows.sort(key=lambda r: (
+            r["distance_pct"] is None, abs(r["distance_pct"]) if r["distance_pct"] is not None else 0, r["ticker"]
+        ))
+        sections["watchlist_signals"] = table_rows
+
+    if "macro_events_week" in sections_included:
+        # Part 3: two Monday-Sunday weeks side by side, not a rolling
+        # 7-day window from today -- "this week" always starts on the
+        # Monday on/before as_of_date, regardless of which weekday the
+        # digest happens to send on.
+        this_monday = as_of_date - timedelta(days=as_of_date.weekday())
+        next_monday = this_monday + timedelta(days=7)
+        events = get_macro_events_in_range(conn, this_monday, next_monday + timedelta(days=6),
+                                            overlay_impact_filter=None)
+        by_day = {}
+        for e in events:
+            by_day.setdefault(e["scheduled_date"], []).append(e)
+
+        def _week_days(monday):
+            return [
+                {"date": (monday + timedelta(days=i)).isoformat(),
+                 "events": by_day.get((monday + timedelta(days=i)).isoformat(), [])}
+                for i in range(7)
+            ]
+
+        sections["macro_events_week"] = {
+            "this_week": {"start": this_monday.isoformat(),
+                          "end": (this_monday + timedelta(days=6)).isoformat(), "days": _week_days(this_monday)},
+            "next_week": {"start": next_monday.isoformat(),
+                          "end": (next_monday + timedelta(days=6)).isoformat(), "days": _week_days(next_monday)},
+        }
+
+    if "earnings_alerts" in sections_included:
+        alerts = []
+        for t in watchlist:
+            row = conn.execute(
+                "SELECT days_to_earnings, next_earnings_date FROM earnings_signal WHERE ticker=? "
+                "ORDER BY fetched_at DESC LIMIT 1",
+                (t,),
+            ).fetchone()
+            if row and row[0] is not None and 0 <= row[0] <= 5:
+                alerts.append({"ticker": t, "days_to_earnings": row[0], "next_earnings_date": row[1]})
+        sections["earnings_alerts"] = alerts
+
+    # ---- Render: Substack-style newsletter (Part 7) ----
+    featured = sections.get("featured_stock")
+    subject = f"📌 {featured['ticker']} + {len(watchlist)}-ticker watchlist digest" if featured else "Smart Money Daily Digest"
+    if market_holiday:
+        subject = f"Smart Money Digest -- Market closed ({holiday_name})"
+
+    text_lines = ["SMART MONEY INTELLIGENCE — DAILY DIGEST", as_of_date.strftime("%A, %B %-d, %Y"), ""]
+    html_parts = [_digest_html_banner(as_of_date)]
+
+    if market_holiday:
+        text_lines.append(f"🎌 Market closed today ({holiday_name}) -- Runners/Day Prediction/Swing Forecast "
+                           f"sections are skipped; nothing meaningful to report while the market is shut.")
+        text_lines.append("")
+        html_parts.append(_digest_html_callout(f"🎌 Market closed today ({holiday_name}) — Runners/Day "
+                                                 f"Prediction/Swing Forecast sections are skipped.", "#fff3cd"))
+    if incomplete_reasons:
+        gate_txt = " ".join(incomplete_reasons)
+        text_lines.append(f"⚠️ Some sections may reflect incomplete data — {gate_txt}")
+        text_lines.append("")
+        html_parts.append(_digest_html_callout(f"⚠️ Some sections may reflect incomplete data — "
+                                                 f"{html.escape(gate_txt)}", "#fdecea"))
+
+    # ---- Featured Stock (Part 1/2) -- the lead section ----
+    if featured:
+        text_lines.append(f"📌 TODAY'S FEATURED STOCK: {featured['ticker']}")
+        text_lines.append("=" * 50)
+        html_parts.append(
+            f"<h2 style='font-size:22px;margin:28px 0 4px;padding-top:20px;border-top:3px solid #1a1a1a;'>"
+            f"📌 TODAY'S FEATURED STOCK: {html.escape(featured['ticker'])}</h2>"
+        )
+        if chart_cid:
+            html_parts.append(
+                f"<img src='cid:{chart_cid}' alt='{html.escape(featured['ticker'])} price chart' "
+                f"style='width:100%;max-width:560px;border-radius:6px;margin:12px 0;'>"
+            )
+        price = featured.get("current_price")
+        if price is not None:
+            text_lines.append(f"Current price: ${price:.2f}")
+            html_parts.append(f"<p style='color:#666;font-size:13px;'>Current price: <b>${price:.2f}</b></p>")
+        brief = featured.get("brief")
+        if brief:
+            # Part 1: Setup -> Overview, Institutional Analysis rendered
+            # as a table (below) instead of prose, News Summary kept as-
+            # is. Technical & Catalyst Setup / Retail Analysis / Catalysts
+            # to Watch are intentionally NOT rendered here -- removed from
+            # the email only; generate_deep_analysis/the Ticker Deep-Dive
+            # tab still produce and store all of it unchanged.
+            overview = brief.get("setup")
+            if overview:
+                text_lines.append(f"\nOVERVIEW:\n{overview}")
+                html_parts.append(f"<h4 style='margin:14px 0 2px;font-size:14px;'>Overview</h4>"
+                                   f"<p style='margin:0 0 8px;'>{html.escape(overview)}</p>")
+
+            inst_rows = featured.get("institutional_table") or []
+            if inst_rows:
+                text_lines.append("\nINSTITUTIONAL ANALYSIS:")
+                for r in inst_rows:
+                    text_lines.append(f"  {r['label']}: {r['detail']}")
+                html_parts.append(
+                    "<h4 style='margin:14px 0 2px;font-size:14px;'>Institutional Analysis</h4>"
+                    "<table style='width:100%;border-collapse:collapse;font-size:13px;margin-bottom:8px;'>"
+                )
+                for r in inst_rows:
+                    html_parts.append(
+                        "<tr style='border-bottom:1px solid #eee;'>"
+                        f"<td style='padding:4px 8px 4px 0;color:#666;white-space:nowrap;vertical-align:top;'>"
+                        f"{html.escape(r['label'])}</td>"
+                        f"<td style='padding:4px 0;'>{html.escape(r['detail'])}</td></tr>"
+                    )
+                html_parts.append("</table>")
+
+            news_summary = brief.get("news_summary")
+            if news_summary:
+                text_lines.append(f"\nNEWS SUMMARY:\n{news_summary}")
+                html_parts.append(f"<h4 style='margin:14px 0 2px;font-size:14px;'>News Summary</h4>"
+                                   f"<p style='margin:0 0 8px;'>{html.escape(news_summary)}</p>")
+
+            outlook = brief.get("verdicts") or []
+            if outlook:
+                text_lines.append("\nOUTLOOK:")
+                html_parts.append("<h4 style='margin:14px 0 2px;font-size:14px;'>Outlook</h4><ul style='margin:0 0 8px;padding-left:18px;'>")
+                for v in outlook:
+                    text_lines.append(f"  - {v['horizon']} ({v['target_date']}): {v['bias']} ({v['confidence']} confidence) — risk: {v['key_risk']}")
+                    html_parts.append(f"<li style='margin-bottom:4px;'><b>{html.escape(v['horizon'])}</b> "
+                                       f"({html.escape(v['target_date'])}): <b>{html.escape(v['bias'])}</b> "
+                                       f"({html.escape(v['confidence'])} confidence) — {html.escape(v['key_risk'])}</li>")
+                html_parts.append("</ul>")
+        else:
+            text_lines.append("(AI Briefing unavailable for this ticker today.)")
+            html_parts.append("<p style='color:#999;'>(AI Briefing unavailable for this ticker today.)</p>")
+        news = featured.get("news") or []
+        if news:
+            text_lines.append("\nRECENT NEWS:")
+            html_parts.append("<h4 style='margin:14px 0 2px;font-size:14px;'>Recent News</h4><ul style='margin:0 0 8px;padding-left:18px;'>")
+            for n in news:
+                text_lines.append(f"  - {n['title']} ({n['publisher']}, {n.get('published_at') or '—'})")
+                html_parts.append(f"<li style='margin-bottom:4px;'>{html.escape(n['title'])} "
+                                   f"<span style='color:#888;font-size:12px;'>— {html.escape(n['publisher'] or '')}</span></li>")
+            html_parts.append("</ul>")
+        text_lines.append("")
+        html_parts.append("<hr style='border:none;border-top:1px solid #e5e5e5;margin:24px 0;'>")
+
+    def _section_header(title, count=None):
+        suffix = f" ({count})" if count is not None else ""
+        text_lines.append(f"{title.upper()}{suffix}")
+        text_lines.append("-" * 40)
+        html_parts.append(f"<h3 style='font-size:16px;margin:20px 0 8px;color:#1a1a1a;'>{html.escape(title)}"
+                           f"{f'<span style=\"color:#888;font-weight:400;\"> ({count})</span>' if count is not None else ''}</h3>")
+
+    def _add_list_section(key, title, items, line_fn, html_fn):
+        if key not in sections_included or not items:
+            return
+        _section_header(title, len(items))
+        for item in items:
+            text_lines.append(f"  • {line_fn(item)}")
+        text_lines.append("")
+        html_parts.append("<ul style='margin:0 0 8px;padding-left:18px;'>")
+        for item in items:
+            html_parts.append(f"<li style='margin-bottom:6px;'>{html_fn(item)}</li>")
+        html_parts.append("</ul>")
+
+    if not market_holiday:
+        # Part 5: technical read appended to each Runner's line.
+        def _runner_vol_txt(r):
+            vr = r.get("vol_ratio")
+            return f"{vr:.1f}x vol" if vr else "big move"
+
+        _add_list_section(
+            "todays_runners", DIGEST_SECTION_LABELS["todays_runners"], sections.get("todays_runners"),
+            lambda r: (f"{r['ticker']}: ${r['price']:.2f} ({_fmt_pct(r.get('chg_pct'))}, {_runner_vol_txt(r)})"
+                       + (f" — {r['technical_read']}" if r.get("technical_read") else "")),
+            lambda r: (f"<b>{html.escape(r['ticker'])}</b>: ${r['price']:.2f} ({_fmt_pct(r.get('chg_pct'))}, "
+                       f"{_runner_vol_txt(r)})"
+                       + (f"<br><span style='color:#555;font-size:13px;'>{html.escape(r['technical_read'])}</span>"
+                          if r.get("technical_read") else "")),
+        )
+
+        # Part 3: current price, target price, % move, AND target date/time.
+        _add_list_section(
+            "day_prediction_targets", DIGEST_SECTION_LABELS["day_prediction_targets"],
+            sections.get("day_prediction_targets"),
+            lambda p: (f"{p['ticker']} — Current: ${p['current_price']:.2f} → Target: ${p['target_price']:.2f} "
+                       f"({p['predicted_direction']}, {_fmt_pct(p['move_pct'])}) by market close today "
+                       f"(4:00 PM ET) — {_DAY_PREDICTION_MODE_LABEL.get(p['mode'], p['mode'] or '—')}, "
+                       f"backtested on {p['backtest_n']} sessions"),
+            lambda p: (f"<b>{html.escape(p['ticker'])}</b> — Current: ${p['current_price']:.2f} → "
+                       f"Target: <b>${p['target_price']:.2f}</b> ({html.escape(p['predicted_direction'] or '')}, "
+                       f"{_fmt_pct(p['move_pct'])}) by market close today (4:00 PM ET) — "
+                       f"{html.escape(_DAY_PREDICTION_MODE_LABEL.get(p['mode'], p['mode'] or '—'))}, backtested on "
+                       f"{p['backtest_n']} sessions"),
+        )
+
+        if "swing_forecast_highlights" in sections_included and sections.get("swing_forecast_highlights"):
+            _add_list_section(
+                "swing_forecast_highlights", DIGEST_SECTION_LABELS["swing_forecast_highlights"],
+                sections.get("swing_forecast_highlights"),
+                lambda s: f"{s['ticker']} ({s['horizon_days']}d): target ${s['target_price']:.2f} "
+                          f"({s['predicted_direction']}, High confidence)",
+                lambda s: (f"<b>{html.escape(s['ticker'])}</b> ({s['horizon_days']}d): target "
+                           f"${s['target_price']:.2f} ({html.escape(s['predicted_direction'] or '')})"),
+            )
+
+    # Part 4: FULL watchlist table, every ticker, closest-to-entry first,
+    # changed-today rows bolded/colored rather than filtered to a
+    # changed-only list.
+    if "watchlist_signals" in sections_included and sections.get("watchlist_signals"):
+        rows = sections["watchlist_signals"]
+        _section_header(DIGEST_SECTION_LABELS["watchlist_signals"], len(rows))
+        text_lines.append(f"{'TICKER':<7}{'PRICE':<10}{'ENTRY ZONE':<18}{'DIST':<9}{'SIGNAL':<10}{'DIV':<5}")
+        html_parts.append(
+            "<table style='width:100%;border-collapse:collapse;font-size:13px;margin-bottom:8px;'>"
+            "<tr style='text-align:left;border-bottom:2px solid #1a1a1a;'>"
+            "<th style='padding:4px 6px;'>Ticker</th><th style='padding:4px 6px;'>Price</th>"
+            "<th style='padding:4px 6px;'>Entry Zone</th><th style='padding:4px 6px;'>Distance</th>"
+            "<th style='padding:4px 6px;'>Signal</th><th style='padding:4px 6px;'>Div. Score</th></tr>"
+        )
+        for r in rows:
+            price_txt = f"${r['price']:.2f}" if r["price"] is not None else "—"
+            dist_txt = (
+                "IN ZONE" if r["status"] == "in_zone"
+                else _fmt_pct(r["distance_pct"]) if r["distance_pct"] is not None else "—"
+            )
+            div_txt = f"{r['divergence_score']:.0f}" if r["divergence_score"] is not None else "—"
+            changed = r["zone_changed_today"] or r["signal_changed_today"]
+            flag = " 🔔" if changed else ""
+            text_lines.append(
+                f"{r['ticker']:<7}{price_txt:<10}{r['zone_txt']:<18}{dist_txt:<9}{r['signal']:<10}{div_txt:<5}{flag}"
+            )
+            # The highlight/bold is applied per-<td>, not on the <tr> --
+            # Gmail (confirmed live: this is exactly why the highlight
+            # silently disappeared in a real sent email while an identical
+            # preview rendered fine in a plain browser) strips background-
+            # color set on <tr> but honors the same style set on each
+            # <td>, so a <tr>-level style is genuinely unreliable for
+            # email despite working everywhere else HTML renders.
+            cell_style = "padding:4px 6px;font-weight:700;background:#fff9e6;" if changed else "padding:4px 6px;"
+            html_parts.append(
+                "<tr style='border-bottom:1px solid #eee;'>"
+                f"<td style='{cell_style}'>{html.escape(r['ticker'])}{flag}</td>"
+                f"<td style='{cell_style}'>{price_txt}</td>"
+                f"<td style='{cell_style}'>{html.escape(r['zone_txt'])}</td>"
+                f"<td style='{cell_style}'>{dist_txt}</td>"
+                f"<td style='{cell_style}'>{html.escape(r['signal'])}</td>"
+                f"<td style='{cell_style}'>{div_txt}</td></tr>"
+            )
+        text_lines.append("")
+        html_parts.append("</table>")
+
+    # Part 3: two Monday-Sunday weeks side by side, with day/date and
+    # impact badges (same High/Medium/Low colors as the Macro Calendar
+    # tab -- see _MACRO_IMPACT_COLORS_HEX).
+    if "macro_events_week" in sections_included and sections.get("macro_events_week"):
+        weeks = sections["macro_events_week"]
+        _section_header(DIGEST_SECTION_LABELS["macro_events_week"])
+
+        def _week_range_label(week):
+            return f"{pd.Timestamp(week['start']).strftime('%b %-d')} – {pd.Timestamp(week['end']).strftime('%b %-d')}"
+
+        def _week_text_lines(week, title):
+            out = [f"{title} ({_week_range_label(week)}):"]
+            for d in week["days"]:
+                day_label = pd.Timestamp(d["date"]).strftime("%a, %b %-d")
+                ev_txt = (
+                    "; ".join(f"{e['event_name']} ({e['impact_level']})" for e in d["events"])
+                    if d["events"] else "—"
+                )
+                out.append(f"  {day_label}: {ev_txt}")
+            return out
+
+        for line in _week_text_lines(weeks["this_week"], "THIS WEEK"):
+            text_lines.append(line)
+        text_lines.append("")
+        for line in _week_text_lines(weeks["next_week"], "NEXT WEEK"):
+            text_lines.append(line)
+        text_lines.append("")
+
+        def _event_badge_html(e):
+            color = _MACRO_IMPACT_COLORS_HEX.get(e["impact_level"], "#8b9bab")
+            badge = (f"<span style='display:inline-block;padding:1px 6px;border-radius:8px;font-size:9px;"
+                     f"font-weight:700;color:#fff;background:{color};margin-right:4px;'>"
+                     f"{html.escape((e['impact_level'] or '—').upper())}</span>")
+            return f"{badge}{html.escape(e['event_name'])}"
+
+        def _week_html_column(week, title):
+            parts = [f"<div style='font-weight:700;font-size:13px;margin-bottom:8px;'>{html.escape(title)}<br>"
+                     f"<span style='font-weight:400;color:#888;font-size:11px;'>"
+                     f"{html.escape(_week_range_label(week))}</span></div>"]
+            for d in week["days"]:
+                day_label = pd.Timestamp(d["date"]).strftime("%a, %b %-d")
+                ev_html = (
+                    "<br>".join(_event_badge_html(e) for e in d["events"]) if d["events"]
+                    else "<span style='color:#bbb;'>—</span>"
+                )
+                parts.append(f"<div style='margin-bottom:8px;font-size:12px;line-height:1.5;'>"
+                              f"<div style='color:#666;font-weight:700;'>{html.escape(day_label)}</div>{ev_html}</div>")
+            return "".join(parts)
+
+        html_parts.append(
+            "<table style='width:100%;border-collapse:collapse;' role='presentation'><tr>"
+            f"<td class='digest-week-col' style='width:50%;vertical-align:top;padding-right:10px;'>"
+            f"{_week_html_column(weeks['this_week'], 'THIS WEEK')}</td>"
+            f"<td class='digest-week-col' style='width:50%;vertical-align:top;padding-left:10px;"
+            f"border-left:1px solid #eee;'>{_week_html_column(weeks['next_week'], 'NEXT WEEK')}</td>"
+            "</tr></table>"
+        )
+
+    _add_list_section(
+        "earnings_alerts", DIGEST_SECTION_LABELS["earnings_alerts"], sections.get("earnings_alerts"),
+        lambda a: f"{a['ticker']} reports in {a['days_to_earnings']:.0f} day(s) ({a['next_earnings_date']})",
+        lambda a: f"<b>{html.escape(a['ticker'])}</b> reports in {a['days_to_earnings']:.0f} day(s)",
+    )
+
+    if not any(sections.get(k) for k in sections_included if not k.startswith("_")):
+        text_lines.append("Nothing new to report since the last digest.")
+        html_parts.append("<p>Nothing new to report since the last digest.</p>")
+
+    text_lines.append("View full details in the WATCHLIST SIGNALS tab.")
+    text_lines.append(f"Unsubscribe: {DIGEST_UNSUBSCRIBE_PLACEHOLDER}")
+    text_lines.append("Read more analysis at monotrading.substack.com")
+    html_parts.append(_DIGEST_HTML_FOOTER)
+
+    html_body = _DIGEST_HTML_OPEN + "".join(html_parts) + _DIGEST_HTML_CLOSE
+    return {
+        "subject": subject, "text_body": "\n".join(text_lines), "html_body": html_body,
+        "sections": sections, "market_holiday": market_holiday, "holiday_name": holiday_name,
+    }
+
+
+def get_unsubscribe_url(conn, token):
+    """Part 4.2. https://{APP_PUBLIC_URL}/?unsubscribe=<token> when
+    APP_PUBLIC_URL is configured (a stable ngrok/deployed URL) --
+    dashboard.py's own query-param handler is what makes that link
+    actually functional once such a URL exists. Falls back to a mailto:
+    unsubscribe request (CAN-SPAM's own accepted mechanism, works
+    regardless of hosting) when no public URL is configured -- this is
+    the honest default in a plain local/dev Streamlit deployment with no
+    stable public address yet."""
+    base_url = os.environ.get("APP_PUBLIC_URL")
+    if base_url:
+        return f"{base_url.rstrip('/')}/?unsubscribe={token}"
+    return f"mailto:{get_effective_from_email(conn)}?subject=Unsubscribe"
+
+
+def build_list_unsubscribe_header(conn, token):
+    """Part 4.3 -- RFC 8058 List-Unsubscribe header value: a comma-
+    separated list of URIs, mailto: always included (works everywhere),
+    https: added too when APP_PUBLIC_URL is configured. HONEST CAVEAT:
+    RFC 8058's true one-click mechanism expects the https: target to
+    accept a POST (List-Unsubscribe-Post: List-Unsubscribe=One-Click,
+    also set on the outgoing message) -- this app's unsubscribe handler
+    is a plain Streamlit query-param GET, not a dedicated POST endpoint,
+    since Streamlit has no easy way to serve one. Most major clients
+    (Gmail included) still surface a native one-click "Unsubscribe"
+    button from this header in practice, but it is not a byte-for-byte
+    strict RFC 8058 implementation."""
+    mailto = f"<mailto:{get_effective_from_email(conn)}?subject=Unsubscribe>"
+    base_url = os.environ.get("APP_PUBLIC_URL")
+    if base_url:
+        return f"{mailto}, <{base_url.rstrip('/')}/?unsubscribe={token}>"
+    return mailto
+
+
+# Pause between individual sends within one digest batch (Part 2) -- see
+# the loop's own comment for why this is deliberately simple insurance,
+# not real rate-limiting.
+EMAIL_SEND_DELAY_SECONDS = 0.3
+
+
+def send_daily_digest_email(conn, recipient_email=None, force=False, incomplete_reasons=None,
+                             featured_stock=None, chart_cid=None, inline_images=None):
+    """Sends the actual email -- the one function that touches SMTP.
+    Content comes entirely from build_digest_content (the exact same
+    function "Preview Today's Digest" calls, so the two can never
+    disagree) -- called ONCE per send, not once per recipient, since the
+    AI Briefing/chart work it depends on is shared across everyone this
+    digest goes out to. This function's own job is resolving config, the
+    same-day duplicate guard, personalizing + sending one message per
+    recipient, and recording the outcome -- never re-implementing content
+    generation. Its CORE sending mechanics (SMTP config check, same-day
+    guard, STARTTLS/login/sendmail, success/failure bookkeeping) are
+    unchanged from before this newsletter rebuild -- only extended with
+    real subscriber iteration (Part 4) and per-recipient unsubscribe
+    personalization, on top of the featured_stock/chart_cid/inline_images
+    params already added in the SES cutover.
+
+    `recipient_email=None` (the normal automated path) iterates every row
+    from get_active_subscribers() -- the real subscriber list, not a
+    single hardcoded address. An explicit `recipient_email` (the "Send
+    Test Email Now" button) targets exactly that one address instead,
+    auto-adding it as a subscriber first (via add_email_subscriber) if
+    it isn't already one, so even a test send gets a real, working
+    unsubscribe link/token rather than a broken one. `force=True` bypasses
+    BOTH the enabled toggle and the same-day last_sent_date guard, but
+    still genuinely sends over real SMTP -- it is not a dry run.
+    `incomplete_reasons` gets embedded directly into the email body via
+    build_digest_content, not just returned as metadata.
+
+    Overall result is "sent": True iff AT LEAST ONE recipient succeeded;
+    a per-recipient hard failure (Part 4.4) is logged and bounced against
+    that one subscriber (record_send_bounce) without aborting the rest of
+    the batch -- one bad address should never block everyone else's
+    digest. `last_send_error`/`last_send_status` on email_config reflect
+    the batch as a whole: "failed" only if EVERY recipient failed (or the
+    connection itself never succeeded); "success" if at least one went
+    through, with a note appended when some -- but not all -- failed.
+
+    smtplib/STARTTLS on SMTP_PORT (587 is the simplest path for a
+    personal Gmail account with an App Password, or an AWS SES SMTP
+    credential -- both reject a send without STARTTLS first)."""
+    config = get_email_config(conn)
+
+    if recipient_email:
+        recipients = [{"email": recipient_email, "unsubscribe_token": add_email_subscriber(conn, recipient_email)}]
+    else:
+        recipients = get_active_subscribers(conn)
+
+    smtp_host = os.environ.get("SMTP_HOST")
+    smtp_port = os.environ.get("SMTP_PORT")
+    smtp_user = os.environ.get("SMTP_USER")
+    smtp_password = os.environ.get("SMTP_PASSWORD")
+    if not (smtp_host and smtp_port and smtp_user and smtp_password and recipients):
+        print("[send_daily_digest_email] SMTP not fully configured (SMTP_HOST/SMTP_PORT/SMTP_USER/"
+              "SMTP_PASSWORD + at least one active subscriber are all required) -- skipping. The "
+              "WATCHLIST SIGNALS tab is unaffected either way.")
+        return {"sent": False, "reason": "smtp_not_configured" if not recipients else "no_active_subscribers"}
+
+    today = date.today().isoformat()
+    if not force and config["last_sent_date"] == today:
+        return {"sent": False, "reason": "already_sent_today"}
+
+    since_iso = config["last_digest_sent_at"] or (datetime.utcnow() - timedelta(hours=24)).isoformat()
+    content = build_digest_content(
+        conn, config["sections_included"], since_iso, incomplete_reasons=incomplete_reasons,
+        featured_stock=featured_stock, chart_cid=chart_cid,
+    )
+
+    # Part 2 fix: the sender identity is EMAIL_FROM/email_config.from_email
+    # (an address SES has actually verified -- e.g. the monotrading.io
+    # domain identity), NEVER smtp_user. smtp_user is what you AUTHENTICATE
+    # as (an SES SMTP credential, not a mailbox -- often not even a
+    # syntactically valid email address), completely independent of which
+    # verified identity a send goes out FROM. Used for both the From:
+    # header AND the SMTP envelope sender below -- SES checks the
+    # envelope MAIL FROM (bounce address) too, not just the header.
+    from_email = get_effective_from_email(conn)
+
+    sent_ok, failed = [], []
+    try:
+        with smtplib.SMTP(smtp_host, int(smtp_port), timeout=15) as server:
+            server.starttls()
+            server.login(smtp_user, smtp_password)
+            for i, sub in enumerate(recipients):
+                if i > 0:
+                    # Part 2: cheap insurance against SES throttling as
+                    # the subscriber list grows -- SES production
+                    # accounts typically allow well above 1/sec, so this
+                    # is a deliberately small pause, not real rate-
+                    # limiting logic (no backoff/retry-on-429 here).
+                    time.sleep(EMAIL_SEND_DELAY_SECONDS)
+                email, token = sub["email"], sub["unsubscribe_token"]
+                unsubscribe_url = get_unsubscribe_url(conn, token)
+                # Personalized ONLY substitution -- the (potentially large,
+                # AI-briefing-heavy) content itself is never rebuilt per
+                # recipient, just this one placeholder swapped per address.
+                text_body = content["text_body"].replace(DIGEST_UNSUBSCRIBE_PLACEHOLDER, unsubscribe_url)
+                html_body = content["html_body"].replace(DIGEST_UNSUBSCRIBE_PLACEHOLDER, unsubscribe_url)
+
+                msg = EmailMIMEMultipart("related")
+                msg["Subject"] = content["subject"]
+                msg["From"] = from_email
+                msg["To"] = email
+                # Part 4.3 -- RFC 8058-style headers (see build_list_
+                # unsubscribe_header's own honest caveat on GET vs. POST).
+                msg["List-Unsubscribe"] = build_list_unsubscribe_header(conn, token)
+                msg["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
+                alt = EmailMIMEMultipart("alternative")
+                alt.attach(EmailMIMEText(text_body, "plain"))
+                alt.attach(EmailMIMEText(html_body, "html"))
+                msg.attach(alt)
+                for cid, img_bytes in (inline_images or {}).items():
+                    img_part = EmailMIMEImage(img_bytes)
+                    img_part.add_header("Content-ID", f"<{cid}>")
+                    img_part.add_header("Content-Disposition", "inline", filename=f"{cid}.png")
+                    msg.attach(img_part)
+
+                try:
+                    server.sendmail(from_email, [email], msg.as_string())
+                    sent_ok.append(email)
+                except Exception as e:
+                    print(f"[send_daily_digest_email] send to {email} failed: {e}")
+                    record_send_bounce(conn, email, str(e))
+                    failed.append((email, str(e)))
+    except Exception as e:
+        # A connection/auth-level failure (never even got to send a
+        # single message) -- distinct from a per-recipient bounce above,
+        # so this is NOT attributed to any one subscriber.
+        print(f"[send_daily_digest_email] SMTP connection/auth failed: {e}")
+        save_email_config(conn, last_send_status="failed", last_send_error=str(e))
+        return {"sent": False, "reason": f"send_error: {e}"}
+
+    # Part 3: a single, always-populated batch-result sentence -- e.g.
+    # "sent to 4 of 5 subscriber(s) — 1 failed (a@b.com: <error>)" -- so
+    # SETTINGS can show one honest line covering full success, partial
+    # failure, AND total failure, rather than last_send_error only ever
+    # appearing on a binary success/failure. (`last_digest_sent_at`,
+    # a separate existing field, is what supplies the timestamp the UI
+    # appends -- not duplicated into this string.)
+    failure_clause = (
+        f" — {len(failed)} failed (" + "; ".join(f"{e}: {err}" for e, err in failed) + ")" if failed else ""
+    )
+    batch_note = f"sent to {len(sent_ok)} of {len(recipients)} subscriber(s){failure_clause}"
+
+    if not sent_ok:
+        # Do NOT update last_sent_date on total failure (Part 5) -- a
+        # genuine retry later the same day must remain possible.
+        save_email_config(conn, last_send_status="failed", last_send_error=batch_note)
+        return {"sent": False, "reason": batch_note}
+
+    sent_at = datetime.utcnow().isoformat()
+    current_signals = content["sections"].get("_current_signals_snapshot")
+    watchlist_rows = content["sections"].get("watchlist_signals") or []
+    conn.execute(
+        """INSERT INTO digest_email_log
+               (sent_at, recipient, entry_zone_count, rating_change_count, signals_snapshot_json,
+                featured_ticker)
+           VALUES (?,?,?,?,?,?)""",
+        (sent_at, ", ".join(sent_ok), sum(1 for r in watchlist_rows if r["zone_changed_today"]),
+         sum(1 for r in watchlist_rows if r["signal_changed_today"]),
+         json.dumps(current_signals) if current_signals is not None else None,
+         (featured_stock or {}).get("ticker")),
+    )
+    conn.commit()
+    save_email_config(
+        conn, last_sent_date=today, last_digest_sent_at=sent_at, last_send_status="success",
+        last_send_error=batch_note,
+    )
+    return {"sent": True, "sent_at": sent_at, "subject": content["subject"], "recipients_sent": sent_ok,
+            "recipients_failed": [e for e, _ in failed]}
+
+
+# How many minutes past send_time_et to keep retrying readiness before
+# giving up and sending anyway with an "incomplete data" note -- 90
+# minutes off the DEFAULT 07:30 send time lands exactly on the "9:00 AM
+# ET" cutoff this feature's own spec used as its example.
+DAILY_DIGEST_READINESS_GRACE_MINUTES = 90
+
+
+def should_send_daily_digest_now(conn):
+    """Part 4 gating -- PURE decision logic, no sending. Kept deliberately
+    separate from send_daily_digest_email (which only ever sends when
+    explicitly told to) because the actual send now needs dashboard.py's
+    chart-generation step first (see get_featured_stock_section/
+    render_chart_as_image) -- this function only ever answers "is now the
+    moment," it never touches SMTP or the Plotly/kaleido chart pipeline.
+    dashboard.py's orchestration calls this, and only builds the Featured
+    Stock section + chart + calls send_daily_digest_email when it returns
+    ready=True.
+
+    Returns {"ready": bool, "reason": str, "incomplete_reasons":
+    list[str]|None} -- "reason" is one of: disabled, already_sent_today,
+    weekend_skipped, before_send_time, waiting_for_readiness, ready.
+    When "reason"=="ready" but incomplete_reasons is non-empty, the
+    readiness cutoff has passed and the caller should still send, with
+    those reasons embedded as the "incomplete data" caveat.
+
+    HONESTY, STATED PLAINLY (Part 4 requires this): this is an IN-PROCESS
+    CHECK, not a real background scheduler or cron job -- Streamlit has
+    no standalone server-side scheduler. It only has any chance of firing
+    automatically at all if:
+      (1) a connected browser tab is open and dashboard.py's orchestration
+          is being called from the sidebar-adjacent st.fragment(run_
+          every=...) scan on RUNNERS' own refresh-interval timer -- in
+          which case retries happen roughly every 5/15/60 minutes
+          (whatever that interval is set to), NOT a guaranteed 10-15 min
+          cadence; "On demand" mode means this NEVER fires on a timer at
+          all, only on a full-page interaction; or
+      (2) the dashboard is opened/reloaded at some point that day AFTER
+          send_time_et, in which case the once-per-full-load call site
+          (dashboard.py's main script body) catches up immediately on
+          that visit.
+    If the app process isn't running, or no browser tab has it open, at
+    or after send_time_et, NOTHING sends until the next time someone
+    opens it -- there is no guarantee of an on-time morning send. This is
+    surfaced verbatim in SETTINGS' Email Digest section copy, not just
+    here."""
+    config = get_email_config(conn)
+    if not config["enabled"] or config["frequency"] == "off":
+        return {"ready": False, "reason": "disabled", "incomplete_reasons": None}
+
+    now_et = pd.Timestamp.now(tz="America/New_York")
+    today = now_et.date()
+    if config["last_sent_date"] == today.isoformat():
+        return {"ready": False, "reason": "already_sent_today", "incomplete_reasons": None}
+    if config["frequency"] == "weekdays_only" and today.weekday() >= 5:
+        return {"ready": False, "reason": "weekend_skipped", "incomplete_reasons": None}
+
+    try:
+        send_hour, send_minute = (int(x) for x in config["send_time_et"].split(":"))
+        send_time = now_et.replace(hour=send_hour, minute=send_minute, second=0, microsecond=0)
+    except (ValueError, AttributeError):
+        send_time = now_et.replace(hour=7, minute=30, second=0, microsecond=0)
+    if now_et < send_time:
+        return {"ready": False, "reason": "before_send_time", "incomplete_reasons": None}
+
+    cutoff = send_time + timedelta(minutes=DAILY_DIGEST_READINESS_GRACE_MINUTES)
+    ready, reasons = is_daily_digest_ready(conn)
+    if not ready and now_et < cutoff:
+        return {"ready": False, "reason": "waiting_for_readiness", "incomplete_reasons": reasons}
+
+    return {"ready": True, "reason": "ready", "incomplete_reasons": (reasons if not ready else None)}
+
+
+# --------------------------------------------------------------------------
+# FRED Fed Funds Rate (Part 7/8/9) -- replaces the previously hardcoded
+# 0.04 risk-free-rate assumption used throughout this file's Black-
+# Scholes Greeks, and feeds the current target range into macro
+# reasoning (Swing Forecast / AI Briefing).
+# --------------------------------------------------------------------------
+
+def fetch_fed_funds_rate(conn):
+    """Real FRED data: DFF (daily effective rate -- the actual risk-free-
+    rate input, persisted into fed_rate_history and read back by
+    get_current_risk_free_rate for every bs_greeks/bs_price call site),
+    DFEDTARU/DFEDTARL (target range upper/lower, for 'did the Fed hike/
+    cut/hold' framing), and FEDFUNDS (monthly average -- lower priority
+    per this feature's own spec; returned for an optional future trend
+    chart but not persisted, since fed_rate_history is daily-keyed).
+
+    Raises RuntimeError if FRED_API_KEY isn't set or DFF comes back
+    unusable -- caught by cached_fed_funds_rate, which is what actually
+    falls back gracefully; this function is the honest 'did it really
+    work' layer, same convention as fetch_fred_events/fetch_fomc_schedule
+    elsewhere in this file."""
+    api_key = os.environ.get("FRED_API_KEY")
+    if not api_key:
+        raise RuntimeError("FRED_API_KEY not set -- see setup_env.sh")
+
+    def _latest(series_id):
+        data = _fred_get("series/observations", {"series_id": series_id, "sort_order": "desc", "limit": 1}, api_key)
+        obs = data.get("observations") or []
+        if not obs or obs[0].get("value") in (None, "."):
+            return None, None
+        try:
+            return obs[0]["date"], float(obs[0]["value"])
+        except (TypeError, ValueError):
+            return None, None
+
+    dff_date, dff_rate = _latest("DFF")
+    _, target_upper = _latest("DFEDTARU")
+    _, target_lower = _latest("DFEDTARL")
+    if dff_rate is None:
+        raise RuntimeError("FRED returned no usable DFF (Fed Funds Effective Rate) observation")
+
+    monthly_data = _fred_get(
+        "series/observations", {"series_id": "FEDFUNDS", "sort_order": "desc", "limit": 24}, api_key
+    )
+    monthly_avg = [
+        {"date": o["date"], "value": float(o["value"])}
+        for o in (monthly_data.get("observations") or []) if o.get("value") not in (None, ".")
+    ]
+
+    fetched_at = datetime.utcnow().isoformat()
+    conn.execute(
+        """INSERT INTO fed_rate_history (date, dff_rate, target_upper, target_lower, fetched_at)
+           VALUES (?,?,?,?,?)
+           ON CONFLICT(date) DO UPDATE SET
+               dff_rate=excluded.dff_rate, target_upper=excluded.target_upper,
+               target_lower=excluded.target_lower, fetched_at=excluded.fetched_at""",
+        (dff_date, dff_rate, target_upper, target_lower, fetched_at),
+    )
+    conn.commit()
+    return {"date": dff_date, "dff_rate": dff_rate, "target_upper": target_upper, "target_lower": target_lower,
+            "monthly_avg": monthly_avg, "source": "fred", "fetched_at": fetched_at}
+
+
+def cached_fed_funds_rate(conn, max_age_hours=24, force_refresh=False):
+    """24h-TTL wrapper over fetch_fed_funds_rate, same should_refetch/
+    fetch_log freshness ledger every other cached_* wrapper uses -- keyed
+    on the _MARKET_KEY sentinel (ticker=None) since this is market-wide,
+    same convention as cached_macro_events."""
+    table = "fed_rate_history"
+    if not force_refresh and not should_refetch(conn, table, None, max_age_hours):
+        row = conn.execute(
+            "SELECT date, dff_rate, target_upper, target_lower, fetched_at "
+            "FROM fed_rate_history ORDER BY date DESC LIMIT 1"
+        ).fetchone()
+        if row:
+            return {"data": {"date": row[0], "dff_rate": row[1], "target_upper": row[2], "target_lower": row[3]},
+                    "source": "fred", "cache_hit": True, "fetched_at": row[4]}
+    try:
+        result = fetch_fed_funds_rate(conn)
+        _log_fetch(conn, table, None, True, 1)
+        return {"data": {"date": result["date"], "dff_rate": result["dff_rate"],
+                          "target_upper": result["target_upper"], "target_lower": result["target_lower"],
+                          "monthly_avg": result["monthly_avg"]},
+                "source": "fred", "cache_hit": False, "fetched_at": result["fetched_at"]}
+    except Exception as e:
+        _log_fetch(conn, table, None, False, 0, str(e))
+        row = conn.execute(
+            "SELECT date, dff_rate, target_upper, target_lower, fetched_at "
+            "FROM fed_rate_history ORDER BY date DESC LIMIT 1"
+        ).fetchone()
+        if row:
+            return {"data": {"date": row[0], "dff_rate": row[1], "target_upper": row[2], "target_lower": row[3]},
+                    "source": "fred", "cache_hit": True, "fetched_at": row[4]}
+        return {"data": None, "source": "fred", "cache_hit": False, "fetched_at": None}
+
+
+def get_current_risk_free_rate(conn=None):
+    """Part 8. Live risk-free rate for Black-Scholes Greeks, sourced from
+    fed_rate_history's most recent DFF value (percent -> decimal).
+    Pure DB read -- never fetches live itself, matching this file's usual
+    'cached_* fetches, compute functions only read' discipline. Falls
+    back to RISK_FREE_RATE_DEFAULT (0.04), CLEARLY LOGGED (not silent),
+    when `conn` isn't available to a caller or fed_rate_history has no
+    row yet (FRED unreachable/no key and no prior successful fetch)."""
+    if conn is None:
+        return RISK_FREE_RATE_DEFAULT
+    row = conn.execute("SELECT dff_rate FROM fed_rate_history ORDER BY date DESC LIMIT 1").fetchone()
+    if row is None or row[0] is None:
+        print(
+            f"[get_current_risk_free_rate] No cached Fed Funds Rate yet -- falling back to "
+            f"RISK_FREE_RATE_DEFAULT ({RISK_FREE_RATE_DEFAULT:.2%}). Call cached_fed_funds_rate(conn) "
+            "(e.g. via full_refresh) to populate fed_rate_history."
+        )
+        return RISK_FREE_RATE_DEFAULT
+    return round(row[0] / 100.0, 5)
+
+
+def get_fed_target_range_text(conn):
+    """Part 9. 'Fed funds target range is currently X%-Y%' framing for
+    macro reasoning (Swing Forecast / AI Briefing), sourced from the same
+    fed_rate_history row get_current_risk_free_rate reads. Returns None
+    (never a fabricated placeholder) if no data is cached yet."""
+    row = conn.execute(
+        "SELECT target_lower, target_upper, date FROM fed_rate_history "
+        "WHERE target_lower IS NOT NULL AND target_upper IS NOT NULL ORDER BY date DESC LIMIT 1"
+    ).fetchone()
+    if not row:
+        return None
+    lower, upper, as_of = row
+    return f"Fed funds target range is currently {lower:.2f}%-{upper:.2f}% (as of {as_of})"
 
 
 if __name__ == "__main__":

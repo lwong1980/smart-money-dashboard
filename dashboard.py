@@ -4,9 +4,10 @@ import html
 import json
 import os
 import re
+import threading
 import time
 from contextlib import nullcontext
-from datetime import date
+from datetime import date, datetime, timedelta, time as dt_time
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -120,6 +121,74 @@ from data_engine import (
     get_most_recent_day_prediction,
     get_most_recent_backtest_prediction,
     get_intraday_bars_for_session,
+    cached_macro_events,
+    get_macro_events_in_range,
+    get_macro_events_near,
+    get_macro_events_by_id,
+    get_watchlist_relevant_tickers,
+    _format_et_time_12h,
+    FOMC_MEETING_DATES,
+    load_pinned_runners,
+    save_pinned_runners,
+    load_runners_refresh_interval,
+    save_runners_refresh_interval,
+    SWING_HORIZON_OPTIONS,
+    get_multiday_realized_volatility,
+    check_earnings_collision,
+    get_divergence_score_trend,
+    get_relative_strength_trend,
+    get_recency_weighted_activity,
+    get_dark_pool_trend,
+    get_gamma_evolution,
+    backtest_swing_forecasts,
+    compute_swing_forecast,
+    log_swing_forecast,
+    reconcile_swing_forecasts,
+    recommend_swing_strategy,
+    get_swing_forecast_track_record,
+    get_swing_backtest_report_data,
+    get_active_swing_calibration,
+    get_swing_calibration_history,
+    calibrate_swing_forecast_model,
+    SWING_CALIBRATION_MIN_SAMPLES,
+    analyze_swing_contract,
+    get_history,
+    get_committed_swing_path,
+    get_macro_event_grounded_reasoning,
+    get_entry_zones,
+    get_latest_cached_price,
+    refresh_entry_zone,
+    refresh_all_entry_zones,
+    check_entry_zones,
+    check_rating_changes,
+    synthesize_rating_signal,
+    get_watchlist_signals_since,
+    load_watchlist_signals_last_viewed,
+    save_watchlist_signals_last_viewed,
+    send_daily_digest_email,
+    cached_fed_funds_rate,
+    get_fed_target_range_text,
+    get_firm_tier,
+    log_runners_scan,
+    get_email_config,
+    save_email_config,
+    is_daily_digest_ready,
+    should_send_daily_digest_now,
+    build_digest_content,
+    is_market_holiday,
+    get_market_holiday_name,
+    DIGEST_SECTION_LABELS,
+    DEFAULT_DIGEST_SECTIONS,
+    select_featured_stock,
+    get_featured_stock_section,
+    DEFAULT_DIGEST_FROM_EMAIL,
+    unsubscribe_by_token,
+    add_email_subscriber,
+    get_active_subscribers,
+    get_all_subscribers,
+    remove_email_subscriber,
+    resubscribe_email,
+    is_valid_email_format,
 )
 
 # --------------------------------------------------------------------------
@@ -141,12 +210,16 @@ COLOR_RETAIL = "#c98500"          # amber
 COLOR_BULLISH = "#0ca30c"         # good / green
 COLOR_BEARISH = "#e66767"         # critical / red
 COLOR_NEUTRAL = "#5a6472"         # muted gray
+COLOR_CONFLICTED = "#a86fe0"      # violet -- distinct from NEUTRAL's gray so a
+                                  # high-conviction-but-disagreeing read doesn't
+                                  # visually collapse into "nothing going on"
 
 LABEL_COLORS = {
     "SMART_BULLISH": COLOR_BULLISH,
     "SMART_BEARISH_RETAIL_LONG": COLOR_BEARISH,
     "RETAIL_FRENZY": COLOR_RETAIL,
     "INSTITUTIONAL_ACTIVE": COLOR_INSTITUTIONAL,
+    "CONFLICTED_SIGNALS": COLOR_CONFLICTED,
     "NEUTRAL": COLOR_NEUTRAL,
 }
 
@@ -244,7 +317,7 @@ section[data-testid="stSidebar"] {{
 }}
 div.block-container {{
     padding-top: 1.1rem;
-    max-width: 1400px;
+    max-width: 100%;
 }}
 
 h1, h2, h3, h4, h5 {{
@@ -344,6 +417,15 @@ hr {{ border-color: {BORDER}; }}
 st.set_page_config(page_title="SMART MONEY INTELLIGENCE", layout="wide", page_icon="📡")
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
+# Initialized here, immediately after page config, rather than further
+# down where the sidebar used to live -- every tab-render function below
+# reads the bare `watchlist` global or st.session_state.watchlist
+# directly, so this must be the very first stateful thing set up on any
+# script run, with no tab/dialog/fragment code able to run ahead of it.
+if "watchlist" not in st.session_state:
+    st.session_state.watchlist = load_watchlist()
+watchlist = st.session_state.watchlist
+
 
 # --------------------------------------------------------------------------
 # Startup: log QUIVER_API_KEY detection once per server process (not once
@@ -368,10 +450,69 @@ _log_startup_status()
 # Data access
 # --------------------------------------------------------------------------
 
-@st.cache_resource
+_db_thread_local = threading.local()
+
+
 def get_conn():
-    init_db(DEFAULT_DB_PATH)
-    return get_connection(DEFAULT_DB_PATH)
+    """A connection PRIVATE to the current thread -- was previously a
+    single @st.cache_resource-cached sqlite3.Connection shared globally
+    across every session, tab, AND every RUNNERS Day Prediction fragment
+    auto-refresh (st.fragment(run_every=...) executes on Streamlit's own
+    background scheduling, genuinely concurrently with the main script
+    thread, not just "later"). One Python sqlite3.Connection object is
+    NOT safe for two threads to call .execute() on at the same instant
+    -- check_same_thread=False only disables Python's own same-thread
+    guard, it does not make the underlying connection thread-safe for
+    true concurrent use. Confirmed live: the moment the "5 min" auto-
+    refresh fragment actually started firing on its own timer (right
+    after fixing a separate bug where that setting silently reverted to
+    "On demand" on every reload, so this race was previously almost
+    never triggered), a normal page load hit
+    'sqlite3.InterfaceError: bad parameter or other API misuse' in the
+    NEWS tab while the fragment's background thread was also live.
+
+    threading.local() gives each thread (main script thread, and each
+    fragment's own execution thread) its own real connection to the
+    same WAL-mode file -- multiple separate connections to a WAL
+    database ARE safe to use concurrently, which is the whole reason
+    WAL mode exists; a single connection OBJECT shared across threads
+    is a different, unsafe thing entirely. init_db()'s schema/migration
+    checks are cheap and idempotent, so re-running them once per new
+    thread (not once per rerun on the same thread) costs nothing
+    noticeable."""
+    if not hasattr(_db_thread_local, "conn"):
+        init_db(DEFAULT_DB_PATH)
+        _db_thread_local.conn = get_connection(DEFAULT_DB_PATH)
+    return _db_thread_local.conn
+
+
+# --------------------------------------------------------------------------
+# Unsubscribe query-param handler (Part 4.2) -- checks for ?unsubscribe=
+# <token> on EVERY load, before any tab content renders, and shows a
+# dedicated confirmation/error page instead of the dashboard when present
+# (st.stop() below short-circuits the rest of this script). Only actually
+# reachable while this app is running somewhere with a real, stable
+# public URL (see get_unsubscribe_url's own APP_PUBLIC_URL / mailto:
+# fallback) -- a link clicked from an email obviously can't reach a
+# purely local `streamlit run` process on someone's own machine.
+# --------------------------------------------------------------------------
+
+_unsubscribe_token = st.query_params.get("unsubscribe")
+if _unsubscribe_token:
+    # NOTE: st.set_page_config() already ran once, earlier in this script
+    # (it must be the first Streamlit call and can only run once per
+    # script execution) -- not repeated here.
+    _unsubscribed_email = unsubscribe_by_token(get_conn(), _unsubscribe_token)
+    st.markdown("### 📧 Smart Money Intelligence — Daily Digest")
+    if _unsubscribed_email:
+        st.success(f"✅ **{_unsubscribed_email}** has been unsubscribed from the daily digest. "
+                   f"You will not receive further emails.")
+        st.caption("Changed your mind? Re-subscribe from the SETTINGS → Email Digest panel, or contact "
+                   "the sender directly.")
+    else:
+        st.error("⚠️ This unsubscribe link isn't valid (or has already been used). If you're still receiving "
+                 "emails you don't want, reply to the digest directly and ask to be removed.")
+    st.stop()
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -723,6 +864,92 @@ def apply_theme(fig, height=360, **overrides):
     return fig
 
 
+_MACRO_IMPACT_COLORS = {"High": COLOR_BEARISH, "Medium": "#e8c547", "Low": TEXT_SECONDARY}
+_MACRO_ABBREV = {
+    "fomc_rate_decision": "FOMC", "cpi": "CPI", "pce": "PCE", "nfp": "NFP",
+    "gdp": "GDP", "retail_sales": "RETAIL", "jobless_claims": "CLAIMS",
+}
+
+
+def add_macro_event_markers(fig, events, intraday=False, chart_tz=None, row=None, col=None,
+                             y_bottom=None, marker_row=None):
+    """Adds a plain thin, low-opacity (35%) dashed vertical line for
+    every macro event whose date falls in the chart's own range -- fully
+    automatic (Part 6): every price-chart function calls get_macro_
+    events_in_range with its OWN visible date range and passes the
+    result straight here, so a new macro event starts appearing on every
+    relevant chart with zero per-chart/per-ticker configuration the
+    moment it's fetched. Color-coded by impact_level (red/orange High --
+    FOMC/CPI/NFP; muted gray Medium/Low). On an intraday chart (Day
+    Prediction), positions the line at the event's real scheduled_
+    time_et instead of just the date, localized to the chart's own tz
+    (chart_tz) so it lines up with the rest of that chart's tz-aware
+    x-axis.
+
+    Hover detail (this request): a single small dot marker at the BOTTOM
+    of the chart (y_bottom, supplied by the caller from its own price
+    data's range -- never both top and bottom) shows the full event
+    name/date/time on mouseover, via a real Scatter trace with hovertext
+    -- NOT annotation_hovertext, which turned out to render a literal
+    "new text" placeholder at render time even with no visible
+    annotation_text (a Plotly.js quirk, confirmed live: the Python
+    object shows text=None but the browser renders a placeholder
+    regardless -- the same bug class already diagnosed once before in
+    this codebase for the support/resistance hlines: 'only pass
+    annotation_* kwargs at all when there's real text to show'). This
+    replaces that entirely -- the line itself carries no annotation/
+    label of any kind now, at any timeframe; the dot is the only
+    interactive element, and a static, always-visible fallback is the
+    "📅 X macro events in this range" expander every caller renders
+    below its chart (render_macro_event_expander)."""
+    for ev in events:
+        color = _MACRO_IMPACT_COLORS.get(ev["impact_level"], TEXT_SECONDARY)
+        time_label = f" {_format_et_time_12h(ev['scheduled_time_et'])}" if ev.get("scheduled_time_et") else ""
+        if intraday and ev.get("scheduled_time_et"):
+            x = pd.Timestamp(f"{ev['scheduled_date']} {ev['scheduled_time_et']}")
+            if chart_tz is not None:
+                x = x.tz_localize(chart_tz)
+        else:
+            x = ev["scheduled_date"]
+        vline_kwargs = dict(x=x, line=dict(color=color, width=1, dash="dash"), opacity=0.35)
+        if row is not None:
+            vline_kwargs["row"] = row
+        if col is not None:
+            vline_kwargs["col"] = col
+        fig.add_vline(**vline_kwargs)
+
+        if y_bottom is not None:
+            trace_kwargs = dict(
+                x=[x], y=[y_bottom], mode="markers",
+                marker=dict(symbol="circle", size=7, color=color, line=dict(width=1, color=PANEL)),
+                hovertext=f"{ev['event_name']} — {ev['scheduled_date']}{time_label}",
+                hoverinfo="text", showlegend=False,
+            )
+            if marker_row is not None and col is not None:
+                fig.add_trace(go.Scatter(**trace_kwargs), row=marker_row, col=col)
+            else:
+                fig.add_trace(go.Scatter(**trace_kwargs))
+    return fig
+
+
+def render_macro_event_expander(events):
+    """Part 3 -- collapsed, on-demand full detail for whatever events a
+    chart's overlay actually plotted (already impact-filtered for wide
+    ranges by get_macro_events_in_range's overlay_impact_filter="auto").
+    No-op if there are none in this chart's range."""
+    if not events:
+        return
+    with st.expander(f"📅 {len(events)} macro event(s) in this range", expanded=False):
+        for ev in events:
+            color = _MACRO_IMPACT_COLORS.get(ev["impact_level"], TEXT_SECONDARY)
+            time_label = f" {_format_et_time_12h(ev['scheduled_time_et'])}" if ev.get("scheduled_time_et") else ""
+            st.markdown(
+                f"<span style='color:{color};'>●</span> **{ev['event_name']}** — "
+                f"{ev['scheduled_date']}{time_label} ({ev['impact_level']} impact)",
+                unsafe_allow_html=True,
+            )
+
+
 def render_price_chart(df, ticker, mode="line", height=380):
     fig = go.Figure()
     if mode == "candlestick":
@@ -750,13 +977,21 @@ def render_price_chart(df, ticker, mode="line", height=380):
                        line=dict(color=COLOR_RETAIL, width=1.4, dash="dot"))
         )
     fig.update_layout(xaxis_rangeslider_visible=False)
+    macro_events = []
+    if not df.empty:
+        macro_events = get_macro_events_in_range(get_conn(), df.index.min(), df.index.max(),
+                                                  overlay_impact_filter="auto")
+        lo = float(df["Low"].min()) if mode == "candlestick" else float(df["Close"].min())
+        hi = float(df["High"].max()) if mode == "candlestick" else float(df["Close"].max())
+        y_bottom = lo - (hi - lo) * 0.03
+        add_macro_event_markers(fig, macro_events, y_bottom=y_bottom)
     apply_theme(
         fig, height=height,
         title=dict(text=f"{ticker} &mdash; Price", font=dict(color=TEXT_PRIMARY, size=14)),
         legend=dict(orientation="h", y=1.12, bgcolor="rgba(0,0,0,0)"),
         hovermode="x unified",
     )
-    return fig
+    return fig, macro_events
 
 
 def render_price_volume_chart(df, ticker, mode="line", short_label="SMA short", long_label="SMA long",
@@ -858,6 +1093,18 @@ def render_price_volume_chart(df, ticker, mode="line", short_label="SMA short", 
         rangebreaks.append(dict(bounds=[16, 9.5], pattern="hour"))
     fig.update_xaxes(rangebreaks=rangebreaks)
 
+    macro_events = []
+    if not df.empty:
+        macro_events = get_macro_events_in_range(get_conn(), df.index.min(), df.index.max(),
+                                                  overlay_impact_filter="auto")
+        # Dot sits on the VOLUME subplot (row 2), at y=0 -- volume bars
+        # already start at 0, so this is the true visual bottom of the
+        # whole chart with no padding math needed. The vline itself still
+        # spans both subplots (row="all") so it visually connects price
+        # to the dot below.
+        add_macro_event_markers(fig, macro_events, intraday=is_intraday, chart_tz=df.index.tz, row="all", col=1,
+                                 y_bottom=0, marker_row=2)
+
     fig.update_layout(xaxis_rangeslider_visible=False, xaxis2_rangeslider_visible=False)
     apply_theme(
         fig, height=height,
@@ -865,7 +1112,7 @@ def render_price_volume_chart(df, ticker, mode="line", short_label="SMA short", 
         legend=dict(orientation="h", y=1.06, bgcolor="rgba(0,0,0,0)"),
         hovermode="x unified",
     )
-    return fig
+    return fig, macro_events
 
 
 def render_technical_structure_panel(levels):
@@ -1069,13 +1316,12 @@ def render_timeframe_chart_section(ticker, key_prefix, mode="line", show_technic
         short_w, long_w = cfg["sma_windows"]
         levels = _compute_technical_levels(hist, cfg, ticker) if show_technical_structure else None
         cache_suffix = f"{ticker}_{interval}_{lookback}"
-        st.plotly_chart(
-            render_price_volume_chart(
-                hist, ticker, mode=mode,
-                short_label=f"SMA {short_w}", long_label=f"SMA {long_w}", levels=levels,
-            ),
-            width='stretch', key=f"{key_prefix}_pv_{cache_suffix}",
+        pv_fig, pv_macro_events = render_price_volume_chart(
+            hist, ticker, mode=mode,
+            short_label=f"SMA {short_w}", long_label=f"SMA {long_w}", levels=levels,
         )
+        st.plotly_chart(pv_fig, width='stretch', key=f"{key_prefix}_pv_{cache_suffix}")
+        render_macro_event_expander(pv_macro_events)
         horizon_label = "Intraday setup" if cfg["horizon"] == "intraday" else "Swing setup"
         st.caption(horizon_label)
         rcol1, rcol2 = st.columns(2)
@@ -2139,6 +2385,342 @@ def render_news_feeds_section():
     st.markdown("<br>", unsafe_allow_html=True)
 
 
+def render_firm_tiers_section():
+    """RATING SIGNAL FIRM TIERS (Part 2): editable firm_tiers table --
+    classifies each firm's real MARKET IMPACT (attention/volume a call
+    typically generates), NOT analyst accuracy. synthesize_rating_signal
+    (WATCHLIST SIGNALS tab) reads this via get_firm_tier on every call, so
+    an edit here takes effect immediately on the next scan/render, no
+    cache to clear. Any firm with no row here defaults to Tier 3 / 0.25 --
+    that default lives in data_engine.get_firm_tier, not here."""
+    st.markdown('<div class="smd-section">RATING SIGNAL FIRM TIERS</div>', unsafe_allow_html=True)
+    st.caption(
+        "Classifies each firm's real market-impact tier (attention/volume a rating call typically "
+        "generates) -- not a claim about analyst accuracy. Used to weight WATCHLIST SIGNALS' synthesized "
+        "per-ticker rating signal. Any firm not listed here defaults to Tier 3 / weight 0.25. Edit directly "
+        "and Save; use the blank bottom row to add a new firm."
+    )
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT firm_name, tier, tier_label, weight FROM firm_tiers ORDER BY tier, firm_name"
+    ).fetchall()
+    df = pd.DataFrame(rows, columns=["Firm", "Tier", "Tier label", "Weight"])
+    edited = st.data_editor(
+        df, width='stretch', hide_index=True, num_rows="dynamic", key="firm_tiers_editor",
+        column_config={
+            "Tier": st.column_config.NumberColumn(min_value=1, max_value=3, step=1),
+            "Weight": st.column_config.NumberColumn(min_value=0.0, max_value=1.0, step=0.05, format="%.2f"),
+        },
+    )
+    if st.button("Save changes", key="firm_tiers_save_btn"):
+        conn.execute("DELETE FROM firm_tiers")
+        for _, r in edited.iterrows():
+            firm = str(r["Firm"]).strip() if pd.notna(r["Firm"]) else ""
+            if not firm:
+                continue
+            conn.execute(
+                "INSERT OR REPLACE INTO firm_tiers (firm_name, tier, tier_label, weight) VALUES (?,?,?,?)",
+                (firm, int(r["Tier"]) if pd.notna(r["Tier"]) else 3,
+                 str(r["Tier label"]) if pd.notna(r["Tier label"]) else "Smaller/Regional",
+                 float(r["Weight"]) if pd.notna(r["Weight"]) else 0.25),
+            )
+        conn.commit()
+        st.success("Firm tier classifications saved.")
+        st.rerun()
+
+
+# --------------------------------------------------------------------------
+# Daily Digest newsletter orchestration -- the ONE place that ties
+# together build_digest_content (data_engine.py, no plotting dependency)
+# with the Featured Stock's chart image, since chart-building
+# (render_price_volume_chart) and static PNG export (kaleido) both live
+# only here. data_engine.py's send_daily_digest_email/build_digest_
+# content never import plotly/kaleido themselves -- they just accept a
+# `chart_cid` reference string and `inline_images` bytes dict, both
+# supplied by this file.
+# --------------------------------------------------------------------------
+
+FEATURED_STOCK_CHART_CID = "featured_stock_chart"
+
+
+def render_chart_as_image(fig, width=560, height=380):
+    """Part 2. Converts an existing Plotly figure (e.g. render_price_
+    volume_chart's output, already used unmodified by Ticker Deep-Dive)
+    into static PNG bytes via kaleido -- the standard way to embed a real
+    chart in an HTML email, since email clients can't run Plotly/JS.
+    Returns None (never raises) if kaleido/Chrome isn't available in this
+    environment -- the digest still sends, just without the chart image,
+    rather than failing the whole send over a missing chart dependency."""
+    try:
+        return fig.to_image(format="png", width=width, height=height, scale=2)
+    except Exception as e:
+        print(f"[render_chart_as_image] chart export failed: {e}")
+        return None
+
+
+def _build_featured_stock_chart_bytes(ticker, conn):
+    """Reuses render_price_volume_chart -- the EXACT function Ticker
+    Deep-Dive's own price chart uses, SMA/support-resistance overlay
+    included -- rather than building a second, digest-only chart. Returns
+    (png_bytes_or_None, cid_or_None)."""
+    hist, cfg = fetch_price_history(ticker, DEFAULT_INTERVAL, DEFAULT_LOOKBACK, conn=conn)
+    if hist.empty:
+        return None, None
+    levels = detect_technical_levels(ticker, DEFAULT_INTERVAL, DEFAULT_LOOKBACK, conn=conn)
+    fig, _ = render_price_volume_chart(
+        hist, ticker, short_label="SMA short", long_label="SMA long", height=380, levels=levels,
+    )
+    png_bytes = render_chart_as_image(fig)
+    return (png_bytes, FEATURED_STOCK_CHART_CID) if png_bytes else (None, None)
+
+
+def run_daily_digest_send(conn, force=False, recipient_email=None):
+    """The single orchestration entry point for an actual digest send --
+    called both by the background scan fragment/full-load catch-up (an
+    automatic, schedule-driven send) and by SETTINGS' "Send Test Email
+    Now" button (force=True, immediate, optionally to a not-yet-saved
+    `recipient_email` typed into the input). Builds the Featured Stock
+    section (select_featured_stock + get_featured_stock_section, both
+    data_engine.py, unmodified core logic) and its chart image (this
+    file's own render_price_volume_chart + kaleido) BEFORE calling
+    send_daily_digest_email, so a scheduled automatic send gets the exact
+    same rich newsletter as a manually-triggered test send -- there is no
+    second, thinner "automatic" path.
+
+    `force=False` (the automatic path) first asks should_send_daily_
+    digest_now() -- a pure yes/no decision with no chart/API cost of its
+    own -- and does nothing further unless it says ready, so the
+    (potentially real, billed) AI Briefing call and chart render only
+    ever happen when a send is actually about to go out."""
+    incomplete_reasons = None
+    if not force:
+        decision = should_send_daily_digest_now(conn)
+        if not decision["ready"]:
+            return {"sent": False, "reason": decision["reason"]}
+        incomplete_reasons = decision["incomplete_reasons"]
+
+    featured_stock, chart_bytes, chart_cid = None, None, None
+    featured_ticker = select_featured_stock(conn)
+    if featured_ticker:
+        featured_stock = get_featured_stock_section(featured_ticker, conn)
+        chart_bytes, chart_cid = _build_featured_stock_chart_bytes(featured_ticker, conn)
+
+    result = send_daily_digest_email(
+        conn, recipient_email=recipient_email, force=True, incomplete_reasons=incomplete_reasons,
+        featured_stock=featured_stock, chart_cid=chart_cid,
+        inline_images=({chart_cid: chart_bytes} if chart_bytes else None),
+    )
+    if incomplete_reasons:
+        result["sent_incomplete"] = True
+        result["incomplete_reasons"] = incomplete_reasons
+    return result
+
+
+def render_email_digest_section():
+    """📧 EMAIL DIGEST (Parts 1-4 of this feature): in-app config for
+    recipient/schedule/content-selection -- SMTP server credentials
+    (SMTP_HOST/PORT/USER/PASSWORD) remain environment secrets, a real
+    security boundary (this table is just app state on disk; an env var
+    requires server-level access to change). The trigger-mechanism
+    honesty note is surfaced here VERBATIM, not just in code comments,
+    per this feature's own explicit instruction -- there is no real
+    background scheduler behind this, only an in-process check."""
+    st.markdown('<div class="smd-section">📧 EMAIL DIGEST</div>', unsafe_allow_html=True)
+    conn = get_conn()
+    config = get_email_config(conn)
+
+    st.warning(
+        "Digest checks run only while this dashboard is open in a connected browser tab — an in-process "
+        "check on RUNNERS' own refresh-interval timer, plus a catch-up check on every page load. There is "
+        "no real background scheduler or cron behind this. For a reliable morning send, make sure the app "
+        "is running (or gets opened) around your scheduled send time.",
+        icon="⚠️",
+    )
+
+    smtp_configured = all(os.environ.get(v) for v in ("SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASSWORD"))
+    if smtp_configured:
+        st.success("✅ SMTP configured", icon="✅")
+    else:
+        st.warning("⚠️ SMTP not configured — set SMTP_HOST/SMTP_USER/SMTP_PASSWORD environment variables.",
+                   icon="⚠️")
+
+    if config["last_send_status"] == "success":
+        # Part 3: last_send_error is now ALWAYS a batch-result sentence
+        # on a successful send (e.g. "sent to 4 of 5 subscriber(s) — 1
+        # failed (a@b.com: <error>)"), not just present on partial
+        # failure -- one line covers full success, partial, and (below)
+        # total failure consistently.
+        batch_note = config["last_send_error"] or "sent"
+        st.info(f"✅ Last digest: {batch_note} at {time_ago(config['last_digest_sent_at'])} "
+                f"({config['last_digest_sent_at']}).")
+    elif config["last_send_status"] == "failed":
+        st.error(f"❌ Last digest attempt failed — {config['last_send_error']}")
+
+    enabled = st.toggle("Enable daily digest", value=config["enabled"], key="digest_enabled_toggle")
+
+    # ---- Part 1: full subscriber list manager ----
+    st.markdown("**Subscribers**")
+    st.caption("Real subscriber list -- send_daily_digest_email() sends an INDIVIDUAL email to every row "
+               "below with unsubscribed=0 (never a shared To:/Cc:), each with their own unique unsubscribe "
+               "link/token.")
+    all_subscribers = get_all_subscribers(conn)
+    active_count = sum(1 for s in all_subscribers if not s["unsubscribed"])
+    st.markdown(f"**Sending to {active_count} active subscriber(s)**")
+
+    acol1, acol2 = st.columns([3, 1])
+    new_subscriber = acol1.text_input(
+        "Add subscriber", key="digest_add_subscriber_input", placeholder="you@example.com",
+        label_visibility="collapsed",
+    )
+    if acol2.button("+ Add Subscriber", key="digest_add_subscriber_btn", disabled=not new_subscriber.strip(),
+                     width='stretch'):
+        _candidate = new_subscriber.strip()
+        if not is_valid_email_format(_candidate):
+            st.error(f"'{_candidate}' doesn't look like a valid email address — not added.")
+        else:
+            add_email_subscriber(conn, _candidate)
+            st.success(f"Added {_candidate}.")
+            st.rerun()
+
+    if not all_subscribers:
+        st.caption("No subscribers yet -- add one above.")
+    else:
+        for sub in all_subscribers:
+            rcol1, rcol2, rcol3, rcol4 = st.columns([3, 1.3, 1.3, 1])
+            if sub["unsubscribed"]:
+                rcol1.markdown(f"<span style='opacity:0.5;'>{html.escape(sub['email'])}</span>",
+                                unsafe_allow_html=True)
+                rcol2.markdown(f"<span style='opacity:0.5;color:{COLOR_NEUTRAL};'>Unsubscribed "
+                                f"{fmt_date(sub['unsubscribed_at'])}</span>", unsafe_allow_html=True)
+                rcol3.caption(f"joined {fmt_date(sub['subscribed_at'])}")
+                if rcol4.button("Re-subscribe", key=f"digest_resub_{sub['email']}", width='stretch'):
+                    resubscribe_email(conn, sub["email"])
+                    st.rerun()
+            else:
+                rcol1.markdown(f"**{html.escape(sub['email'])}**", unsafe_allow_html=True)
+                rcol2.markdown(f"<span style='color:{COLOR_BULLISH};'>● Active</span>", unsafe_allow_html=True)
+                rcol3.caption(f"joined {fmt_date(sub['subscribed_at'])}")
+                if rcol4.button("Remove", key=f"digest_remove_{sub['email']}", width='stretch'):
+                    remove_email_subscriber(conn, sub["email"])
+                    st.rerun()
+
+    _email_from_env = os.environ.get("EMAIL_FROM")
+    if _email_from_env:
+        st.caption(f"From address: **{_email_from_env}** (set via EMAIL_FROM environment variable — "
+                   f"overrides the field below until that variable is unset).")
+        from_email = _email_from_env
+    else:
+        from_email = st.text_input(
+            "From email (must be a verified sender/domain identity in your SMTP provider)",
+            value=config["from_email"] or DEFAULT_DIGEST_FROM_EMAIL, key="digest_from_email_input",
+            placeholder="digest@yourdomain.com",
+        )
+
+    c3, c4 = st.columns(2)
+    freq_options = ["daily", "weekdays_only", "off"]
+    freq_labels = {"daily": "Daily", "weekdays_only": "Weekdays only", "off": "Off"}
+    frequency = c3.selectbox(
+        "Frequency", options=freq_options,
+        index=freq_options.index(config["frequency"]) if config["frequency"] in freq_options else 0,
+        format_func=lambda k: freq_labels[k], key="digest_frequency_select",
+    )
+    try:
+        default_time = datetime.strptime(config["send_time_et"] or "07:30", "%H:%M").time()
+    except ValueError:
+        default_time = dt_time(7, 30)
+    send_time = c4.time_input("Send time (ET)", value=default_time, key="digest_send_time_input")
+
+    c5, c6 = st.columns(2)
+    wait_runners = c5.checkbox(
+        "Wait for Runners scan to complete", value=config["wait_for_runners"], key="digest_wait_runners_cb",
+    )
+    wait_predictions = c6.checkbox(
+        "Wait for Day Predictions to complete", value=config["wait_for_predictions"],
+        key="digest_wait_predictions_cb",
+    )
+
+    st.markdown("**Sections to include**")
+    included = set(config["sections_included"])
+    section_cols = st.columns(4)
+    new_included = []
+    for i, key in enumerate(DEFAULT_DIGEST_SECTIONS):
+        checked = section_cols[i % 4].checkbox(
+            DIGEST_SECTION_LABELS[key], value=key in included, key=f"digest_section_cb_{key}",
+        )
+        if checked:
+            new_included.append(key)
+
+    if st.button("Save Email Digest settings", key="digest_save_settings_btn"):
+        _save_kwargs = dict(
+            enabled=enabled, frequency=frequency, send_time_et=send_time.strftime("%H:%M"),
+            wait_for_runners=wait_runners, wait_for_predictions=wait_predictions, sections_included=new_included,
+        )
+        if not _email_from_env:
+            # Only touched when the field is actually editable here --
+            # when EMAIL_FROM is set, the field above is hidden/inert, so
+            # leaving from_email out of this call preserves whatever's
+            # already stored instead of overwriting it with None.
+            _save_kwargs["from_email"] = from_email.strip() or None
+        save_email_config(conn, **_save_kwargs)
+        st.success("Email Digest settings saved.")
+        st.rerun()
+
+    ready, reasons = is_daily_digest_ready(conn)
+    st.caption(f"Readiness right now: {'✅ ready' if ready else '⏳ not ready — ' + ' '.join(reasons)}")
+
+    bcol1, bcol2 = st.columns(2)
+    if bcol1.button("👁️ Preview Today's Digest", key="digest_preview_btn"):
+        st.session_state["_digest_preview_open"] = True
+    if bcol2.button(
+        "📨 Send Test Email Now", key="digest_send_test_btn",
+        disabled=not (smtp_configured and active_count),
+        help="Sends immediately to every active subscriber above over real SMTP (Featured Stock + chart "
+             "included), bypassing the schedule/duplicate-send guard." if smtp_configured
+             else "Set SMTP_HOST/SMTP_USER/SMTP_PASSWORD first.",
+    ):
+        with st.spinner("Building today's digest (Featured Stock AI Briefing + chart)..."):
+            result = run_daily_digest_send(conn, force=True)
+        if result.get("sent"):
+            st.success(f"Test email sent to: {', '.join(result.get('recipients_sent') or [])}.")
+            if result.get("recipients_failed"):
+                st.warning(f"Failed for: {', '.join(result['recipients_failed'])}.")
+        else:
+            st.error(f"Send failed: {result.get('reason')}")
+        st.rerun()
+
+    if st.session_state.get("_digest_preview_open"):
+        with st.expander("👁️ Today's Digest Preview", expanded=True):
+            since_iso = config["last_digest_sent_at"] or (datetime.utcnow() - timedelta(hours=24)).isoformat()
+            with st.spinner("Building preview (Featured Stock AI Briefing + chart)..."):
+                featured_ticker = select_featured_stock(conn)
+                featured_stock = get_featured_stock_section(featured_ticker, conn) if featured_ticker else None
+                chart_bytes, chart_cid = (
+                    _build_featured_stock_chart_bytes(featured_ticker, conn) if featured_ticker else (None, None)
+                )
+                preview = build_digest_content(
+                    conn, new_included or DEFAULT_DIGEST_SECTIONS, since_iso,
+                    featured_stock=featured_stock, chart_cid=chart_cid,
+                )
+            st.caption(f"Subject: {preview['subject']}")
+            if preview["market_holiday"]:
+                st.info(f"🎌 Market closed today ({preview['holiday_name']}).")
+            preview_html = preview["html_body"]
+            if chart_bytes and chart_cid:
+                # The real email references the chart via a `cid:` MIME
+                # attachment (email-transport-only, unresolvable inside a
+                # sandboxed web iframe) -- swapped here, PREVIEW ONLY, for
+                # a base64 data: URI so this in-app preview can actually
+                # display the same image the email will show.
+                import base64
+                data_uri = f"data:image/png;base64,{base64.b64encode(chart_bytes).decode()}"
+                preview_html = preview_html.replace(f"cid:{chart_cid}", data_uri)
+            # A genuine sandboxed iframe (not st.markdown) since html_body
+            # is a full standalone <html><body> document -- exactly the
+            # bytes the real email client would render, not a fragment
+            # embedded into this page's own DOM.
+            st.components.v1.html(preview_html, height=700, scrolling=True)
+
+
 def render_settings_tab():
     """SETTINGS tab: full source registry (more room than the sidebar ever
     had), watchlist configuration, and a manual recheck-all button. Both
@@ -2218,6 +2800,9 @@ def render_settings_tab():
         if st.button("Reset to default", width='stretch', key="wl_reset"):
             st.session_state.watchlist = save_watchlist(DEFAULT_STARTER_WATCHLIST)
             st.rerun()
+
+    render_firm_tiers_section()
+    render_email_digest_section()
 
     st.markdown('<div class="smd-section">EARNINGS SIMULATOR TRACK RECORD</div>', unsafe_allow_html=True)
     if st.button("🔄 Reconcile Predictions", key="reconcile_predictions_btn"):
@@ -2806,14 +3391,762 @@ def render_earnings_simulator_tab():
         render_simulator_track_record_panel()
 
 
+_MACRO_IMPACT_BADGE = {
+    "High": ("🔴", COLOR_BEARISH), "Medium": ("🟠", "#e8c547"), "Low": ("⚪", TEXT_SECONDARY),
+}
+
+
+def render_macro_calendar_tab():
+    """MACRO CALENDAR tab (Part 4) -- standalone, ticker-agnostic event
+    log: officially scheduled economic/Fed releases only (FRED + the
+    Fed's published FOMC calendar). Deliberately out of scope: unscheduled
+    events (political press conferences, ad hoc announcements, tariff
+    timing) -- no reliable structured free source exists for those; NEWS
+    and the AI Briefing's catalyst detection cover them once they occur
+    or are formally announced.
+
+    One wide, chronologically-sorted table for the selected window --
+    date/time ET, event name, impact badge, prior/forecast/actual, and
+    watchlist-relevance tags (get_watchlist_relevant_tickers) all in one
+    row per event, no truncation. (An earlier day-column grid version
+    packed 3 st.metric() blocks into 1/5th-page-width columns and was
+    unreadably cramped in practice -- replaced.) forecast_value is
+    always shown as "—" for FRED-sourced events -- FRED has no
+    consensus/forecast concept, only actuals and release dates, and
+    pretending otherwise would be exactly the kind of fabrication this
+    app avoids everywhere else."""
+    st.markdown('<div class="smd-section">MACRO CALENDAR</div>', unsafe_allow_html=True)
+    st.caption(
+        "Officially scheduled economic/Fed releases only, from FRED and the Federal Reserve's published "
+        "FOMC calendar. Unscheduled events (political press conferences, ad hoc announcements, tariff "
+        "timing) are covered by the NEWS tab and the AI Briefing's catalyst detection once they occur or "
+        "are formally announced — this calendar has no reliable free source for those."
+    )
+    conn = get_conn()
+
+    hcol1, hcol2 = st.columns([1, 3])
+    if hcol1.button("🔄 Refresh Calendar", key="macro_calendar_refresh"):
+        with st.spinner("Fetching FRED release schedule + FOMC dates..."):
+            cached_macro_events(conn, force_refresh=True)
+        st.rerun()
+    events = cached_macro_events(conn)
+    if not events:
+        st.warning(
+            "No macro events on record yet — click 🔄 Refresh Calendar. If it stays empty, check "
+            "FRED_API_KEY in SETTINGS' source registry (fred_api row)."
+        )
+        return
+
+    fcol1, fcol2, fcol3 = st.columns(3)
+    weeks_ahead = fcol1.selectbox("Window", ["This week", "Next 2 weeks", "Next 4 weeks", "Next 8 weeks"], index=2)
+    high_only = fcol2.checkbox("High impact only", key="macro_high_only")
+    relevant_only = fcol3.checkbox("Relevant to my watchlist only", key="macro_relevant_only")
+
+    n_weeks = {"This week": 1, "Next 2 weeks": 2, "Next 4 weeks": 4, "Next 8 weeks": 8}[weeks_ahead]
+    today = pd.Timestamp.now(tz="America/New_York").date()
+    window_end = today + timedelta(weeks=n_weeks)
+
+    upcoming = [e for e in events if today.isoformat() <= e["scheduled_date"] <= window_end.isoformat()]
+    if high_only:
+        upcoming = [e for e in upcoming if e["impact_level"] == "High"]
+
+    # Relevance is computed once per event_type per render (cheap -- pure
+    # DB reads of already-cached fundamentals, no live fetch) rather than
+    # once per event, since every CPI row shares the same relevant set.
+    relevance_cache = {}
+    def _relevant_for(event_type):
+        if event_type not in relevance_cache:
+            relevance_cache[event_type] = get_watchlist_relevant_tickers(conn, event_type, watchlist)
+        return relevance_cache[event_type]
+
+    if relevant_only:
+        upcoming = [e for e in upcoming if _relevant_for(e["event_type"])]
+
+    if not upcoming:
+        st.info("No matching events in this window.")
+        return
+
+    # One wide, chronologically-sorted table for the whole window --
+    # replaces the original day-column grid (Streamlit's st.metric()
+    # blocks truncate hard in a narrow column, and 5 simultaneous
+    # columns each with 3 sub-metrics + 3 caption lines was unreadably
+    # cramped in practice). A single table shows every field in full,
+    # scrolls naturally for a long window, and stays scannable.
+    upcoming_sorted = sorted(upcoming, key=lambda e: (e["scheduled_date"], e["scheduled_time_et"] or ""))
+    st.caption(
+        f"{len(upcoming_sorted)} event(s), {today.isoformat()} to {window_end.isoformat()}. Forecast is always "
+        f"blank for FRED-sourced events (CPI/PCE/NFP/GDP/Retail Sales/Jobless Claims) — FRED has no consensus/"
+        f"forecast concept, only actuals and release dates."
+    )
+    table_rows = []
+    for ev in upcoming_sorted:
+        dot, _ = _MACRO_IMPACT_BADGE.get(ev["impact_level"], ("⚪", TEXT_SECONDARY))
+        relevant = _relevant_for(ev["event_type"])
+        # Display-only shortening -- the real event_name (used in hover
+        # text, expanders, reconciliation notes, etc.) is never touched,
+        # this table cell alone was getting cut off by the long SEP
+        # suffix regardless of column width.
+        display_name = ev["event_name"].replace(" + Summary of Economic Projections", " (+SEP)")
+        table_rows.append({
+            "Date": ev["scheduled_date"], "Day": pd.Timestamp(ev["scheduled_date"]).strftime("%a"),
+            "Time (ET)": _format_et_time_12h(ev["scheduled_time_et"]) or "—",
+            "Event": display_name, "Impact": f"{dot} {ev['impact_level']}",
+            "Prior": ev.get("prior_value") or "—", "Forecast": ev.get("forecast_value") or "—",
+            "Actual": ev.get("actual_value") or "—",
+            "Relevant to your watchlist": ", ".join(relevant) if relevant else "—",
+        })
+    # Explicit pixel widths, not "small"/"medium"/"large" -- those still
+    # truncated long event names and multi-ticker relevance lists
+    # (confirmed live: "Nonfarm Payrolls (Employment Situatio…" and
+    # "FOMC Rate Decision + Summary of Econ…" both got cut off). Short
+    # columns pinned small so the two text-heavy columns get real room;
+    # the table scrolls horizontally rather than truncating if it still
+    # doesn't fit.
+    st.dataframe(
+        pd.DataFrame(table_rows), width='stretch', hide_index=True,
+        column_config={
+            "Date": st.column_config.TextColumn(width="small"),
+            "Day": st.column_config.TextColumn(width="small"),
+            "Time (ET)": st.column_config.TextColumn(width="small"),
+            "Impact": st.column_config.TextColumn(width="small"),
+            "Prior": st.column_config.TextColumn(width="small"),
+            "Forecast": st.column_config.TextColumn(width="small"),
+            "Actual": st.column_config.TextColumn(width="small"),
+            "Event": st.column_config.TextColumn(width=320),
+            "Relevant to your watchlist": st.column_config.TextColumn(width=280),
+        },
+    )
+
+    with st.expander("About this calendar's relevance tags"):
+        st.caption(
+            "Simple, defensible rules, not a model: FOMC/rate decisions flag high-beta (>1.5) names, "
+            "Financial Services, and REITs; CPI/PCE flag consumer discretionary/staples and rate-sensitive "
+            "sectors (Real Estate, Financial Services, Utilities); Jobs Reports (NFP) flag high-beta names "
+            "specifically as a broad-market proxy. GDP/Retail Sales/Jobless Claims have no rule defined yet, "
+            "so no tickers are flagged for them rather than guessing. Beta/sector come from each ticker's "
+            "already-cached fundamentals."
+        )
+
+
+# --------------------------------------------------------------------------
+# SWING FORECAST tab
+# --------------------------------------------------------------------------
+
+def _swing_trading_day_number(event_date_str):
+    """Which trading day of the swing window (1-indexed, counting from
+    today) event_date_str falls on -- small local helper, not a data_
+    engine function, since it's only ever used for this tab's own
+    display formatting (check_earnings_collision computes an equivalent
+    day_num for its own earnings_date internally, but that's a separate,
+    brand-new function this same build already owns -- no existing
+    "working feature" is touched either way)."""
+    try:
+        ed = pd.Timestamp(event_date_str).date()
+    except (TypeError, ValueError):
+        return None
+    day_num, d = 0, date.today()
+    while d < ed:
+        d = d + timedelta(days=1)
+        if d.weekday() < 5:
+            day_num += 1
+    return day_num
+
+
+def render_swing_verdict_panel(ticker, conn, forecast, horizon_days):
+    st.markdown('<div class="smd-section">OVERALL VERDICT</div>', unsafe_allow_html=True)
+    move_pct = (forecast["target_price"] / forecast["current_price"] - 1) * 100
+    dot = "🟢" if forecast["predicted_direction"] == "UP" else "🔴" if forecast["predicted_direction"] == "DOWN" else "⚪"
+
+    vcol1, vcol2, vcol3, vcol4 = st.columns(4)
+    vcol1.metric("Current price", f"${forecast['current_price']:.2f}")
+    vcol2.metric(f"Target ({horizon_days}d, {forecast['target_date']})", f"${forecast['target_price']:.2f}", f"{move_pct:+.2f}%")
+    vcol3.metric(
+        "Confidence band (p10-p90)",
+        f"${forecast['band_low']:.2f} – ${forecast['band_high']:.2f}" if forecast.get("band_low") is not None else "—",
+    )
+    vcol4.metric("Confidence", forecast.get("confidence_level") or "—")
+
+    mode_label = {"raw_pattern": "Mode 1: raw pattern", "bayesian": "Mode 2: Bayesian",
+                  "trained_model": "Mode 3: trained model"}.get(forecast["mode"], forecast["mode"])
+    backtest_n = forecast.get("backtest_n") or 0
+    st.markdown(
+        f"**{dot} {forecast['predicted_direction']}** — {ticker} target ${forecast['target_price']:.2f} "
+        f"({move_pct:+.2f}%) by {forecast['target_date']} ({horizon_days} trading days). {mode_label} "
+        f"({backtest_n} reconciled {horizon_days}-day session(s) on record"
+        + (f", avg |error| {forecast['backtest_error_pct']:.2f}%" if forecast.get("backtest_error_pct") is not None else "")
+        + ")."
+    )
+
+    reasoning = []
+    if not forecast.get("briefing_inputs"):
+        reasoning.append(
+            "No AI Briefing on record for this ticker -- the qualitative-verdict component of the lean above "
+            "was skipped (renormalized over technicals + momentum only, see the banner above to generate one)."
+        )
+    tf = forecast.get("trend_features") or {}
+    if tf.get("trend_structure"):
+        reasoning.append(f"Technical structure: {tf['trend_structure']}.")
+    if tf.get("momentum_10d_pct") is not None:
+        reasoning.append(f"10-day momentum: {tf['momentum_10d_pct']:+.2f}%.")
+
+    div_trend = get_divergence_score_trend(ticker, conn)
+    if div_trend.get("trend") not in (None, "no_history", "insufficient_history"):
+        reasoning.append(f"Smart-money conviction score is {div_trend['trend']} (currently {div_trend.get('current')}).")
+
+    rs_trend = get_relative_strength_trend(ticker, conn)
+    if rs_trend.get("trend"):
+        reasoning.append(
+            f"{rs_trend['trend'].capitalize()} its {rs_trend['benchmark']} benchmark over the last "
+            f"{rs_trend['lookback_days']} sessions ({rs_trend['relative_pct']:+.2f} pts relative)."
+        )
+
+    activity = get_recency_weighted_activity(ticker, conn)
+    activity_parts = []
+    if activity.get("insider_net_weighted"):
+        activity_parts.append(f"insider activity net {'buying' if activity['insider_net_weighted'] > 0 else 'selling'} (recency-weighted)")
+    if activity.get("congress_net_weighted"):
+        activity_parts.append(f"congressional activity net {'buying' if activity['congress_net_weighted'] > 0 else 'selling'} (recency-weighted)")
+    if activity_parts:
+        reasoning.append("Recent " + " and ".join(activity_parts) + ".")
+
+    dp_trend = get_dark_pool_trend(ticker, conn)
+    if dp_trend.get("pattern") not in (None, "insufficient_history", "no_clear_trend"):
+        reasoning.append(f"Dark pool signal: {dp_trend['pattern']} pattern over the last {dp_trend.get('n')} sessions.")
+
+    # Part 7 -- never let an in-window macro event sit unacknowledged.
+    events = forecast.get("active_macro_events") or []
+    if events:
+        beta = None
+        try:
+            fund_env = cached_fundamentals(conn, ticker, max_age_hours=12)
+            beta = (fund_env.get("data") or {}).get("info", {}).get("beta")
+        except Exception:
+            beta = None
+        for ev in events:
+            try:
+                relevant = get_watchlist_relevant_tickers(conn, ev["event_type"], [ticker])
+            except Exception:
+                relevant = []
+            beta_note = f", and {ticker}'s beta of {beta:.2f} puts it in the flagged-sensitive group" if (relevant and beta) else ""
+            day_num = _swing_trading_day_number(ev["scheduled_date"])
+            day_txt = f"Day {day_num}" if day_num else ev["scheduled_date"]
+            # Anti-hallucination fix (Part 3): the impact reasoning below is
+            # ALWAYS grounded in either a real Polymarket probability or this
+            # ticker's own backtested historical reaction -- never a bare
+            # directional assertion, via get_macro_event_grounded_reasoning
+            # (the same function the MACRO EVENTS table below cites, so the
+            # two can never disagree).
+            grounded = get_macro_event_grounded_reasoning(ticker, conn, ev, horizon_days)
+            reasoning.append(
+                f"This {horizon_days}-day window includes a {ev['event_name']} on {day_txt} "
+                f"({ev['scheduled_date']}, {ev['impact_level']} impact){beta_note}. {grounded['text']}"
+            )
+
+    if reasoning:
+        st.markdown("**Reasoning:**")
+        for r in reasoning:
+            st.caption(f"• {r}")
+
+
+def render_swing_macro_events_section(ticker, conn, forecast, horizon_days):
+    st.markdown('<div class="smd-section">MACRO EVENTS IN THIS WINDOW</div>', unsafe_allow_html=True)
+    events = forecast.get("active_macro_events") or []
+    if not events:
+        st.caption(f"No scheduled economic/Fed events within this {horizon_days}-day window.")
+        return
+
+    event_ids = [e["event_id"] for e in events]
+    placeholders = ",".join("?" * len(event_ids))
+    detail_rows = conn.execute(
+        f"SELECT event_id, prior_value, forecast_value FROM macro_events WHERE event_id IN ({placeholders})",
+        event_ids,
+    ).fetchall()
+    detail_map = {r[0]: {"prior": r[1], "forecast": r[2]} for r in detail_rows}
+
+    grounding_label = {"polymarket": "📊 Polymarket", "backtest": "📈 Backtested", "none": "— No data"}
+    table_rows = []
+    grounded_texts = []
+    for ev in events:
+        day_num = _swing_trading_day_number(ev["scheduled_date"])
+        try:
+            relevant = get_watchlist_relevant_tickers(conn, ev["event_type"], [ticker])
+        except Exception:
+            relevant = []
+        det = detail_map.get(ev["event_id"], {})
+        # Anti-hallucination fix (Part 3): grounded, not asserted -- see
+        # get_macro_event_grounded_reasoning's own docstring. Same call the
+        # OVERALL VERDICT reasoning above uses, so the two never disagree.
+        grounded = get_macro_event_grounded_reasoning(ticker, conn, ev, horizon_days)
+        table_rows.append({
+            "Event": ev["event_name"],
+            "Date": ev["scheduled_date"],
+            "Time (ET)": _format_et_time_12h(ev.get("scheduled_time_et")) or "—",
+            "Day of window": f"Day {day_num} of {horizon_days}" if day_num else "—",
+            "Impact": ev["impact_level"],
+            "Prior": det.get("prior") or "—",
+            "Forecast": det.get("forecast") or "—",
+            f"{ticker} relevance": "⚠️ Flagged sensitive" if relevant else "—",
+            "Impact reasoning grounded in": grounding_label.get(grounded["grounded_in"], "—"),
+        })
+        grounded_texts.append(f"**{ev['event_name']}** ({ev['scheduled_date']}): {grounded['text']}")
+    st.dataframe(pd.DataFrame(table_rows), width='stretch', hide_index=True,
+                 key=f"swing_macro_events_{ticker}_{horizon_days}")
+    with st.expander("Full impact reasoning per event (grounded)", expanded=False):
+        for t in grounded_texts:
+            st.caption(t)
+
+
+def render_swing_price_chart(ticker, conn, forecast, horizon_days):
+    hist = get_history(conn, "price_history", ticker, days_back=60)
+    if hist is None or hist.empty:
+        return
+    hist["date"] = pd.to_datetime(hist["date"])
+    hist = hist.sort_values("date")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=hist["date"], y=hist["close"], mode="lines", line=dict(color=ACCENT, width=2), name="Close",
+    ))
+    target_color = (
+        COLOR_BULLISH if forecast["predicted_direction"] == "UP"
+        else COLOR_BEARISH if forecast["predicted_direction"] == "DOWN" else COLOR_NEUTRAL
+    )
+    target_ts = pd.Timestamp(forecast["target_date"])
+
+    # Bug fix: render the CACHED simulated daily-step path (real drift +
+    # random-shock + Brownian-bridge texture, generated once at commit
+    # time by log_swing_forecast -- see simulate_multiday_path) instead
+    # of a straight 2-point ruler line from today's price to the target.
+    committed_path = get_committed_swing_path(conn, ticker, horizon_days, forecast["session_date"])
+    if committed_path:
+        path_x = [pd.Timestamp(d) for d, _ in committed_path]
+        path_y = [p for _, p in committed_path]
+    else:
+        path_x, path_y = [hist["date"].iloc[-1], target_ts], [forecast["current_price"], forecast["target_price"]]
+    fig.add_trace(go.Scatter(
+        x=path_x, y=path_y, mode="lines+markers", line=dict(color=target_color, width=2, dash="dash"),
+        marker=dict(size=5), name=f"{horizon_days}d projected path",
+    ))
+    all_y = list(hist["close"]) + path_y
+    if forecast.get("band_low") is not None and forecast.get("band_high") is not None:
+        fig.add_trace(go.Scatter(
+            x=[target_ts, target_ts], y=[forecast["band_low"], forecast["band_high"]],
+            mode="lines", line=dict(color=TEXT_MUTED, width=6), opacity=0.35, name="Confidence band (p10-p90)",
+        ))
+        all_y += [forecast["band_low"], forecast["band_high"]]
+
+    events = forecast.get("active_macro_events") or []
+    add_macro_event_markers(fig, events, y_bottom=min(all_y) * 0.99)
+
+    fig.update_yaxes(title_text="Price ($)")
+    st.plotly_chart(
+        apply_theme(fig, height=380, legend=dict(orientation="h", y=-0.25, bgcolor="rgba(0,0,0,0)")),
+        width='stretch', key=f"swing_price_chart_{ticker}_{horizon_days}",
+    )
+    render_macro_event_expander(events)
+
+
+def render_swing_strategy_section(ticker, conn, forecast, horizon_days):
+    st.markdown('<div class="smd-section">OPTIONS STRATEGY</div>', unsafe_allow_html=True)
+    strategy = recommend_swing_strategy(ticker, conn, forecast)
+    st.caption(md_safe(strategy["note"]))
+    if strategy.get("caution"):
+        st.warning(md_safe(strategy["caution"]))
+
+    candidates = strategy["candidates"]["calls"] + strategy["candidates"]["puts"]
+    if not candidates:
+        st.caption(strategy.get("note") or "No candidates matched the delta/liquidity filters for this ticker's chain right now.")
+        return
+
+    market = get_market_pricing_signals(ticker, conn)
+    for i, c in enumerate(candidates):
+        type_color = COLOR_BULLISH if c["type"] == "call" else COLOR_BEARISH
+        badge_defs = [
+            ("delta", DELTA_BADGE_COLORS, None), ("iv", IV_BADGE_COLORS, None),
+            ("vol_oi", None, VOL_OI_PROFILES), ("dte", None, None),
+            ("theta", None, THETA_PCT_PROFILES), ("spread", None, SPREAD_PROFILES),
+        ]
+        badges_html = []
+        for key, color_map, tier_profiles in badge_defs:
+            b = c["badges"].get(key) or {}
+            label = b.get("label")
+            if color_map is not None:
+                color = color_map.get(label, COLOR_NEUTRAL)
+            elif tier_profiles is not None:
+                color = _tier_escalation_color(label, tier_profiles)
+            else:
+                color = COLOR_NEUTRAL
+            badges_html.append(interp_badge_html(label, color, b.get("note")))
+
+        delta_txt = f"{c['delta']:.2f}" if c.get("delta") is not None else "—"
+        gamma_txt = f"{c['gamma']:.4f}" if c.get("gamma") is not None else "—"
+        theta_txt = f"-${abs(c['theta']) * 100:.2f}/day" if c.get("theta") is not None else "—"
+        vega_txt = f"${c['vega'] * 100:.2f}" if c.get("vega") is not None else "—"
+        greeks_html = (
+            f'<div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:14px;font-size:12px;'
+            f'color:{TEXT_SECONDARY};">'
+            f'<span>Delta: <b style="color:{TEXT_PRIMARY};">{delta_txt}</b></span>'
+            f'<span>Gamma: <b style="color:{TEXT_PRIMARY};">{gamma_txt}</b></span>'
+            f'<span>Theta: <b style="color:{TEXT_PRIMARY};">{theta_txt}</b></span>'
+            f'<span>Vega: <b style="color:{TEXT_PRIMARY};">{vega_txt}</b></span>'
+            f'</div>'
+        )
+        st.markdown(f"""
+        <div class="smcard">
+          <div style="display:flex;justify-content:space-between;align-items:baseline;">
+            <div style="font-size:15px;font-weight:700;color:{TEXT_PRIMARY};">
+              <span style="color:{type_color};">{c['type'].upper()}</span>
+              ${c['strike']:g} &mdash; {html.escape(str(c['expiration']))}
+            </div>
+            <div style="font-size:12px;color:{TEXT_MUTED};">{c.get('dte', '—')} DTE</div>
+          </div>
+          <div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:4px;">{"".join(badges_html)}</div>
+          {greeks_html}
+        </div>
+        """, unsafe_allow_html=True)
+
+        analysis = analyze_swing_contract(ticker, conn, c, forecast, market=market)
+        if not analysis:
+            st.caption("Not enough data to simulate this contract (missing price/IV/DTE).")
+            continue
+
+        pop = analysis["probability_of_profit"]
+        max_profit_txt = "Uncapped" if c["type"] == "call" else f"${c['strike'] * 100:,.0f} (if stock → $0)"
+        scol1, scol2, scol3, scol4, scol5 = st.columns(5)
+        scol1.metric("Net Debit", f"${analysis['net_debit']:,.0f}")
+        scol2.metric("Max Loss", f"${analysis['max_loss']:,.0f}")
+        scol3.metric("Max Profit", max_profit_txt)
+        scol4.metric("Chance of Profit", f"{pop:.0%}" if pop is not None else "—")
+        scol5.metric("Breakeven", f"${analysis['breakeven']:.2f}" if analysis["breakeven"] else "—")
+
+        pl_fig = render_pl_curve_chart(analysis["pl_curve"], analysis["pl_curve_earnings"], forecast["current_price"])
+        if pl_fig is not None:
+            st.plotly_chart(pl_fig, width='stretch', key=f"swing_plcurve_{ticker}_{horizon_days}_{i}")
+
+        st.markdown(f"*{md_safe(analysis['reasoning'])}*")
+
+        decomp_rows = [{
+            "Scenario": s["scenario"], "Price move": f"{s['price_move_pct']:+.1f}%",
+            "Target option price": f"${s['target_option_price']:.2f}",
+            "P/L ($)": f"{s['pl_dollar']:+,.2f}", "P/L (%)": f"{s['pl_pct']:+.1f}%",
+        } for s in analysis["contract_pl"]["scenarios"]]
+        st.dataframe(pd.DataFrame(decomp_rows), width='stretch', hide_index=True,
+                     key=f"swing_decomp_{ticker}_{horizon_days}_{i}")
+
+        with st.expander("Detailed grid — price × date"):
+            hm_fig = render_pl_heatmap_chart(analysis["heatmap"])
+            if hm_fig is not None:
+                st.plotly_chart(hm_fig, width='stretch', key=f"swing_heatmap_{ticker}_{horizon_days}_{i}")
+            else:
+                st.caption("Not enough data to build the detailed grid for this contract.")
+
+    gamma_evo = get_gamma_evolution(ticker, conn, horizon_days)
+    expiries = gamma_evo.get("expiries") if isinstance(gamma_evo, dict) else None
+    if expiries:
+        with st.expander("Gamma exposure by expiry (within this horizon)"):
+            gamma_rows = [{
+                "Expiration": e["expiration"], "Net gamma exposure": f"{e['net_gamma_exposure']:,.0f}",
+                "Top strikes": ", ".join(f"${s['strike']:g} ({s['net_gamma_exposure']:+,.0f})" for s in e["top_strikes"]),
+            } for e in expiries]
+            st.dataframe(pd.DataFrame(gamma_rows), width='stretch', hide_index=True,
+                         key=f"swing_gamma_evo_{ticker}_{horizon_days}")
+
+
+def render_swing_backtest_report(ticker, conn, horizon_days):
+    rows, latest_run = get_swing_backtest_report_data(conn, ticker, horizon_days)
+    if not latest_run:
+        st.caption("No backtest on record yet for this ticker/horizon.")
+        return
+    track = get_swing_forecast_track_record(conn, ticker=ticker, horizon_days=horizon_days)
+    with st.expander(f"📊 Backtest Report — {ticker} ({horizon_days}d)", expanded=True,
+                      key=f"swing_backtest_report_{ticker}_{horizon_days}"):
+        st.caption(
+            f"Based on {track['n']} reconciled {horizon_days}-day session(s) (backtested + live). "
+            f"Last backtest run: {latest_run['run_at'][:19].replace('T', ' ')} UTC, covering "
+            f"{latest_run['date_range_start']} to {latest_run['date_range_end']} "
+            f"({latest_run['qualifying_sessions_found']} of the last {latest_run['lookback_days']} trading days)."
+        )
+        scol1, scol2, scol3 = st.columns(3)
+        scol1.metric("Sessions backtested", latest_run["sessions_backtested"])
+        scol2.metric("Avg |error|", f"{latest_run['mean_abs_error_pct']:.2f}%"
+                     if latest_run["mean_abs_error_pct"] is not None else "—")
+        scol3.metric("Directional accuracy", f"{latest_run['direction_accuracy']:.0%}"
+                     if latest_run["direction_accuracy"] is not None else "—")
+
+        calibration = get_active_swing_calibration(conn, horizon_days)
+        st.caption(
+            f"Current calibration bias correction for {horizon_days}-day forecasts: "
+            f"drift_scale={calibration['drift_scale']:.2f}, vol_scale={calibration['vol_scale']:.2f} "
+            f"(1.00/1.00 = no adjustment)."
+        )
+
+        if not rows:
+            st.caption("No backtested rows with a resolved error yet.")
+            return
+        errors = [r["error_pct"] for r in rows if r["error_pct"] is not None]
+        if errors:
+            hist_fig = go.Figure(data=[go.Histogram(x=errors, marker_color=ACCENT, nbinsx=min(20, max(6, len(errors) // 2)))])
+            hist_fig.add_vline(x=0, line=dict(color=TEXT_SECONDARY, width=1, dash="dot"))
+            hist_fig.update_xaxes(title_text="error_pct (actual vs. predicted target, %)")
+            hist_fig.update_yaxes(title_text="Sessions")
+            st.plotly_chart(
+                apply_theme(hist_fig, height=280, margin=dict(l=50, r=30, t=20, b=50)),
+                width='stretch', key=f"swing_backtest_hist_{ticker}_{horizon_days}",
+            )
+
+        ranked = sorted([r for r in rows if r["error_pct"] is not None], key=lambda r: abs(r["error_pct"]))
+        best5, worst5 = ranked[:5], list(reversed(ranked[-5:]))
+
+        def _fmt(r):
+            return {
+                "Date": r["session_date"], "Predicted Target": f"${r['target_price']:.2f}",
+                "Actual Close": f"${r['actual_close_price']:.2f}" if r["actual_close_price"] is not None else "—",
+                "Error %": f"{r['error_pct']:+.2f}%", "Direction correct": "✅" if r["prediction_correct_direction"] else "❌",
+            }
+
+        bcol, wcol = st.columns(2)
+        with bcol:
+            st.markdown("**Best 5 (lowest |error|)**")
+            st.dataframe(pd.DataFrame([_fmt(r) for r in best5]), width='stretch', hide_index=True,
+                         key=f"swing_backtest_best5_{ticker}_{horizon_days}")
+        with wcol:
+            st.markdown("**Worst 5 (highest |error|)**")
+            st.dataframe(pd.DataFrame([_fmt(r) for r in worst5]), width='stretch', hide_index=True,
+                         key=f"swing_backtest_worst5_{ticker}_{horizon_days}")
+
+
+def render_swing_forecast_tab():
+    st.markdown('<div class="smd-section">SWING FORECAST</div>', unsafe_allow_html=True)
+    st.caption(
+        "Multi-day (3/5/10 trading session) directional + magnitude forecast for ANY ticker, not scoped "
+        "to the watchlist — reuses Day Prediction's and Earnings Simulator's backtest-first calibration, "
+        "Mode 1/2/3 honesty system, and macro-event linkage, adapted for a multi-day horizon instead of a "
+        "single session or a single earnings event."
+    )
+    conn = get_conn()
+
+    scol1, scol2 = st.columns([3, 1])
+    sw_ticker = scol1.text_input(
+        "Ticker", value=st.session_state.get("swing_ticker", ""), label_visibility="collapsed",
+        placeholder="e.g. NVDA, MU, STX", key="swing_ticker_input",
+    )
+    horizon_days = scol2.selectbox(
+        "Horizon", SWING_HORIZON_OPTIONS, index=1, key="swing_horizon_select",
+        format_func=lambda h: f"{h} trading days",
+    )
+    if not sw_ticker:
+        return
+    sw_ticker = sw_ticker.strip().upper()
+    st.session_state["swing_ticker"] = sw_ticker
+
+    # Prerequisite (bug fix): the AI Briefing's qualitative synthesis
+    # (catalysts, verdicts) is one of the swing lean's three inputs (see
+    # _swing_directional_lean's 0.30 weight) -- previously silently
+    # skipped with no indication to the user when missing. Surfaced here,
+    # not auto-triggered (same paid-API confirmation discipline as
+    # TICKER DEEP-DIVE): reuses the EXACT SAME confirmation dialog
+    # (_confirm_ai_briefing_dialog, unmodified) via the same
+    # ai_brief_pending_ticker session-state flag TICKER DEEP-DIVE's own
+    # trigger check already watches for every rerun -- no new dialog or
+    # API-call path added, just a second place that can set the flag.
+    ai_brief = get_cached_ai_brief(conn, sw_ticker, max_age_hours=AI_BRIEF_CACHE_HOURS)
+    if ai_brief:
+        fetched_dt = pd.to_datetime(ai_brief.get("_fetched_at"), utc=True, errors="coerce")
+        age_label = "recently"
+        if pd.notna(fetched_dt):
+            age_h = (pd.Timestamp.now(tz="UTC") - fetched_dt).total_seconds() / 3600
+            age_label = f"{age_h * 60:.0f}m ago" if age_h < 1 else f"{age_h:.1f}h ago"
+        st.caption(f"🧠 Using the AI Briefing generated {age_label} as this forecast's qualitative input.")
+    else:
+        bcol1, bcol2 = st.columns([4, 1.4])
+        bcol1.warning(
+            f"No AI Briefing on record for {sw_ticker} yet. It's one of this forecast's three directional-lean "
+            f"inputs (technicals, momentum, and the Briefing's own qualitative verdict) — without it the "
+            f"forecast still runs, just on technicals/momentum alone. Recommended before relying too heavily "
+            f"on the verdict below."
+        )
+        if bcol2.button("🧠 Generate AI Briefing", width='stretch', key=f"swing_gen_briefing_{sw_ticker}"):
+            st.session_state["ai_brief_pending_ticker"] = sw_ticker
+
+    has_daily = conn.execute("SELECT 1 FROM price_history WHERE ticker=? LIMIT 1", (sw_ticker,)).fetchone()
+    if not has_daily:
+        with st.spinner(f"Preparing {sw_ticker} — downloading price history + running backtests..."):
+            readiness = ensure_ticker_data_ready(sw_ticker, conn, bootstrap_swing_horizons=[horizon_days])
+    else:
+        readiness = ensure_ticker_data_ready(sw_ticker, conn, bootstrap_swing_horizons=[horizon_days])
+
+    if not readiness["ready"]:
+        st.error(f"⛔ **{sw_ticker}** — {' '.join(readiness['still_missing']) or 'No reliable price history available.'}")
+        return
+    if readiness["fetched_now"]:
+        st.caption("ℹ️ " + "; ".join(readiness["fetched_now"]))
+
+    forecast = compute_swing_forecast(sw_ticker, conn, horizon_days)
+    if not forecast.get("ready"):
+        st.info(f"⏳ **{sw_ticker}** — {forecast.get('wait_message', 'Waiting for data.')}")
+        return
+
+    log_swing_forecast(conn, sw_ticker, forecast)
+
+    render_swing_verdict_panel(sw_ticker, conn, forecast, horizon_days)
+    render_swing_macro_events_section(sw_ticker, conn, forecast, horizon_days)
+
+    ec = forecast.get("earnings_collision") or {}
+    if ec.get("collision"):
+        st.warning(ec["warning"])
+
+    render_swing_price_chart(sw_ticker, conn, forecast, horizon_days)
+    render_swing_strategy_section(sw_ticker, conn, forecast, horizon_days)
+
+    st.markdown('<div class="smd-section">BACKTEST REPORT</div>', unsafe_allow_html=True)
+    render_swing_backtest_report(sw_ticker, conn, horizon_days)
+
+
+# --------------------------------------------------------------------------
+# 📍 WATCHLIST SIGNALS -- auto-derived entry zones (Part 1) + synthesized,
+# tier-weighted rating signals (Part 3/4). The background scan
+# (refresh_all_entry_zones/check_entry_zones/check_rating_changes) runs
+# elsewhere (the sidebar-adjacent fragment, Part 6) -- this tab is a pure
+# read surface (plus a per-ticker force-recompute button) over the same
+# entry_zones/seen_analyst_actions tables that scan writes to. No manual
+# entry-zone input anywhere.
+# --------------------------------------------------------------------------
+
+_ZONE_STATUS_STYLE = {
+    "in_zone": ("IN ZONE", COLOR_BULLISH),
+    "above": ("ABOVE ZONE", COLOR_RETAIL),
+    "below": ("BELOW ZONE", COLOR_NEUTRAL),
+    "no_zone": ("NO ZONE", COLOR_NEUTRAL),
+    None: ("NOT YET COMPUTED", COLOR_NEUTRAL),
+}
+
+_RATING_SIGNAL_STYLE = {
+    "UPGRADE": ("UPGRADE", COLOR_BULLISH),
+    "DOWNGRADE": ("DOWNGRADE", COLOR_BEARISH),
+    "MIXED": ("MIXED", COLOR_RETAIL),
+    "QUIET": ("QUIET", COLOR_NEUTRAL),
+}
+
+
+def render_watchlist_signals_tab():
+    conn = get_conn()
+
+    # "Since your last visit" baseline (Part 4): the marker from the
+    # PREVIOUS visit, used to compute this render's summary -- only
+    # overwritten to "now" at the very end, after everything below has
+    # already used the old value. A first-ever visit (marker is None)
+    # treats everything currently on record as new, per load_watchlist_
+    # signals_last_viewed's own documented fallback.
+    last_viewed = load_watchlist_signals_last_viewed()
+    since_baseline = last_viewed or "1970-01-01T00:00:00"
+    signals_since = get_watchlist_signals_since(conn, since_baseline)
+    n_zones, n_actions = len(signals_since["triggered_zones"]), len(signals_since["new_actions"])
+
+    st.markdown('<div class="smd-section">📍 WATCHLIST SIGNALS</div>', unsafe_allow_html=True)
+    if last_viewed is None:
+        st.caption(f"Welcome — {n_zones} ticker(s) currently in their auto-derived entry zone, {n_actions} "
+                   f"rating action(s) on record.")
+    else:
+        st.caption(f"Since your last visit ({time_ago(last_viewed)}): {n_zones} ticker(s) entered their "
+                   f"entry zone, {n_actions} new analyst rating action(s) recorded.")
+
+    # ---- SECTION A: 🎯 Entry Zones (auto-derived -- Part 1) ----
+    st.markdown('<div class="smd-section">🎯 Entry Zones</div>', unsafe_allow_html=True)
+    st.caption(
+        "Auto-derived per ticker from technical support structure, its own backtested forward-return "
+        "distribution, and its current divergence score -- no manual range entry. Recomputes automatically "
+        "in the background (hourly at most); use Recompute to force a refresh."
+    )
+    zones_by_ticker = {z["ticker"]: z for z in get_entry_zones(conn)}
+    enriched = []
+    for t in watchlist:
+        z = zones_by_ticker.get(t)
+        if z is None:
+            status = None
+        elif z.get("entry_low") is None:
+            status = "no_zone"
+        else:
+            status = z["last_zone_status"]
+        enriched.append({"ticker": t, "zone": z, "price": get_latest_cached_price(conn, t), "status": status})
+    # Tickers currently IN ZONE sort to the top (Part 4), then alphabetical.
+    enriched.sort(key=lambda e: (e["status"] != "in_zone", e["ticker"]))
+
+    for e in enriched:
+        t, z, price, status = e["ticker"], e["zone"], e["price"], e["status"]
+        badge_txt, badge_color = _ZONE_STATUS_STYLE.get(status, _ZONE_STATUS_STYLE[None])
+        hcol1, hcol2 = st.columns([6, 1])
+        hcol1.markdown(
+            f"**{t}**&nbsp;&nbsp;<span class='chip' style='border-color:{badge_color};color:{badge_color};'>"
+            f"{'⭐ ' if status == 'in_zone' else ''}{badge_txt}</span>",
+            unsafe_allow_html=True,
+        )
+        if hcol2.button("🔄 Recompute", key=f"wsig_recompute_{t}", help="Force-recompute this ticker's entry zone"):
+            refresh_entry_zone(conn, t, force_refresh=True)
+            st.rerun()
+        if z is None:
+            st.caption("Not yet computed for this ticker — the background scan will populate it shortly.")
+        elif z.get("entry_low") is None:
+            st.caption(z.get("reasoning") or "No entry zone could be derived for this ticker yet.")
+        else:
+            days_in_zone_txt = ""
+            if status == "in_zone" and z["zone_entered_at"]:
+                try:
+                    entered = pd.Timestamp(z["zone_entered_at"])
+                    entered = entered.tz_localize("UTC") if entered.tzinfo is None else entered
+                    days_in_zone_txt = f" — {(pd.Timestamp.now(tz='UTC') - entered).days}d in zone"
+                except (TypeError, ValueError):
+                    days_in_zone_txt = ""
+            target_txt = f"${z['implied_target_price']:.2f}" if z.get("implied_target_price") is not None else "—"
+            price_txt = f"${price:.2f}" if price is not None else "—"
+            st.markdown(
+                f"Range **${z['entry_low']:.2f}-${z['entry_high']:.2f}** · current {price_txt} · "
+                f"target **{target_txt}**{days_in_zone_txt}"
+            )
+            st.caption(z.get("reasoning") or "")
+        st.markdown("<hr style='margin:6px 0;opacity:0.12;'>", unsafe_allow_html=True)
+
+    # ---- SECTION B: 📈 Rating Changes (synthesized, tier-weighted -- Part 3/4) ----
+    st.markdown('<div class="smd-section">📈 Rating Changes</div>', unsafe_allow_html=True)
+    st.caption(
+        "One synthesized signal per ticker, weighted by the issuing firm's real market-impact tier -- not a "
+        "flat list treating every firm equally. Full raw list available per ticker on expand."
+    )
+    signal_rows = [synthesize_rating_signal(t, conn) for t in watchlist]
+    # Real directional/mixed activity sorts above a quiet ticker, then alphabetical.
+    signal_rows.sort(key=lambda s: (s["signal"] == "QUIET", s["ticker"]))
+    for sig in signal_rows:
+        badge_txt, badge_color = _RATING_SIGNAL_STYLE.get(sig["signal"], _RATING_SIGNAL_STYLE["QUIET"])
+        driving = sig.get("driving_action")
+        driving_txt = (
+            f"{driving['firm']} ({driving['tier_label']}) {driving['action']} → "
+            f"{driving['to_grade'] or '—'} ({fmt_date(driving['action_date'])})"
+        ) if driving else "No rating activity on record."
+        st.markdown(
+            f"**{sig['ticker']}**&nbsp;&nbsp;<span class='chip' style='border-color:{badge_color};"
+            f"color:{badge_color};'>{badge_txt}</span>&nbsp;&nbsp;{driving_txt}",
+            unsafe_allow_html=True,
+        )
+        if sig["all_actions"]:
+            with st.expander(f"Show all {sig['n_actions']} action(s)"):
+                rows = [{
+                    "Firm": a["firm"], "Tier": a["tier_label"],
+                    "Grade change": (
+                        f"{a['from_grade']} → {a['to_grade']}" if a.get("from_grade") and a.get("to_grade")
+                        else (a.get("to_grade") or "—")
+                    ),
+                    "Action": a["action"], "Date": fmt_date(a["action_date"]),
+                } for a in sig["all_actions"]]
+                st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
+
+    # Resets the "since your last visit" marker to now -- AFTER everything
+    # above has already used the old baseline, so this visit's own newly-
+    # triggered zones/rating actions are correctly shown as new THIS time,
+    # and only stop being flagged starting next visit.
+    save_watchlist_signals_last_viewed()
+
+
 # --------------------------------------------------------------------------
 # Sidebar
 # --------------------------------------------------------------------------
-
-if "watchlist" not in st.session_state:
-    st.session_state.watchlist = load_watchlist()
-
-watchlist = st.session_state.watchlist
 
 # EARNINGS SIMULATOR Part 11 -- automatic daily reconciliation. Keyed on
 # today's date in session_state (not a bare "has this run" flag), so a
@@ -2834,6 +4167,29 @@ if st.session_state.get("last_auto_reconcile_date") != _today_str:
     # for whenever that same-day trigger didn't fire (e.g. the app wasn't
     # open at close and only reconciled on the next load).
     calibrate_day_prediction_model(get_conn())
+    # MACRO CALENDAR: force_refresh=True (not just the normal 24h TTL)
+    # so a new day always gets a real pull here, regardless of what time
+    # yesterday's last fetch happened to land at -- a plain 24h-TTL check
+    # could still be "not stale yet" minutes into a new calendar day.
+    # Streamlit has no standalone background scheduler, so this is the
+    # closest equivalent to "refresh at day start": the first session
+    # that touches the app after midnight (local time) triggers it, same
+    # pattern as the reconciliation calls just above. For a guaranteed
+    # refresh even with the app never opened overnight, an OS-level cron
+    # calling `python3 -c "import data_engine as de; "
+    # "de.cached_macro_events(de.get_connection(), force_refresh=True)"`
+    # would be the real fixed-12:01am equivalent -- outside what a
+    # Streamlit script can trigger on its own.
+    cached_macro_events(get_conn(), force_refresh=True)
+    # SWING FORECAST Part 8 -- same idempotent-when-nothing-pending
+    # reconciliation + calibration pattern, additive to the block above.
+    # reconcile_swing_forecasts is horizon-agnostic (one pass covers every
+    # horizon_days at once); calibration is scoped per horizon_days, so it
+    # loops SWING_HORIZON_OPTIONS same as the Backtested Tickers registry
+    # would for any other per-horizon setting.
+    reconcile_swing_forecasts(get_conn())
+    for _h in SWING_HORIZON_OPTIONS:
+        calibrate_swing_forecast_model(get_conn(), _h)
     st.session_state["last_auto_reconcile_date"] = _today_str
 
 st.sidebar.markdown(
@@ -2851,6 +4207,62 @@ if st.sidebar.button("⟳  REFRESH DATA", width='stretch'):
     st.cache_data.clear()
     get_health(force=True)
     st.rerun()
+
+# --------------------------------------------------------------------------
+# WATCHLIST SIGNALS background scan (Part 6): refresh_all_entry_zones()
+# (auto-derives every watchlist ticker's zone -- the scheduler-driven
+# replacement for the old manual form, itself TTL-gated so a real
+# recompute only happens hourly even on a 5-min scan interval) + check_
+# entry_zones() (unchanged price-vs-zone status logic) + check_
+# rating_changes(). All reuse RUNNERS' own persisted refresh-interval
+# setting (load_runners_refresh_interval) and the identical
+# st.fragment(run_every=...) mechanism, rather than building a second
+# scheduler -- this fragment isn't tied to any one tab's widget, so it
+# runs regardless of which tab is currently open (satisfying "on app
+# load" too, since a fresh session's first full script run executes this
+# unconditionally). No UI here -- the WATCHLIST SIGNALS tab and the daily
+# digest email both read the resulting state directly, rather than this
+# fragment rendering anything itself.
+# --------------------------------------------------------------------------
+
+_signals_run_every = {"On demand": None, "5 min": "5m", "15 min": "15m", "1 hour": "1h"}[
+    load_runners_refresh_interval()
+]
+
+
+def _scan_watchlist_signals_fragment():
+    _conn = get_conn()
+    refresh_all_entry_zones(_conn, watchlist)
+    check_entry_zones(_conn)
+    check_rating_changes(_conn, watchlist)
+    # Email Digest: checked on the SAME timer as everything else in this
+    # fragment -- while a browser tab stays open and connected, this is
+    # what gives the "retry every N minutes" behavior the digest needs.
+    # run_daily_digest_send(force=False) first asks should_send_daily_
+    # digest_now() (a cheap pure decision, no AI Briefing call or chart
+    # render) and only builds the Featured Stock section + chart + sends
+    # when that says ready -- safe to call on every tick. See should_
+    # send_daily_digest_now's own docstring for the full honesty note on
+    # why this is NOT a real background scheduler.
+    try:
+        run_daily_digest_send(_conn, force=False)
+    except Exception as _digest_err:
+        print(f"[run_daily_digest_send] unexpected error: {_digest_err}")
+
+
+st.fragment(run_every=_signals_run_every)(_scan_watchlist_signals_fragment)()
+
+# Catch-up path: also checked once on every FULL page load/rerun (not
+# just the fragment's own timer above), so a browser opened/reloaded
+# late in the day still gets same-day digest delivery on that visit,
+# rather than depending on a tab having stayed open and ticking since
+# send_time_et. Cheap (a few DB reads when nothing is due, since
+# should_send_daily_digest_now's decision gates everything expensive)
+# and self-guarded, safe to call unconditionally here.
+try:
+    run_daily_digest_send(get_conn(), force=False)
+except Exception as _digest_err:
+    print(f"[run_daily_digest_send] unexpected error (full-load path): {_digest_err}")
 
 _quiver_note = (
     "QUIVER_API_KEY set — congressional trades use QuiverQuant (paid)."
@@ -2881,7 +4293,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs(
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12, tab13, tab14 = st.tabs(
     [
         "DIVERGENCE MAP",
         "OPTIONS FLOW",
@@ -2894,6 +4306,9 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs(
         "RUNNERS",
         "SETTINGS",
         "EARNINGS SIMULATOR",
+        "MACRO CALENDAR",
+        "SWING FORECAST",
+        "📍 WATCHLIST SIGNALS",
     ]
 )
 
@@ -2932,8 +4347,9 @@ with tab2:
     if f["price_df"].empty:
         st.warning(f"No price data for {sel}.")
     else:
-        st.plotly_chart(render_price_chart(f["price_df"].tail(120), sel, mode="candlestick"),
-                        width='stretch', key=f"opt_price_chart_{sel}")
+        opt_fig, opt_macro_events = render_price_chart(f["price_df"].tail(120), sel, mode="candlestick")
+        st.plotly_chart(opt_fig, width='stretch', key=f"opt_price_chart_{sel}")
+        render_macro_event_expander(opt_macro_events)
 
     latest_fetch_row = q(
         "SELECT MAX(fetch_date) AS d FROM options_flow WHERE ticker=?", (sel,)
@@ -3399,6 +4815,27 @@ def render_backtest_report(ticker, conn, key_prefix="dd"):
                          key=f"backtest_worst5_{key_prefix}_{ticker}")
 
 
+def render_macro_event_note(prediction_row, conn):
+    """Part 5.4 -- if this prediction has any active_macro_event_ids
+    (populated at commit time by log_day_prediction, see MACRO CALENDAR),
+    surface it plainly right under the chart: labeling only, never a
+    directional claim ("stock will move because of X") -- that needs
+    real reconciled history to learn from, which this labeling is what
+    accumulates toward. No-op if the list is empty."""
+    event_ids = prediction_row.get("active_macro_event_ids") or []
+    if not event_ids:
+        return
+    events = get_macro_events_by_id(conn, event_ids)
+    if not events:
+        return
+    names = "; ".join(
+        f"{e['event_name']} ({e['scheduled_date']}"
+        f"{', ' + _format_et_time_12h(e['scheduled_time_et']) if e.get('scheduled_time_et') else ''})"
+        for e in events
+    )
+    st.caption(f"📅 Note: {names} was scheduled within 48h of this session.")
+
+
 def render_prediction_comparison_table(ticker, conn, committed, session_date, key_prefix):
     """Predicted-vs-actual comparison table for one session, read off the
     committed row's own cached simulated path via _predicted_price_at_time
@@ -3491,13 +4928,15 @@ def render_last_session_full(ticker, conn):
         # its last-session chart forever, exactly like the earlier bug.
         track = get_day_prediction_track_record(conn, ticker=ticker)
         try:
-            fig = render_day_prediction_chart(
+            fig, chart_macro_events = render_day_prediction_chart(
                 ticker, last, intraday_hist if not intraday_hist.empty else None,
                 track.get("mean_abs_error_pct"), track.get("n"),
             )
             st.plotly_chart(fig, width='stretch', key=f"last_session_chart_{ticker}_{last['session_date']}")
+            render_macro_event_expander(chart_macro_events)
         except RuntimeError as e:
             st.caption(f"⛔ Could not render last session's chart: {e}")
+        render_macro_event_note(last, conn)
         render_prediction_comparison_table(ticker, conn, last, last["session_date"], key_prefix="lastsession")
         if last["reconciled_at"] and last["actual_close_price"] is not None:
             outcome = (
@@ -4420,9 +5859,23 @@ with tab8:
     conn_news = get_conn()
     st.caption("Feeds are managed in the SETTINGS tab → **News Feeds** (add, remove, enable/disable).")
 
+    # Defensive, on top of the real fix (get_conn() is now per-thread,
+    # not one globally-shared connection) -- this exact loop is what hit
+    # the live crash, so it gets its own explicit belt-and-suspenders
+    # guard: one ticker's fetch failing (whatever the cause) surfaces as
+    # a soft warning and moves on, never takes down the whole page.
+    _news_fetch_errors = []
     with st.spinner("Pulling news across the watchlist...") if force_news else nullcontext():
         for t in watchlist:
-            cached_news(conn_news, t, limit=8, max_age_hours=2, force_refresh=force_news)
+            try:
+                cached_news(conn_news, t, limit=8, max_age_hours=2, force_refresh=force_news)
+            except Exception as e:
+                _news_fetch_errors.append((t, str(e)))
+    if _news_fetch_errors:
+        st.warning(
+            "News fetch failed for: " + ", ".join(f"{t} ({err})" for t, err in _news_fetch_errors)
+            + " -- other tickers below are unaffected."
+        )
     if force_news:
         st.cache_data.clear()
 
@@ -4521,6 +5974,12 @@ def render_day_prediction_chart(ticker, committed, intraday_hist, backtest_error
         hour=16, minute=0, tz=model_start_time.tz,
     )
 
+    # Part 6: macro events scheduled on this session's own date -- fetched
+    # here, but the actual markers aren't drawn until price data (below)
+    # is known, since the hover-dot needs a real y_bottom to sit at.
+    macro_events_today = get_macro_events_in_range(get_conn(), session_date, session_date,
+                                                    overlay_impact_filter="auto")
+
     if intraday_hist is not None and not intraday_hist.empty:
         fig.add_trace(go.Candlestick(
             x=intraday_hist.index, open=intraday_hist["Open"], high=intraday_hist["High"],
@@ -4546,9 +6005,18 @@ def render_day_prediction_chart(ticker, committed, intraday_hist, backtest_error
     else:
         est_pct = committed.get("magnitude_estimate_pct")
         error_txt = f"±{est_pct:.1f}% (est., insufficient backtest history)" if est_pct is not None else "±est."
+    # This chart is shared by the live in-progress view (render_day_
+    # prediction_panel) and the closed/reconciled "last session" view
+    # (render_last_session_full) -- `committed` carries reconciled_at in
+    # both cases (None while the session is still open), so that's the
+    # one signal that actually distinguishes them. Previously this said
+    # "MODEL ACTIVE" unconditionally, which read as wrong/confusing on an
+    # already-closed, already-graded session (e.g. WMT's 2026-08-20 chart
+    # still saying "MODEL ACTIVE" hours after close and reconciliation).
+    status_label = "SESSION CLOSED" if committed.get("reconciled_at") else "MODEL ACTIVE"
     fig.add_vrect(
         x0=model_start_time, x1=market_close, fillcolor="rgba(0,229,255,0.06)", line_width=0,
-        annotation_text=f"MODEL ACTIVE — {error_txt}", annotation_position="top left",
+        annotation_text=f"{status_label} — {error_txt}", annotation_position="top left",
         annotation_font=dict(size=10, color=ACCENT),
     )
 
@@ -4578,6 +6046,20 @@ def render_day_prediction_chart(ticker, committed, intraday_hist, backtest_error
         x=[p[0] for p in simulated_path], y=[p[1] for p in simulated_path], mode="lines",
         line=dict(color="#e8c547", width=2), name="Projected path (simulated)",
     ))
+
+    # Now that real price data is known, draw the macro event line(s) +
+    # hover dot at the true bottom of this chart's combined price range
+    # (candles, simulated path, current/target levels) -- intraday, so
+    # the line positions at the event's real scheduled_time_et, not just
+    # the date.
+    price_lows = [p for _, p in simulated_path] + [model_start_price, target_price, current_price]
+    price_highs = list(price_lows)
+    if intraday_hist is not None and not intraday_hist.empty:
+        price_lows.append(float(intraday_hist["Low"].min()))
+        price_highs.append(float(intraday_hist["High"].max()))
+    y_lo, y_hi = min(price_lows), max(price_highs)
+    y_bottom = y_lo - (y_hi - y_lo) * 0.04
+    add_macro_event_markers(fig, macro_events_today, intraday=True, chart_tz=model_start_time.tz, y_bottom=y_bottom)
 
     fig.add_hline(y=current_price, line=dict(color=TEXT_SECONDARY, width=1, dash="dot"),
                   annotation_text=f"Last: ${current_price:.2f}", annotation_position="right",
@@ -4629,10 +6111,11 @@ def render_day_prediction_chart(ticker, committed, intraday_hist, backtest_error
     # room for either that top-left annotation or the FW TARGET/Last
     # right-edge labels. Both fixed the same way: give the figure real
     # margin instead of relying on default spacing meant for a plain chart.
-    return apply_theme(
+    apply_theme(
         fig, height=height, margin=dict(l=55, r=175, t=75, b=60),
         legend=dict(orientation="h", y=-0.2, bgcolor="rgba(0,0,0,0)"),
     )
+    return fig, macro_events_today
 
 
 def render_day_prediction_panel(ticker, conn, buffer_minutes=DAY_PREDICTION_BUFFER_MINUTES_DEFAULT):
@@ -4712,14 +6195,26 @@ def render_day_prediction_panel(ticker, conn, buffer_minutes=DAY_PREDICTION_BUFF
         # None permanently, so the chart kept saying "insufficient backtest
         # history" forever afterward even once hundreds of backtested
         # sessions existed -- confirmed live on MU/WDC's 2026-08-18 rows.
-        fig = render_day_prediction_chart(
+        fig, chart_macro_events = render_day_prediction_chart(
             ticker, committed, prediction.get("intraday_bars"), prediction.get("backtest_error_pct"),
             prediction.get("backtest_n"),
         )
     except RuntimeError as e:
         st.error(f"⛔ **{ticker}** — {e}")
         return
+    # This request: these 4 blocks previously only showed on the "last
+    # session" (closed) view -- the live view had no equivalent, so the
+    # panel's own composition visibly changed the moment today's session
+    # became ready (right at the model-start buffer), which read as
+    # metrics randomly disappearing. render_last_session_metrics already
+    # uses .get() defensively for the outcome fields, so it's directly
+    # compatible with a live, not-yet-reconciled `committed` row -- it
+    # just shows "Pending"/"—" for Actual close/Error/Direction call
+    # until the session actually closes and reconciles.
+    render_last_session_metrics(committed)
     st.plotly_chart(fig, width='stretch', key=f"day_pred_chart_{ticker}_{prediction['session_date']}")
+    render_macro_event_expander(chart_macro_events)
+    render_macro_event_note(committed, conn)
 
     # Live comparison table (Part 4): Predicted Price at each snapshot's
     # timestamp is read off the SAME cached simulated path the chart plots
@@ -4801,6 +6296,11 @@ with tab9:
     if not runner_rows:
         st.caption("No unusual volume or price moves detected in the current watchlist right now.")
         runner_tickers = []
+        # Email Digest readiness (Part 4): persists even the "zero runners
+        # today" outcome, so is_daily_digest_ready() can tell "scan ran,
+        # found nothing" apart from "scan hasn't run yet" -- purely
+        # additive logging, doesn't change anything this tab displays.
+        log_runners_scan(get_conn(), [])
     else:
         # RUNNERS means the day's top movers, not the full watchlist --
         # capped at 4, sorted most-unusual-first, same ranking as before.
@@ -4809,6 +6309,12 @@ with tab9:
         )
         runners_df = runners_df_full.head(4)
         runner_tickers = runners_df["Ticker"].tolist()
+        # Same additive logging as the empty-runners branch above, just
+        # with the real top-4 rows this tab is about to render.
+        log_runners_scan(get_conn(), [
+            {"ticker": r["Ticker"], "price": r["Price"], "chg_pct": r["Chg %"], "vol_ratio": r["Vol vs 20D avg"]}
+            for r in runners_df.to_dict("records")
+        ])
         styled = runners_df.copy()
         styled["Price"] = styled["Price"].map(lambda v: f"${v:.2f}")
         styled["Chg %"] = styled["Chg %"].map(lambda v: f"{v:+.2f}%" if pd.notna(v) else "—")
@@ -4830,9 +6336,17 @@ with tab9:
     # naturally drops off the moment its ticker leaves the watchlist --
     # SETTINGS' "Configure Watchlist" is the only place that list changes,
     # and this re-filters against it on every rerun.
+    # Persisted to pinned_runners.json (this request) -- previously
+    # session_state-only, so every restart (or even a plain browser
+    # refresh) silently lost every pin. Loaded from disk once per
+    # session, saved back on every add/remove/auto-cleanup so the file
+    # never drifts from what's actually shown.
     if "pinned_runners" not in st.session_state:
-        st.session_state.pinned_runners = []
+        st.session_state.pinned_runners = load_pinned_runners()
+    _pinned_before_cleanup = list(st.session_state.pinned_runners)
     st.session_state.pinned_runners = [t for t in st.session_state.pinned_runners if t in watchlist]
+    if st.session_state.pinned_runners != _pinned_before_cleanup:
+        save_pinned_runners(st.session_state.pinned_runners)
 
     display_tickers = runner_tickers + [t for t in st.session_state.pinned_runners if t not in runner_tickers]
 
@@ -4852,16 +6366,29 @@ with tab9:
         if acol2.button("➕ Add", key="runners_manual_add_btn", disabled=(ticker_to_add == "—"),
                          width='stretch'):
             st.session_state.pinned_runners.append(ticker_to_add)
+            save_pinned_runners(st.session_state.pinned_runners)
             st.rerun()
 
     if display_tickers:
+        # Persisted to runners_refresh_interval.json (this request) --
+        # previously session_state-only, so any full browser reload/
+        # reconnect (a NEW server-side session, not the same one)
+        # silently reset a chosen "5 min" back to "On demand" with zero
+        # visible warning -- confirmed as the real cause behind a
+        # "stuck, not refreshing every 5 min like I set it" report.
+        if "runners_refresh_interval" not in st.session_state:
+            st.session_state["runners_refresh_interval"] = load_runners_refresh_interval()
         rcol1, rcol2 = st.columns([1, 3])
         refresh_choice = rcol1.selectbox(
-            "Refresh interval", ["On demand", "5 min", "15 min", "1 hour"], index=0,
+            "Refresh interval", ["On demand", "5 min", "15 min", "1 hour"],
             key="runners_refresh_interval",
             help="'On demand' (default, matching the rest of this dashboard) only re-evaluates on your next "
-                 "manual interaction. The timed options auto-refresh this section during market hours.",
+                 "manual interaction. The timed options auto-refresh this section during market hours. Your "
+                 "choice is saved and survives a page reload.",
         )
+        if refresh_choice != st.session_state.get("_runners_refresh_interval_saved"):
+            save_runners_refresh_interval(refresh_choice)
+            st.session_state["_runners_refresh_interval_saved"] = refresh_choice
         run_every = {"On demand": None, "5 min": "5m", "15 min": "15m", "1 hour": "1h"}[refresh_choice]
         # Part 2 (prior bug report): the timed refresh options kept firing
         # on their own schedule indefinitely, including hours after the
@@ -4875,12 +6402,24 @@ with tab9:
             run_every = None
 
         def _render_day_predictions_fragment(tickers, pinned):
+            # This request: a visible "last ran" indicator, since the
+            # refresh interval only controls the fragment's OWN timer --
+            # it still fully re-executes on any other rerun too (any
+            # widget touched anywhere on the page), so "every 5 min" was
+            # never a strict guarantee and there was no way to tell when
+            # it had actually last run. Captured fresh every time this
+            # fragment body executes, by definition.
+            st.caption(
+                f"🕐 Last updated: {pd.Timestamp.now(tz='America/New_York').strftime('%-I:%M:%S %p')} ET "
+                f"(refresh: {refresh_choice})"
+            )
             for rt in tickers:
                 hcol1, hcol2 = st.columns([5, 1])
                 hcol1.markdown(f"#### {rt}" + ("  📌 manually added" if rt in pinned else ""))
                 if rt in pinned:
                     if hcol2.button("✕ Remove", key=f"runners_remove_pin_{rt}"):
                         st.session_state.pinned_runners = [p for p in st.session_state.pinned_runners if p != rt]
+                        save_pinned_runners(st.session_state.pinned_runners)
                         st.rerun()
                 render_day_prediction_panel(rt, get_conn())
 
@@ -4904,3 +6443,24 @@ with tab10:
 
 with tab11:
     render_earnings_simulator_tab()
+
+# --------------------------------------------------------------------------
+# Tab 12 — MACRO CALENDAR
+# --------------------------------------------------------------------------
+
+with tab12:
+    render_macro_calendar_tab()
+
+# --------------------------------------------------------------------------
+# Tab 13 — SWING FORECAST
+# --------------------------------------------------------------------------
+
+with tab13:
+    render_swing_forecast_tab()
+
+# --------------------------------------------------------------------------
+# Tab 14 — 📍 WATCHLIST SIGNALS
+# --------------------------------------------------------------------------
+
+with tab14:
+    render_watchlist_signals_tab()

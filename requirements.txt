@@ -4,6 +4,7 @@ pandas>=2.0
 numpy>=1.24
 scipy>=1.11  # swing-point detection (argrelextrema) for detect_technical_levels
 plotly>=5.22
+kaleido>=0.2.1  # static PNG export (fig.to_image) for chart images embedded in the Daily Digest email
 requests>=2.31
 feedparser>=6.0
 beautifulsoup4>=4.12  # MarketBeat/Finviz scraping for the AI briefing's real-data sources
