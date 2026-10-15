@@ -22,13 +22,22 @@ import os
 import pickle
 import random
 import re
+import base64
+import contextlib
+import io
 import smtplib
+from email.utils import formataddr, parseaddr
 import sqlite3
+import statistics
+import subprocess
+import sys
+import tempfile
 import time
+import zipfile
 import urllib.parse
 import uuid
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from email.mime.image import MIMEImage as EmailMIMEImage
 from email.mime.multipart import MIMEMultipart as EmailMIMEMultipart
@@ -43,110 +52,555 @@ from bs4 import BeautifulSoup
 from scipy.signal import argrelextrema
 
 DEFAULT_DB_PATH = "smart_money.db"
-WATCHLIST_CONFIG_PATH = "watchlist.json"
+# --------------------------------------------------------------------------
+# MULTI-USER CONFIG LAYER
+#
+# Everything user-specific (watchlist, pinned runners, refresh interval,
+# chart defaults, the "last viewed" marker) used to live in loose JSON
+# files next to the app, which only works for exactly one person. It now
+# lives in per-user DB rows keyed by the logged-in Google account's email
+# (see the `users` table). Every function below REQUIRES an explicit
+# `user_email` -- there is deliberately no default and no "current user"
+# global, so a call site that forgets to pass one fails loudly with a
+# TypeError instead of silently reading or writing someone else's data.
+#
+# The old JSON files are only ever READ, once, by
+# _migrate_legacy_files_to_user() to seed the bootstrap admin's rows.
+# --------------------------------------------------------------------------
 
-# Fallback starter list only -- used to seed watchlist.json the first time it's
-# created, or when the user explicitly clicks "Reset to default". Not forced:
-# once watchlist.json exists, it -- not this constant -- is the source of truth.
+_LEGACY_WATCHLIST_PATH = "watchlist.json"
+_LEGACY_PINNED_RUNNERS_PATH = "pinned_runners.json"
+_LEGACY_RUNNERS_REFRESH_INTERVAL_PATH = "runners_refresh_interval.json"
+_LEGACY_LAST_VIEWED_PATH = "watchlist_signals_last_viewed.json"
+
+# Owner tag for pre-multiuser rows when BOOTSTRAP_ADMIN_EMAIL wasn't set at
+# migration time. Not a real account -- nobody can log in as this -- so
+# such rows are simply invisible until the bootstrap admin exists, at
+# which point _assign_legacy_data_to_admin() re-homes them.
+LEGACY_UNASSIGNED_OWNER = "__unassigned__"
+
+# Fallback starter list only -- seeded for a brand-new user (or when the
+# user explicitly clicks "Reset to default"). Not forced: once a user has
+# saved a watchlist, theirs -- not this constant -- is the source of truth.
 DEFAULT_STARTER_WATCHLIST = [
     "AAPL", "NVDA", "TSLA", "MSFT", "SPY", "AMD", "META", "AMZN",
     "STX", "WDC", "MU", "LYFT",
 ]
 
+USER_ROLES = ("user", "admin")
 
-def load_watchlist(path=WATCHLIST_CONFIG_PATH):
-    """Load the user's saved watchlist from a local JSON config file.
 
-    Falls back to DEFAULT_STARTER_WATCHLIST (without writing it) if the file
-    is missing, empty, or unreadable -- callers that want the fallback
-    persisted should follow up with save_watchlist().
-    """
+def normalize_email(email):
+    """Google account emails are case-insensitive in practice; every
+    stored/compared identity is lowercased + stripped so 'Luis@Gmail.com'
+    and 'luis@gmail.com' can never become two different users."""
+    return (email or "").strip().lower()
+
+
+def _require_user_email(user_email):
+    email = normalize_email(user_email)
+    if not email:
+        raise ValueError("user_email is required (got empty) -- every per-user call must be scoped.")
+    return email
+
+
+# ---- app_settings (GLOBAL, admin-managed) ----
+
+def get_app_setting(conn, key, default=None):
+    row = conn.execute("SELECT value FROM app_settings WHERE key=?", (key,)).fetchone()
+    return row[0] if row and row[0] is not None else default
+
+
+def set_app_setting(conn, key, value):
+    conn.execute(
+        "INSERT INTO app_settings (key, value) VALUES (?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, value),
+    )
+    conn.commit()
+
+
+# ---- per-user preferences (JSON values) ----
+
+def get_user_pref(conn, user_email, key, default=None):
+    email = _require_user_email(user_email)
+    row = conn.execute(
+        "SELECT value_json FROM user_preferences WHERE user_email=? AND key=?", (email, key)
+    ).fetchone()
+    if not row or row[0] is None:
+        return default
     try:
-        with open(path, "r") as f:
-            tickers = json.load(f)
-        if isinstance(tickers, list) and tickers:
-            return [str(t).strip().upper() for t in tickers if str(t).strip()]
-    except (FileNotFoundError, json.JSONDecodeError, ValueError):
-        pass
-    return list(DEFAULT_STARTER_WATCHLIST)
+        return json.loads(row[0])
+    except (TypeError, ValueError):
+        return default
 
 
-def save_watchlist(tickers, path=WATCHLIST_CONFIG_PATH):
-    """Persist the watchlist to a local JSON config file so it survives restarts."""
+def set_user_pref(conn, user_email, key, value):
+    email = _require_user_email(user_email)
+    conn.execute(
+        """INSERT INTO user_preferences (user_email, key, value_json, updated_at) VALUES (?,?,?,?)
+           ON CONFLICT(user_email, key) DO UPDATE SET
+               value_json=excluded.value_json, updated_at=excluded.updated_at""",
+        (email, key, json.dumps(value), datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+    return value
+
+
+# ---- watchlist ----
+
+def load_watchlist(conn, user_email):
+    """This user's saved watchlist. Falls back to DEFAULT_STARTER_WATCHLIST
+    (without writing it) if they have none saved -- callers that want the
+    fallback persisted should follow up with save_watchlist()."""
+    email = _require_user_email(user_email)
+    rows = conn.execute(
+        "SELECT ticker FROM user_watchlists WHERE user_email=? ORDER BY ticker", (email,)
+    ).fetchall()
+    tickers = [r[0] for r in rows]
+    return tickers if tickers else list(DEFAULT_STARTER_WATCHLIST)
+
+
+def save_watchlist(conn, user_email, tickers):
+    """Replaces this user's watchlist with `tickers` (uppercased, deduped,
+    sorted). Only THIS user's rows are touched."""
+    email = _require_user_email(user_email)
     cleaned = sorted({str(t).strip().upper() for t in tickers if str(t).strip()})
-    with open(path, "w") as f:
-        json.dump(cleaned, f, indent=2)
+    now = datetime.utcnow().isoformat()
+    existing = {r[0]: r[1] for r in conn.execute(
+        "SELECT ticker, added_at FROM user_watchlists WHERE user_email=?", (email,)
+    ).fetchall()}
+    conn.execute("DELETE FROM user_watchlists WHERE user_email=?", (email,))
+    conn.executemany(
+        "INSERT INTO user_watchlists (user_email, ticker, added_at) VALUES (?,?,?)",
+        [(email, t, existing.get(t) or now) for t in cleaned],
+    )
+    conn.commit()
     return cleaned
 
 
-PINNED_RUNNERS_CONFIG_PATH = "pinned_runners.json"
+def get_saved_watchlist(conn, user_email):
+    """The tickers actually SAVED for this user -- unlike load_watchlist,
+    never substitutes the starter list when there are none (used by the
+    admin overview, which should show reality, not a fallback)."""
+    email = _require_user_email(user_email)
+    return [r[0] for r in conn.execute(
+        "SELECT ticker FROM user_watchlists WHERE user_email=? ORDER BY ticker", (email,)).fetchall()]
 
 
-def load_pinned_runners(path=PINNED_RUNNERS_CONFIG_PATH):
-    """Load RUNNERS' manually-pinned tickers from a local JSON file --
-    same pattern as load_watchlist, added after a real bug report: pins
-    were session_state-only and silently vanished on every app restart
-    or even a plain browser refresh. Returns [] (not a starter default --
-    there's no sensible fallback list for "manually added" tickers) if
-    missing/empty/unreadable."""
-    try:
-        with open(path, "r") as f:
-            tickers = json.load(f)
-        if isinstance(tickers, list):
-            return [str(t).strip().upper() for t in tickers if str(t).strip()]
-    except (FileNotFoundError, json.JSONDecodeError, ValueError):
-        pass
+def get_all_watchlist_tickers(conn, active_only=True):
+    """Union of every (active) user's watchlist -- what the GLOBAL shared
+    data pool (full_refresh's price/options/dark-pool/divergence fetches)
+    needs to cover so each user's tickers have data, without any user's
+    refresh having to know about anyone else's. Returns tickers only, never
+    which user owns them."""
+    sql = ("SELECT DISTINCT w.ticker FROM user_watchlists w JOIN users u ON u.email = w.user_email "
+           "WHERE u.active=1 ORDER BY w.ticker") if active_only else \
+          "SELECT DISTINCT ticker FROM user_watchlists ORDER BY ticker"
+    return [r[0] for r in conn.execute(sql).fetchall()]
+
+
+# ---- pinned runners / refresh interval / last-viewed / chart defaults ----
+
+def load_pinned_runners(conn, user_email):
+    """RUNNERS' manually-pinned tickers for this user. [] if none (there's
+    no sensible starter list for "manually added" tickers)."""
+    value = get_user_pref(conn, user_email, "pinned_runners", [])
+    if isinstance(value, list):
+        return [str(t).strip().upper() for t in value if str(t).strip()]
     return []
 
 
-def save_pinned_runners(tickers, path=PINNED_RUNNERS_CONFIG_PATH):
-    """Persist RUNNERS' pinned tickers so they survive restarts -- same
-    pattern as save_watchlist. Order-preserving (not sorted, unlike the
-    watchlist) since pin order is "the order the user added them in,"
-    a meaningful detail save_watchlist's alphabetical sort would lose."""
+def save_pinned_runners(conn, user_email, tickers):
+    """Order-preserving (not sorted, unlike the watchlist) since pin order
+    is "the order the user added them in"."""
     cleaned = []
     for t in tickers:
         u = str(t).strip().upper()
         if u and u not in cleaned:
             cleaned.append(u)
-    with open(path, "w") as f:
-        json.dump(cleaned, f, indent=2)
+    set_user_pref(conn, user_email, "pinned_runners", cleaned)
     return cleaned
 
 
-RUNNERS_REFRESH_INTERVAL_CONFIG_PATH = "runners_refresh_interval.json"
 RUNNERS_REFRESH_INTERVAL_OPTIONS = ["On demand", "5 min", "15 min", "1 hour"]
 
 
-def load_runners_refresh_interval(path=RUNNERS_REFRESH_INTERVAL_CONFIG_PATH):
-    """RUNNERS' selected Day Prediction auto-refresh interval, persisted
-    so it survives restarts/reloads -- added after a real bug report: the
-    dropdown lived only in st.session_state, which Streamlit resets on
-    any full browser reload/reconnect (a NEW server-side session, not
-    the same one), so a selected "5 min" silently reverted to the
-    widget's own default ("On demand") with zero indication anything had
-    changed -- confirmed as the actual cause behind a "stuck, not
-    refreshing" report where the UI still visually showed a stale
-    selection from before the reload. Falls back to the safe default
-    ("On demand") if missing/invalid."""
-    try:
-        with open(path, "r") as f:
-            value = json.load(f)
-        if value in RUNNERS_REFRESH_INTERVAL_OPTIONS:
-            return value
-    except (FileNotFoundError, json.JSONDecodeError, ValueError):
-        pass
-    return "On demand"
+def load_runners_refresh_interval(conn, user_email):
+    """This user's selected auto-refresh interval, persisted so it survives
+    restarts/reloads. Falls back to the safe default ("On demand") if
+    missing/invalid."""
+    value = get_user_pref(conn, user_email, "runners_refresh_interval", "On demand")
+    return value if value in RUNNERS_REFRESH_INTERVAL_OPTIONS else "On demand"
 
 
-def save_runners_refresh_interval(value, path=RUNNERS_REFRESH_INTERVAL_CONFIG_PATH):
-    """Persist the refresh-interval choice -- same pattern as
-    save_pinned_runners/save_watchlist."""
+def save_runners_refresh_interval(conn, user_email, value):
     if value not in RUNNERS_REFRESH_INTERVAL_OPTIONS:
         value = "On demand"
-    with open(path, "w") as f:
-        json.dump(value, f)
+    set_user_pref(conn, user_email, "runners_refresh_interval", value)
     return value
+
+
+def load_chart_defaults(conn, user_email):
+    """Per-user timeframe/chart defaults for the shared chart section:
+    {"interval", "lookback", "refresh"}. Missing/invalid values fall back
+    to the app-wide defaults so a new user's charts behave exactly as they
+    always have."""
+    saved = get_user_pref(conn, user_email, "chart_defaults", {}) or {}
+    interval = saved.get("interval") if saved.get("interval") in INTERVAL_OPTIONS else DEFAULT_INTERVAL
+    lookback = saved.get("lookback") if saved.get("lookback") in LOOKBACK_OPTIONS else DEFAULT_LOOKBACK
+    refresh = saved.get("refresh") if saved.get("refresh") in CHART_REFRESH_OPTIONS else "On demand"
+    return {"interval": interval, "lookback": lookback, "refresh": refresh}
+
+
+def save_chart_defaults(conn, user_email, interval, lookback, refresh):
+    set_user_pref(conn, user_email, "chart_defaults",
+                  {"interval": interval, "lookback": lookback, "refresh": refresh})
+    return load_chart_defaults(conn, user_email)
+
+
+CHART_REFRESH_OPTIONS = ["On demand", "1 min", "5 min"]
+
+
+def load_watchlist_signals_last_viewed(conn, user_email):
+    """Persisted 'last time this user opened the WATCHLIST SIGNALS tab'
+    marker. Returns None (not today) if never set, so a genuine first-ever
+    visit reads as 'everything currently triggered/seen is new,' not
+    'nothing is new.'"""
+    value = get_user_pref(conn, user_email, "watchlist_signals_last_viewed", None)
+    return value if isinstance(value, str) and value else None
+
+
+def save_watchlist_signals_last_viewed(conn, user_email, value=None):
+    value = value or datetime.utcnow().isoformat()
+    set_user_pref(conn, user_email, "watchlist_signals_last_viewed", value)
+    return value
+
+
+# --------------------------------------------------------------------------
+# USERS, ROLES, AND LOGIN AUTHORIZATION
+# --------------------------------------------------------------------------
+
+def get_user(conn, email):
+    email = normalize_email(email)
+    if not email:
+        return None
+    row = conn.execute(
+        "SELECT email, display_name, role, created_at, created_by, last_login_at, active FROM users WHERE email=?",
+        (email,),
+    ).fetchone()
+    if not row:
+        return None
+    cols = ["email", "display_name", "role", "created_at", "created_by", "last_login_at", "active"]
+    user = dict(zip(cols, row))
+    user["active"] = bool(user["active"])
+    return user
+
+
+def list_users(conn):
+    rows = conn.execute(
+        "SELECT email, display_name, role, created_at, created_by, last_login_at, active FROM users "
+        "ORDER BY (role='admin') DESC, email"
+    ).fetchall()
+    cols = ["email", "display_name", "role", "created_at", "created_by", "last_login_at", "active"]
+    users = [dict(zip(cols, r)) for r in rows]
+    for u in users:
+        u["active"] = bool(u["active"])
+    return users
+
+
+def count_users(conn):
+    return conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+
+
+def _count_active_admins(conn, excluding=None):
+    sql = "SELECT COUNT(*) FROM users WHERE role='admin' AND active=1"
+    params = []
+    if excluding:
+        sql += " AND email<>?"
+        params.append(normalize_email(excluding))
+    return conn.execute(sql, params).fetchone()[0]
+
+
+def create_user(conn, email, display_name=None, role="user", created_by=None, seed_defaults=True):
+    """Creates a user (never called from a login attempt except via the
+    BOOTSTRAP_ADMIN_EMAIL gate in authorize_login). Returns the new user
+    dict, or raises ValueError on an invalid email/role or a duplicate.
+    A new user gets a persisted starter watchlist + a default email_config
+    row so every tab has something sensible to render from the first
+    login; an admin can change either via View-as-user."""
+    email = normalize_email(email)
+    if not is_valid_email_format(email):
+        raise ValueError(f"'{email}' doesn't look like a valid email address.")
+    if role not in USER_ROLES:
+        raise ValueError(f"role must be one of {USER_ROLES}, got {role!r}.")
+    if get_user(conn, email):
+        raise ValueError(f"{email} already exists.")
+    conn.execute(
+        "INSERT INTO users (email, display_name, role, created_at, created_by, last_login_at, active) "
+        "VALUES (?,?,?,?,?,NULL,1)",
+        (email, (display_name or "").strip() or None, role, datetime.utcnow().isoformat(),
+         normalize_email(created_by) or None),
+    )
+    conn.commit()
+    if seed_defaults:
+        if not conn.execute("SELECT 1 FROM user_watchlists WHERE user_email=? LIMIT 1", (email,)).fetchone():
+            save_watchlist(conn, email, DEFAULT_STARTER_WATCHLIST)
+        get_email_config(conn, email)
+        ensure_self_subscription(conn, email)
+    return get_user(conn, email)
+
+
+def set_user_active(conn, email, active):
+    """Deactivate/reactivate. Refuses to deactivate the last active admin
+    (that would lock everyone out of the admin console)."""
+    email = normalize_email(email)
+    user = get_user(conn, email)
+    if not user:
+        raise ValueError(f"No such user: {email}")
+    if not active and user["role"] == "admin" and user["active"] and _count_active_admins(conn, excluding=email) == 0:
+        raise ValueError("Can't deactivate the last active admin.")
+    conn.execute("UPDATE users SET active=? WHERE email=?", (int(bool(active)), email))
+    conn.commit()
+
+
+def set_user_role(conn, email, role):
+    """Refuses to demote the last active admin."""
+    email = normalize_email(email)
+    if role not in USER_ROLES:
+        raise ValueError(f"role must be one of {USER_ROLES}, got {role!r}.")
+    user = get_user(conn, email)
+    if not user:
+        raise ValueError(f"No such user: {email}")
+    if role != "admin" and user["role"] == "admin" and user["active"] and _count_active_admins(conn, excluding=email) == 0:
+        raise ValueError("Can't demote the last active admin.")
+    conn.execute("UPDATE users SET role=? WHERE email=?", (role, email))
+    conn.commit()
+
+
+_USER_SCOPED_TABLES = ("user_watchlists", "user_preferences", "entry_zones", "email_subscribers",
+                       "email_config", "runners_scan_log")
+
+
+def delete_user(conn, email):
+    """Hard-deletes the user AND every per-user row they own (watchlist,
+    preferences, entry zones, subscribers, digest config, runners scan
+    log). Shared/global data is untouched. Refuses to delete the last
+    active admin. digest_email_log rows are kept (an audit trail of what
+    was actually sent) but are no longer attributable to a live account."""
+    email = normalize_email(email)
+    user = get_user(conn, email)
+    if not user:
+        raise ValueError(f"No such user: {email}")
+    if user["role"] == "admin" and user["active"] and _count_active_admins(conn, excluding=email) == 0:
+        raise ValueError("Can't delete the last active admin.")
+    for table in _USER_SCOPED_TABLES:
+        conn.execute(f"DELETE FROM {table} WHERE user_email=?", (email,))
+    conn.execute("DELETE FROM users WHERE email=?", (email,))
+    conn.commit()
+
+
+def touch_last_login(conn, email, display_name=None):
+    email = normalize_email(email)
+    if display_name:
+        conn.execute("UPDATE users SET last_login_at=?, display_name=COALESCE(display_name, ?) WHERE email=?",
+                     (datetime.utcnow().isoformat(), display_name, email))
+    else:
+        conn.execute("UPDATE users SET last_login_at=? WHERE email=?", (datetime.utcnow().isoformat(), email))
+    conn.commit()
+
+
+def get_bootstrap_admin_email():
+    return normalize_email(os.environ.get("BOOTSTRAP_ADMIN_EMAIL"))
+
+
+NO_ADMIN_CONFIGURED_MESSAGE = (
+    "No admin configured — set BOOTSTRAP_ADMIN_EMAIL in the environment and restart."
+)
+NOT_REGISTERED_MESSAGE = "Your account isn't registered — contact the administrator."
+DEACTIVATED_MESSAGE = "Your account has been deactivated — contact the administrator."
+EMAIL_NOT_VERIFIED_MESSAGE = "Your Google account's email address isn't verified, so it can't be used to sign in."
+
+
+def authorize_login(conn, email, email_verified=True, display_name=None):
+    """The single authorization decision for an already-authenticated
+    Google identity (Google has proven the person controls `email`; this
+    decides whether that email may use THIS app). Returns
+    {"status": <one of below>, "user": user-dict-or-None, "message": str}:
+
+      ok                  registered + active (last_login_at updated)
+      email_not_verified  Google says the email isn't verified -- refused
+      no_admin_configured users table is EMPTY and BOOTSTRAP_ADMIN_EMAIL
+                          is unset -- a clear setup error, never open
+                          self-registration
+      not_registered      unknown email (including ANY account other than
+                          BOOTSTRAP_ADMIN_EMAIL against an empty table)
+      deactivated         registered but active=0
+
+    Admin bootstrap is an explicit env-var gate, NOT 'first login wins': a
+    stranger who reaches a fresh, publicly-exposed instance first still
+    can't claim admin, because only the account matching
+    BOOTSTRAP_ADMIN_EMAIL is ever auto-created, and only while the users
+    table is empty."""
+    email = normalize_email(email)
+    if not email:
+        return {"status": "not_registered", "user": None, "message": NOT_REGISTERED_MESSAGE}
+    if not email_verified:
+        return {"status": "email_not_verified", "user": None, "message": EMAIL_NOT_VERIFIED_MESSAGE}
+
+    if count_users(conn) == 0:
+        bootstrap = get_bootstrap_admin_email()
+        if not bootstrap:
+            return {"status": "no_admin_configured", "user": None, "message": NO_ADMIN_CONFIGURED_MESSAGE}
+        if email != bootstrap:
+            return {"status": "not_registered", "user": None, "message": NOT_REGISTERED_MESSAGE}
+        create_user(conn, email, display_name=display_name, role="admin", created_by="bootstrap",
+                    seed_defaults=False)
+        _assign_legacy_data_to_admin(conn, email)
+        # Fresh install (nothing legacy to migrate): give the admin a persisted starter watchlist, so
+        # the shared refresh (which covers the union of saved watchlists) has something to cover.
+        if not get_saved_watchlist(conn, email):
+            save_watchlist(conn, email, DEFAULT_STARTER_WATCHLIST)
+        ensure_self_subscription(conn, email)
+        touch_last_login(conn, email)
+        return {"status": "ok", "user": get_user(conn, email), "message": ""}
+
+    user = get_user(conn, email)
+    if not user:
+        return {"status": "not_registered", "user": None, "message": NOT_REGISTERED_MESSAGE}
+    if not user["active"]:
+        return {"status": "deactivated", "user": user, "message": DEACTIVATED_MESSAGE}
+    touch_last_login(conn, email, display_name=display_name)
+    ensure_self_subscription(conn, email)
+    return {"status": "ok", "user": get_user(conn, email), "message": ""}
+
+
+# ---- one-time migration of pre-multiuser data ----
+
+def _read_legacy_json(path):
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, ValueError, OSError):
+        return None
+
+
+def _assign_legacy_data_to_admin(conn, admin_email):
+    """Re-homes every pre-multiuser row (tagged LEGACY_UNASSIGNED_OWNER
+    because no admin email was known when the tables were rebuilt) to the
+    bootstrap admin, and seeds that admin's watchlist/preferences from the
+    legacy JSON files exactly once. Idempotent."""
+    admin_email = normalize_email(admin_email)
+    for table in ("entry_zones", "email_subscribers", "email_config", "runners_scan_log"):
+        # OR IGNORE: if the admin somehow already has a row with the same
+        # key, keep theirs and leave the legacy duplicate unassigned.
+        conn.execute(f"UPDATE OR IGNORE {table} SET user_email=? WHERE user_email=?",
+                     (admin_email, LEGACY_UNASSIGNED_OWNER))
+    conn.execute("UPDATE digest_email_log SET user_email=? WHERE user_email IS NULL", (admin_email,))
+    conn.commit()
+    _migrate_legacy_files_to_user(conn, admin_email)
+
+
+def _migrate_legacy_files_to_user(conn, admin_email):
+    if get_app_setting(conn, "legacy_files_migrated") == "1":
+        return
+    admin_email = normalize_email(admin_email)
+    wl = _read_legacy_json(_LEGACY_WATCHLIST_PATH)
+    if isinstance(wl, list) and wl and not conn.execute(
+        "SELECT 1 FROM user_watchlists WHERE user_email=? LIMIT 1", (admin_email,)
+    ).fetchone():
+        save_watchlist(conn, admin_email, wl)
+    pins = _read_legacy_json(_LEGACY_PINNED_RUNNERS_PATH)
+    if isinstance(pins, list) and pins:
+        save_pinned_runners(conn, admin_email, pins)
+    interval = _read_legacy_json(_LEGACY_RUNNERS_REFRESH_INTERVAL_PATH)
+    if interval in RUNNERS_REFRESH_INTERVAL_OPTIONS:
+        save_runners_refresh_interval(conn, admin_email, interval)
+    last_viewed = _read_legacy_json(_LEGACY_LAST_VIEWED_PATH)
+    if isinstance(last_viewed, str) and last_viewed:
+        save_watchlist_signals_last_viewed(conn, admin_email, last_viewed)
+    set_app_setting(conn, "legacy_files_migrated", "1")
+
+
+def _table_columns(conn, table):
+    return [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]
+
+
+def _migrate_to_multiuser(conn):
+    """Rebuilds entry_zones / email_subscribers / email_config /
+    runners_scan_log from their single-user shapes to per-user primary
+    keys. SQLite can't ALTER a PRIMARY KEY, so each is: rename the old
+    table to <name>_legacy_premultiuser (KEPT, never dropped -- a
+    restorable copy of exactly what existed), create the new-shape table,
+    copy every row across tagged with the owner. Idempotent: a table that
+    already has user_email is left alone. The owner is the bootstrap
+    admin's email if BOOTSTRAP_ADMIN_EMAIL is set, else
+    LEGACY_UNASSIGNED_OWNER (re-homed later by _assign_legacy_data_to_admin
+    when that admin first logs in). email_config's stored from_email (a
+    global sender identity, not a per-user setting) is lifted into
+    app_settings first."""
+    owner = get_bootstrap_admin_email() or LEGACY_UNASSIGNED_OWNER
+
+    def _rebuild(table, new_ddl_table_name, insert_sql):
+        cols = _table_columns(conn, table)
+        if not cols or "user_email" in cols:
+            return False
+        legacy = f"{table}_legacy_premultiuser"
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (legacy,)).fetchone():
+            # A previous, interrupted attempt already renamed it -- don't
+            # clobber that backup; drop only the (empty/partial) new table.
+            raise RuntimeError(f"{legacy} already exists; refusing to overwrite it. Inspect manually.")
+        conn.execute(f"ALTER TABLE {table} RENAME TO {legacy}")
+        _create_table_from_schema(conn, new_ddl_table_name)
+        conn.execute(insert_sql.format(legacy=legacy), (owner,))
+        return True
+
+    # Lift the legacy global sender identity out of the singleton row.
+    ec_cols = _table_columns(conn, "email_config")
+    if ec_cols and "user_email" not in ec_cols:
+        row = conn.execute("SELECT from_email FROM email_config WHERE id=1").fetchone()
+        if row and row[0] and not get_app_setting(conn, "from_email"):
+            set_app_setting(conn, "from_email", row[0])
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        _rebuild("entry_zones", "entry_zones",
+                 """INSERT INTO entry_zones (user_email, ticker, entry_low, entry_high, target_pct,
+                        target_horizon_days, implied_target_price, reasoning, last_zone_status,
+                        zone_entered_at, computed_at, created_at, updated_at)
+                    SELECT ?, ticker, entry_low, entry_high, target_pct, target_horizon_days,
+                        implied_target_price, reasoning, last_zone_status, zone_entered_at, computed_at,
+                        created_at, updated_at FROM {legacy}""")
+        _rebuild("email_subscribers", "email_subscribers",
+                 """INSERT INTO email_subscribers (user_email, email, unsubscribe_token, subscribed_at,
+                        unsubscribed, unsubscribed_at, bounce_count, last_bounce_at)
+                    SELECT ?, email, unsubscribe_token, subscribed_at, unsubscribed, unsubscribed_at,
+                        bounce_count, last_bounce_at FROM {legacy}""")
+        _rebuild("email_config", "email_config",
+                 """INSERT INTO email_config (user_email, recipient_email, from_email, enabled, frequency,
+                        send_time_et, wait_for_runners, wait_for_predictions, sections_included,
+                        last_sent_date, last_digest_sent_at, last_send_status, last_send_error, updated_at)
+                    SELECT ?, recipient_email, from_email, enabled, frequency, send_time_et,
+                        wait_for_runners, wait_for_predictions, sections_included, last_sent_date,
+                        last_digest_sent_at, last_send_status, last_send_error, updated_at
+                    FROM {legacy} WHERE id=1""")
+        _rebuild("runners_scan_log", "runners_scan_log",
+                 """INSERT INTO runners_scan_log (user_email, scan_date, runner_rows_json, scanned_at)
+                    SELECT ?, scan_date, runner_rows_json, scanned_at FROM {legacy}""")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _create_table_from_schema(conn, table):
+    """Runs just the CREATE TABLE IF NOT EXISTS statement for `table` out
+    of SCHEMA (so the migration can never drift from the canonical
+    definition)."""
+    marker = f"CREATE TABLE IF NOT EXISTS {table} ("
+    i = SCHEMA.index(marker)
+    j = SCHEMA.index(");", i) + 2
+    conn.execute(SCHEMA[i:j])
 
 
 DIVERGENCE_LABELS = [
@@ -284,6 +738,21 @@ CREATE TABLE IF NOT EXISTS polymarket_events (
     last_updated TEXT
 );
 
+-- Macro Calendar upgrade (spec item 4) -- append-only timestamped history of CPI Polymarket bracket odds,
+-- captured BEFORE a release (snapshot_live_cpi_odds / get_cpi_bracket_odds' own opportunistic write), so
+-- "the odds as of just before release" can be shown even after Polymarket's own bracket prices have
+-- resolved to a meaningless 100/0. Never updated in place -- a real history, not a single latest value.
+CREATE TABLE IF NOT EXISTS macro_cpi_odds_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    series_key TEXT,
+    scheduled_date TEXT,
+    snapshot_at TEXT,
+    hotter_pct REAL,
+    cooler_pct REAL,
+    combined_volume REAL
+);
+CREATE INDEX IF NOT EXISTS idx_macro_cpi_odds_snapshots ON macro_cpi_odds_snapshots(series_key, scheduled_date, snapshot_at);
+
 CREATE TABLE IF NOT EXISTS divergence_scores (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ticker TEXT,
@@ -351,6 +820,126 @@ CREATE TABLE IF NOT EXISTS fetch_log (
     error_message TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_fetch_log_lookup ON fetch_log(data_type, ticker, fetched_at);
+
+-- Volatility Dislocations screener, Stage 1: the two-tier liquid-options universe. GLOBAL/shared, not
+-- per-user (same status as price_history/options_flow/divergence_scores) -- one screening pool the nightly
+-- scan (Stage 2) reads, same for every user. One row per (as_of_date, ticker); a ticker can appear on
+-- multiple as_of_dates as history accumulates (Tier 1 monthly, Tier 2 nightly), never overwritten across
+-- dates -- ON CONFLICT upserts only within the SAME as_of_date (a same-day re-run updates, doesn't
+-- duplicate).
+CREATE TABLE IF NOT EXISTS universe (
+    as_of_date TEXT NOT NULL,
+    ticker TEXT NOT NULL,
+    tier TEXT NOT NULL,                  -- 'core' | 'spike'
+    price REAL,
+    market_cap REAL,
+    market_cap_bucket TEXT,              -- 'large' | 'mid' | 'small' -- label only, never ranked on
+    dollar_vol_20d REAL,
+    pct_sessions_above_floor REAL,       -- Tier 1's persistence test result (fraction of last 60 sessions
+                                          -- with dollar volume above the $100M floor); NULL for Tier 2 rows
+    atm_oi INTEGER,                      -- measured on the nearest MONTHLY expiry >=14 days out (secondary
+                                          -- proxy; atm_spread_pct is the primary quality gate) -- NOT the
+                                          -- next-week contract, which structurally hasn't built up OI yet
+    atm_spread_pct REAL,
+    days_in_spike INTEGER,               -- Tier 2 only: consecutive qualifying sessions; NULL for Tier 1
+    has_weekly INTEGER,                  -- informational only, NEVER a Tier 1 gate -- decides which period(s)
+                                          -- Stage 2 computes for this ticker (Week needs it, Month doesn't)
+    stay_fail_streak INTEGER DEFAULT 0,  -- hysteresis (Part 3): consecutive monthly rebuilds a CURRENT core
+                                          -- member has failed the (looser) "stay" thresholds; reaching 2
+                                          -- removes it. 0 for a fresh entrant or a passing member. NULL/unused
+                                          -- for Tier 2 rows.
+    PRIMARY KEY (as_of_date, ticker)
+);
+CREATE INDEX IF NOT EXISTS idx_universe_date_tier ON universe(as_of_date, tier);
+
+-- One row per rebuild run (Tier 1 monthly OR Tier 2 nightly) -- the honest "what happened" record Stage 1
+-- explicitly asks for: counts, which filter dropped the most candidates, and (Stage 2 reuses this same
+-- table) duration/attempted/stored/skipped/failed for the nightly implied-move scan.
+CREATE TABLE IF NOT EXISTS universe_rebuild_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_type TEXT NOT NULL,              -- 'tier1_monthly' | 'tier2_nightly' | 'scan_week' | 'scan_month'
+    as_of_date TEXT NOT NULL,
+    started_at TEXT,
+    duration_seconds REAL,
+    candidates_considered INTEGER,
+    attempted INTEGER,
+    stored INTEGER,
+    skipped INTEGER,
+    failed INTEGER,
+    top_filter_drop TEXT,                -- name of the filter that dropped the most candidates
+    filter_drops_json TEXT,              -- {filter_name: count} for every filter, not just the top one
+    notes TEXT
+);
+
+-- Volatility Dislocations, Stage 2: the nightly implied-move scan over Stage 1's universe. Table name
+-- ("scan") kept literally as originally specified. One row per (scan_date, ticker, period) -- period is
+-- 'week' or 'month'; a ticker can have both on the same scan_date. GLOBAL/shared, same as `universe`.
+CREATE TABLE IF NOT EXISTS scan (
+    scan_date TEXT NOT NULL,
+    ticker TEXT NOT NULL,
+    tier TEXT NOT NULL,                    -- copied from universe at scan time ('core' | 'spike')
+    period TEXT NOT NULL,                  -- 'week' | 'month'
+    reference_close REAL,                  -- PREVIOUS close -- bands must not drift intraday
+    expiry TEXT,
+    days_to_expiry INTEGER,                -- 2026-09-25 fix: stored explicitly, same value
+                                            -- _atm_option_snapshot used to pick this row's window/expiry --
+                                            -- shown beside every displayed expiry date, never recomputed
+                                            -- against "today" later (would drift from what was scanned)
+    implied_move_pct REAL,
+    implied_move_abs REAL,
+    atm_iv_pct REAL,                       -- annualized ATM IV -- the comparable-across-horizons metric;
+                                            -- raw implied_move_pct is NOT comparable across different
+                                            -- expiry day-counts, atm_iv_pct already divides that out
+    realized_move_pct REAL,                -- realized_vol_20d scaled to this SAME horizon (identical
+                                            -- sqrt(days/365) scaling as the implied side -- not new math),
+                                            -- so the Stage 3 chart can overlay it directly against the
+                                            -- implied band
+    atm_spread_pct REAL,                   -- always measured/stored, even when gate_mode='provisional'
+                                            -- means it did NOT filter this row out
+    option_volume_total INTEGER,
+    option_volume_vs_20d_avg REAL,         -- NULL ("building") until 20 days of this ticker+period's own
+                                            -- scan history exist
+    atm_open_interest INTEGER,
+    realized_vol_20d REAL,                 -- annualized %, backfilled from price history immediately
+    iv_rv_ratio REAL,                      -- implied_move_pct / realized-move-over-the-same-horizon --
+                                            -- the RANKING metric (IV-based, comparable); raw move % is not
+    move_vs_median_60d REAL,               -- NULL ("building") until 60 days of this ticker+period's own
+                                            -- scan history exist -- informational, no longer the sort key
+    earnings_date TEXT,                    -- read from the already-cached earnings_signal table only --
+                                            -- never force-fetched here (cost/rate-limit reasons)
+    short_float REAL,                      -- read from the already-cached fundamentals_info payload only
+    dollar_volume REAL,                    -- copied from universe.dollar_vol_20d
+    gate_mode TEXT,                        -- 'provisional' | 'spread' -- which UNIVERSE_GATE_MODE was active
+                                            -- when this row's data-quality skip rule ran
+    run_type TEXT,                         -- 'scheduled' | 'on_demand'
+    captured_at TEXT,                      -- ET timestamp when this row's chain was actually fetched --
+                                            -- the Stage 3 tab's "intraday vs post-close" banner reads this
+    PRIMARY KEY (scan_date, ticker, period)
+);
+CREATE INDEX IF NOT EXISTS idx_scan_date_period ON scan(scan_date, period);
+CREATE INDEX IF NOT EXISTS idx_scan_ticker_period ON scan(ticker, period, scan_date);
+
+-- On-demand Volatility Dislocations run progress -- what the new tab's "Run scan now" button polls, since
+-- the actual rebuild+scan runs in a DETACHED background process (never inside the Streamlit request), and
+-- this table (not st.session_state) is what makes progress survive a page refresh. One row per on-demand
+-- run; the tab always reads the single most recent row.
+CREATE TABLE IF NOT EXISTS volatility_scan_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    as_of_date TEXT NOT NULL,
+    status TEXT NOT NULL,                -- 'running' | 'done' | 'failed'
+    stage TEXT,                          -- 'tier1' | 'tier2' | 'scan' -- which phase is currently active
+    started_at TEXT,
+    finished_at TEXT,
+    tickers_total INTEGER,
+    tickers_done INTEGER,
+    core_count INTEGER,
+    spike_count INTEGER,
+    scan_stored INTEGER,
+    scan_skipped INTEGER,
+    scan_failed INTEGER,
+    error_message TEXT,
+    pid INTEGER
+);
 
 CREATE TABLE IF NOT EXISTS fundamentals_info (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -894,6 +1483,62 @@ CREATE TABLE IF NOT EXISTS swing_calibration_log (
     calibrated_at TEXT
 );
 
+-- MULTI-USER (Google OAuth via st.login). `email` is the Google account
+-- email, lowercased -- the identity key for every per-user table below.
+-- role is 'user' or 'admin'. Rows are only ever created by (a) the
+-- BOOTSTRAP_ADMIN_EMAIL gate on an EMPTY table or (b) an admin adding
+-- someone in the ADMIN tab -- never auto-created from an arbitrary login.
+-- NOTE: SQLite parses REFERENCES users(email) on the per-user tables but
+-- does not enforce it unless PRAGMA foreign_keys=ON (off by default and
+-- deliberately left off: the legacy-data migration writes rows for the
+-- bootstrap admin before that admin's first login creates their users
+-- row). Integrity is enforced in application code instead -- every
+-- per-user write goes through a function that takes a validated email.
+CREATE TABLE IF NOT EXISTS users (
+    email TEXT PRIMARY KEY,
+    display_name TEXT,
+    role TEXT DEFAULT 'user',
+    created_at TEXT,
+    created_by TEXT,
+    last_login_at TEXT,
+    active INTEGER DEFAULT 1
+);
+
+-- Digest key/value settings (Snowflake-portable: plain key/value + timestamp). Currently holds
+-- "featured_override:<user_email>" -> {"ticker","mode":"once|sticky","expires_at"} (the manual featured-stock
+-- pick; namespaced per user because each user has their OWN newsletter and watchlist).
+CREATE TABLE IF NOT EXISTS digest_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT,
+    updated_at TIMESTAMP
+);
+
+-- Global (NOT per-user) key/value settings: sender identity, migration
+-- flags. Admin-only to change.
+CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
+
+-- Replaces watchlist.json (one row per user per ticker).
+CREATE TABLE IF NOT EXISTS user_watchlists (
+    user_email TEXT NOT NULL REFERENCES users(email),
+    ticker TEXT NOT NULL,
+    added_at TEXT,
+    PRIMARY KEY (user_email, ticker)
+);
+
+-- Replaces pinned_runners.json / runners_refresh_interval.json /
+-- watchlist_signals_last_viewed.json and holds chart/timeframe defaults.
+-- value_json is any JSON-encodable value.
+CREATE TABLE IF NOT EXISTS user_preferences (
+    user_email TEXT NOT NULL REFERENCES users(email),
+    key TEXT NOT NULL,
+    value_json TEXT,
+    updated_at TEXT,
+    PRIMARY KEY (user_email, key)
+);
+
 -- WATCHLIST SIGNALS -- user-defined entry-zone price alerts + a
 -- recurring analyst rating-change scan (see check_entry_zones/
 -- check_rating_changes near the end of this file), surfaced on the
@@ -910,7 +1555,8 @@ CREATE TABLE IF NOT EXISTS swing_calibration_log (
 -- and WHEN each was derived. last_zone_status/zone_entered_at are still
 -- owned exclusively by check_entry_zones() (unchanged), same as before.
 CREATE TABLE IF NOT EXISTS entry_zones (
-    ticker TEXT PRIMARY KEY,
+    user_email TEXT NOT NULL REFERENCES users(email),  -- multi-user: a zone is per (user, ticker)
+    ticker TEXT NOT NULL,
     entry_low REAL,
     entry_high REAL,
     target_pct REAL,            -- the REAL backtested mean forward-return % used, not a flat assumed default
@@ -921,7 +1567,19 @@ CREATE TABLE IF NOT EXISTS entry_zones (
     zone_entered_at TEXT,
     computed_at TEXT,
     created_at TEXT,
-    updated_at TEXT
+    updated_at TEXT,
+    anchor_kind TEXT,           -- 'swing_support' | 'volume_node' | 'current_price_fallback' -- same
+                                 -- anchor_support["kind"] derive_entry_zone already computes, now also
+                                 -- persisted as its own field (2026-09-25) for the card UI's badge/stats
+    anchor_level REAL,
+    anchor_touches INTEGER,     -- swing_support only, else NULL
+    anchor_volume REAL,         -- volume_node only, else NULL
+    backtest_accuracy REAL,     -- Swing Forecast's own direction_accuracy for this ticker, else NULL
+    backtest_sessions INTEGER,  -- Swing Forecast's own sessions_backtested for this ticker, else NULL
+    divergence_score REAL,      -- derive_entry_zone's own divergence_score read (v2 formula), also
+    divergence_label TEXT,      -- already computed and previously discarded -- persisted 2026-09-25
+                                 -- for the dense-overview table's Divergence column
+    PRIMARY KEY (user_email, ticker)
 );
 
 -- Every (ticker, firm, action_date) analyst action ever seen -- the
@@ -966,6 +1624,8 @@ CREATE TABLE IF NOT EXISTS firm_tiers (
 -- report only tickers whose signal actually changed, not every action.
 CREATE TABLE IF NOT EXISTS digest_email_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_email TEXT,            -- whose digest this was (NULL/legacy rows belong to the bootstrap admin)
+    send_type TEXT DEFAULT 'scheduled',  -- 'scheduled' | 'test' -- see send_daily_digest_email(send_type=)
     sent_at TEXT,
     recipient TEXT,
     entry_zone_count INTEGER,
@@ -980,19 +1640,23 @@ CREATE TABLE IF NOT EXISTS digest_email_log (
 -- instead. The `id=1` CHECK enforces exactly one row ever -- see
 -- get_email_config/save_email_config, the only reader/writer.
 CREATE TABLE IF NOT EXISTS email_config (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
+    user_email TEXT PRIMARY KEY REFERENCES users(email),  -- multi-user: one config row per user
     recipient_email TEXT,
-    from_email TEXT,
+    from_email TEXT,            -- legacy: sender identity is now the GLOBAL app_settings 'from_email'
     enabled INTEGER DEFAULT 0,
-    frequency TEXT DEFAULT 'daily',
+    frequency TEXT DEFAULT 'daily',   -- 'daily' (Mon-Fri) | 'weekly'; legacy 'weekdays_only' == daily, 'off' == disabled
+    weekly_day INTEGER DEFAULT 0,     -- for 'weekly': 0=Mon..4=Fri (weekends are never sent)
     send_time_et TEXT DEFAULT '07:30',
     wait_for_runners INTEGER DEFAULT 1,
     wait_for_predictions INTEGER DEFAULT 1,
     sections_included TEXT,
-    last_sent_date TEXT,
-    last_digest_sent_at TEXT,
+    last_sent_date TEXT,           -- ET calendar date of the last SUCCESSFUL SCHEDULED send only
+    last_digest_sent_at TEXT,      -- tz-aware UTC timestamp (isoformat with offset) of same
     last_send_status TEXT,
     last_send_error TEXT,
+    last_test_sent_at TEXT,        -- separate bookkeeping for "Send Test Email Now" -- NEVER affects the
+    last_test_send_status TEXT,    -- scheduled-send dupe guard above, and vice versa (Part 4's "test sends
+    last_test_send_error TEXT,     -- never count as the daily send")
     updated_at TEXT
 );
 
@@ -1005,14 +1669,61 @@ CREATE TABLE IF NOT EXISTS email_config (
 -- hard failures for one address auto-unsubscribe it rather than letting
 -- SES keep retrying a dead/invalid mailbox indefinitely.
 CREATE TABLE IF NOT EXISTS email_subscribers (
-    email TEXT PRIMARY KEY,
+    user_email TEXT NOT NULL REFERENCES users(email),  -- whose digest this recipient receives
+    email TEXT NOT NULL,
     unsubscribe_token TEXT UNIQUE,
     subscribed_at TEXT,
     unsubscribed INTEGER DEFAULT 0,
     unsubscribed_at TEXT,
     bounce_count INTEGER DEFAULT 0,
-    last_bounce_at TEXT
+    last_bounce_at TEXT,
+    -- 2026-10-13 single-global-edition rebuild: per-subscriber section preferences, defaulting to all
+    -- sections (NULL/missing == all on, never a silently-hidden section by omission). A NEW subscriber
+    -- going forward is seeded with the admin's CURRENT "Sections to include" checkbox state at signup
+    -- time (a copy, not a live reference) -- see add_email_subscriber. Editable by the admin in the
+    -- subscriber list, or by the subscriber themselves via the tokenized "Manage preferences" link
+    -- (same unsubscribe_token, no login) -- "active/inactive" reuses the existing `unsubscribed` flag,
+    -- not a second column.
+    sections_included TEXT,
+    PRIMARY KEY (user_email, email)
 );
+
+-- One global edition per calendar date (2026-10-13 digest rebuild, Part 1) -- the full digest, every
+-- section, built ONCE regardless of how many subscribers or how many times it's previewed/rendered. The
+-- ONE Claude deep-analysis call for a given date happens while building this row and ONLY here; every
+-- subsequent preview/test-send/scheduled-send/Substack-draft reads it back, never rebuilds it (unless the
+-- admin explicitly clicks "Rebuild today's edition"). `content_json` is the raw per-section data dict
+-- (build_digest_content's own `sections` return value, JSON-serialized) -- the reusable source
+-- render_edition_for_recipient re-renders from (via build_digest_content again, passing the ALREADY-BUILT
+-- featured_stock back in, which is what keeps that re-render free of any new API call). `html_full`/
+-- `text_full`/`subject` are the all-sections-included rendering, used as-is for the admin's own preview
+-- default and as the Substack conversion source.
+CREATE TABLE IF NOT EXISTS digest_editions (
+    edition_date TEXT PRIMARY KEY,
+    featured_ticker TEXT,
+    featured_source TEXT,
+    built_at TEXT,
+    content_json TEXT,
+    html_full TEXT,
+    text_full TEXT,
+    subject TEXT,
+    claude_api_calls INTEGER DEFAULT 0,
+    claude_api_cost REAL DEFAULT 0.0
+);
+
+-- "Send to Substack (draft)" tracking (2026-10-13, Part 2) -- one row per attempt, so re-sending the
+-- same edition is visible history, not a silent overwrite. NEVER represents a published post -- this
+-- library only ever creates/updates a draft; publishing is a manual step in Substack's own editor.
+CREATE TABLE IF NOT EXISTS substack_posts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    edition_date TEXT NOT NULL,
+    draft_id TEXT,
+    draft_url TEXT,
+    status TEXT,          -- 'draft_created' | 'failed'
+    created_at TEXT,
+    error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_substack_posts_edition ON substack_posts(edition_date);
 
 -- One row per calendar day RUNNERS' own unusual-activity scan actually
 -- ran (see the RUNNERS tab's scan block in dashboard.py, which is the
@@ -1022,9 +1733,11 @@ CREATE TABLE IF NOT EXISTS email_subscribers (
 -- is purely additive: it does not change what the RUNNERS tab itself
 -- computes or displays.
 CREATE TABLE IF NOT EXISTS runners_scan_log (
-    scan_date TEXT PRIMARY KEY,
+    user_email TEXT NOT NULL REFERENCES users(email),  -- a Runners scan is over ONE user's watchlist
+    scan_date TEXT NOT NULL,
     runner_rows_json TEXT,
-    scanned_at TEXT
+    scanned_at TEXT,
+    PRIMARY KEY (user_email, scan_date)
 );
 
 -- FRED Fed Funds Rate data (Part 7) -- one row per calendar date DFF has
@@ -1116,17 +1829,67 @@ _COLUMN_MIGRATIONS = {
     # every other migration in this table follows.
     "entry_zones": [
         ("implied_target_price", "REAL"), ("reasoning", "TEXT"), ("computed_at", "TEXT"),
+        # 2026-09-25 display fix: derive_entry_zone() already computes anchor_support/swing_backtest as
+        # structured dicts, but refresh_entry_zone only ever persisted the free-text `reasoning` built
+        # from them -- the WATCHLIST SIGNALS card redesign needs the anchor kind/level/touches/volume and
+        # backtest accuracy/sessions as their OWN fields (a clean badge + 3 stat lines) instead of
+        # regex-parsing prose. Same computation, same values, just also saved -- no signal logic changed.
+        ("anchor_kind", "TEXT"), ("anchor_level", "REAL"), ("anchor_touches", "INTEGER"),
+        ("anchor_volume", "REAL"), ("backtest_accuracy", "REAL"), ("backtest_sessions", "INTEGER"),
+        # Dense-overview table (2026-09-25 second follow-up) -- same divergence_score/label
+        # derive_entry_zone already reads, now also persisted for the Divergence column.
+        ("divergence_score", "REAL"), ("divergence_label", "TEXT"),
     ],
     "seen_analyst_actions": [("action", "TEXT")],
     # Featured Stock repeat-avoidance (select_featured_stock) needs to know
     # what was actually featured on past sends -- signals_snapshot_json
     # captures per-ticker signal state, not which ticker was the lead
     # story, so it can't answer "was X featured this week" on its own.
-    "digest_email_log": [("signals_snapshot_json", "TEXT"), ("featured_ticker", "TEXT")],
+    "digest_email_log": [("signals_snapshot_json", "TEXT"), ("featured_ticker", "TEXT"), ("user_email", "TEXT"),
+                         ("send_type", "TEXT")],
     # Sender identity moved off a hardcoded/reused SMTP username (Part 2/4
     # of the SES cutover) -- in-app configurable, with an EMAIL_FROM env
     # var override for deployments that prefer that path instead.
-    "email_config": [("from_email", "TEXT")],
+    "email_config": [("from_email", "TEXT"), ("weekly_day", "INTEGER"),
+                     ("last_test_sent_at", "TEXT"), ("last_test_send_status", "TEXT"), ("last_test_send_error", "TEXT")],
+    # Single-global-edition rebuild (2026-10-13): per-subscriber section prefs, added after
+    # email_subscribers' original CREATE TABLE -- this dev DB already has real subscriber rows.
+    "email_subscribers": [("sections_included", "TEXT")],
+    # Provisional gate (2026-09-25 follow-up, pending Monday 2026-09-28's quote-timing decision.json) +
+    # on-demand runs added after `universe`'s original CREATE TABLE, so an existing smart_money.db (this
+    # dev environment's already has real Stage 1 rows) needs the real migration path, not just new-DB DDL.
+    #
+    # has_weekly/stay_fail_streak: discovered live (2026-09-25, real on-demand run against the real
+    # smart_money.db) that these were ALSO never migrated -- the real file's `universe` table still had
+    # the column under its ORIGINAL name `weeklies_available` (pre-rename) and had no stay_fail_streak
+    # column at all, even though the CREATE TABLE text in this file's SCHEMA string has said has_weekly/
+    # stay_fail_streak for a while: `CREATE TABLE IF NOT EXISTS` never alters an already-existing table, so
+    # a rename that only ever touched the DDL text silently never reached the live file. Added here as new
+    # columns (existing rows get NULL for them, correct -- old rows predate this schema) rather than
+    # `ALTER TABLE ... RENAME COLUMN weeklies_available`, matching this file's own established "never
+    # remove/rename a column, just stop referencing it" migration discipline (see entry_zones' `notes`
+    # column above) -- weeklies_available is left in place, unused, harmless.
+    "universe": [("gate_mode", "TEXT"), ("run_type", "TEXT"), ("has_weekly", "INTEGER"),
+                 ("stay_fail_streak", "INTEGER DEFAULT 0")],
+    # Expiry-window bug fix + IV comparability (2026-09-25 second follow-up) -- `scan` already existed live
+    # with real rows (3 on-demand runs) by the time these were added to its CREATE TABLE text above.
+    "scan": [("days_to_expiry", "INTEGER"), ("atm_iv_pct", "REAL"), ("realized_move_pct", "REAL")],
+    # Macro Calendar upgrade -- real forecast/previous/actual + surprise detection (TradingView primary,
+    # ForexFactory forecast/previous-only fallback, kept alongside the existing FRED/FOMC path unchanged).
+    # series_key is the new fine-grained id (cpi_mom/cpi_yoy/core_cpi_mom/... -- see MACRO_DIRECTION_MAP)
+    # used only by the new surprise/banner/odds logic; the existing event_type/prior_value/forecast_value/
+    # actual_value columns keep being populated exactly as before for every existing reader.
+    "macro_events": [
+        ("series_key", "TEXT"), ("forecast_raw", "REAL"), ("actual_raw", "REAL"), ("prior_raw", "REAL"),
+        ("unit", "TEXT"), ("surprise", "REAL"), ("surprise_direction", "TEXT"),
+        ("forecast_source", "TEXT"), ("prior_source", "TEXT"),
+        # Cross-check only (never a display source) -- set when FRED_API_KEY is configured and FRED's own
+        # actual for the same series/date disagrees with TradingView's beyond rounding tolerance.
+        ("fred_mismatch", "INTEGER"),
+        # Post-release alert idempotency -- set the instant send_macro_alert_email succeeds for this event,
+        # checked by check_and_send_macro_release_alerts so a retried tick never double-sends.
+        ("alert_sent_at", "TEXT"),
+    ],
 }
 
 
@@ -1152,9 +1915,17 @@ def init_db(db_path=DEFAULT_DB_PATH):
         conn.executescript(SCHEMA)
         conn.commit()
         _run_migrations(conn)
+        _migrate_to_multiuser(conn)
         _seed_news_sources(conn)
         _seed_firm_tiers(conn)
-        _migrate_recipient_to_subscribers(conn)
+        # If BOOTSTRAP_ADMIN_EMAIL is already set, re-home any pre-multiuser
+        # rows to that address now (this does NOT create the admin user --
+        # that only ever happens on their own first authenticated login).
+        bootstrap = get_bootstrap_admin_email()
+        if bootstrap:
+            _assign_legacy_data_to_admin(conn, bootstrap)
+        for (u_email,) in conn.execute("SELECT email FROM users").fetchall():
+            ensure_self_subscription(conn, u_email)
     finally:
         conn.close()
 
@@ -2085,16 +2856,31 @@ def fetch_price_history_delta(conn, ticker, full_period="1y", days_back=400, max
     return (merged if not merged.empty else hist), request_desc
 
 
-def cached_fundamentals(conn, ticker, max_age_hours=12, force_refresh=False):
+def cached_fundamentals(conn, ticker, max_age_hours=12, force_refresh=False, price_max_age_hours=None):
     """price_df is delta-loaded via fetch_price_history_delta() -- a full
     tk.history(period="1y") only the first time this ticker is seen, just
     the new days after that (see that function's docstring). Only the
     expensive .get_info()-derived info dict is separately DB-cached on its
     own max_age_hours/should_refetch gate. Returns an envelope:
     {"data": {"ticker","price_df","info","snapshot"}, "source",
-    "cache_hit", "fetched_at"}."""
+    "cache_hit", "fetched_at"}.
+
+    price_max_age_hours (None by default -- every existing caller keeps
+    fetch_price_history_delta's own 4h default, byte-for-byte unchanged)
+    lets a caller request a TIGHTER price freshness window than 4h.
+    Added for RUNNERS (2026-09-30 bug fix): confirmed live that a ticker
+    checked once shortly before/around market open (e.g. 7:55am ET) then
+    genuinely doesn't get re-checked for the full 4h regardless of how
+    stale that leaves an "unusual REAL-TIME activity" scan -- BE/LULU/ORCL
+    were stuck showing the PRIOR session's close mid-morning with no
+    warning shown (market_is_open suppresses the staleness banner). This
+    param does not change what counts as "unusual" or any other Runners
+    logic -- it only controls how often the underlying price data itself
+    is allowed to be rechecked."""
     table = "fundamentals_info"
-    hist, _price_request_desc = fetch_price_history_delta(conn, ticker)
+    hist, _price_request_desc = fetch_price_history_delta(
+        conn, ticker, **({"max_age_hours": price_max_age_hours} if price_max_age_hours is not None else {})
+    )
 
     if hist.empty:
         return {"data": {"ticker": ticker, "price_df": pd.DataFrame(), "info": {}, "snapshot": {}},
@@ -3074,6 +3860,308 @@ def fetch_polymarket(conn, limit=75, keywords=None):
     return inserted
 
 
+POLYMARKET_SEARCH_URL = "https://gamma-api.polymarket.com/public-search"
+
+# Numeric bracket thresholds out of Polymarket's own bucket-market question text. Confirmed live two
+# DIFFERENT real phrasing families exist for CPI bracket markets, not one:
+#   Core CPI (any period): "Will Core CPI MoM be 0.3% in September?" / "...be 0.0% or less..." /
+#                           "...be 0.6% or more..."
+#   Headline CPI -- a SEPARATE Polymarket event family ("September Inflation US - Monthly/Annual") with NO
+#   "cpi"/"core"/"mom"/"yoy" token anywhere in its title or question text:
+#       MoM: "Will monthly inflation increase by 0.3% in September?" / "...stay flat (0.0%) or decrease..."
+#            / "...increase by 0.8% or more..."
+#       YoY: "Will annual inflation be 3.0% in September?" / "...2.9% or less..." / "...4.0% or more..."
+#   This second family is exactly why headline CPI MoM/YoY rows showed "—" while Core rows showed odds --
+#   the old fetch's title filter (`"cpi" not in title`) and the old odds function's per-question "mom"/"yoy"
+#   keyword check both silently excluded it, since none of those tokens appear in its text at all.
+_BRACKET_POINT_RE = re.compile(r"(?:be|by) (-?\d+\.?\d*)% in", re.IGNORECASE)
+_BRACKET_OR_LESS_RE = re.compile(r"(?:be|by) (-?\d+\.?\d*)% or less", re.IGNORECASE)
+_BRACKET_OR_MORE_RE = re.compile(r"(?:be|by) (-?\d+\.?\d*)% or more", re.IGNORECASE)
+_BRACKET_FLAT_OR_LESS_RE = re.compile(r"flat \((-?\d+\.?\d*)%\) or decrease", re.IGNORECASE)
+
+_MONTH_YEAR_RE = re.compile(
+    r"(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})",
+    re.IGNORECASE,
+)
+_MONTH_NAME_TO_NUM = {m: i + 1 for i, m in enumerate(
+    ["january", "february", "march", "april", "may", "june",
+     "july", "august", "september", "october", "november", "december"]
+)}
+
+
+def _classify_cpi_bracket_event(title):
+    """Event-level classification (spec item 3: 'check which CPI measure each matched Polymarket market
+    resolves on... and map each to the matching row') -- robust against both real title families confirmed
+    live: 'Core CPI MoM - <Month> <Year>' and '<Month> Inflation US - Monthly/Annual'. Returns a series_key
+    ('cpi_mom'/'cpi_yoy'/'core_cpi_mom'/'core_cpi_yoy') or None if the title matches neither pattern -- never
+    guessed. (Older alternate title 'Core CPI (ex food and energy) MoM' also classifies correctly: contains
+    both 'core' and 'mom'.)"""
+    t = (title or "").lower()
+    is_core = "core" in t
+    if "mom" in t or "monthly" in t:
+        period = "mom"
+    elif "yoy" in t or "annual" in t:
+        period = "yoy"
+    else:
+        return None
+    return ("core_" if is_core else "") + "cpi_" + period
+
+
+def _extract_period_key(description):
+    """The data month this bracket event covers, e.g. 'September 2026' -> '2026-09' -- parsed from the
+    event's own DESCRIPTION text (always states it explicitly, confirmed live across every event checked;
+    the title alone doesn't always include a year). Returns None if not found -- never guessed, and an
+    event fetch_polymarket_cpi_brackets can't date this way is simply skipped rather than stored
+    ambiguously."""
+    m = _MONTH_YEAR_RE.search(description or "")
+    if not m:
+        return None
+    month_num = _MONTH_NAME_TO_NUM.get(m.group(1).lower())
+    if not month_num:
+        return None
+    return f"{m.group(2)}-{month_num:02d}"
+
+
+def fetch_polymarket_cpi_brackets(conn):
+    """CPI-specific Polymarket bracket markets (spec item 4) -- confirmed live during development that
+    Polymarket runs these as grouped events ("Core CPI MoM - September 2026") each containing several
+    mutually-exclusive Yes/No bucket markets, and confirmed that fetch_polymarket's own existing
+    MACRO_KEYWORDS-based crawl never surfaces them (no "cpi" keyword in that list, and the questions don't
+    contain "inflation"). Uses the Gamma API's public-search endpoint (keyless, confirmed live) instead of
+    _fetch_polymarket_pages' plain /markets listing, since these bracket markets often sit well outside the
+    top-volume slice that endpoint returns.
+
+    TWO searches ("CPI" and "Inflation US") -- confirmed live that the headline CPI MoM/YoY event family
+    ("September Inflation US - Monthly/Annual") doesn't surface under a "CPI" search at all. Every candidate
+    event is required to cite "Bureau of Labor Statistics" in its own description (confirmed live: this is
+    the one reliable marker that distinguishes the real US CPI/Core CPI bracket families from same-named
+    country variants -- Japan/China/UK/Canada/India/Mexico/Brazil/Argentina/South Korea/South Africa
+    inflation events all cite their OWN national statistics agency instead, never BLS) and to have >= 3
+    sub-markets (excludes unrelated single Yes/No events like "BLS delays another CPI release before 2027?").
+
+    Persists each bucket market into the SAME polymarket_events table fetch_polymarket already uses (no new
+    table), tagged with a FULLY-QUALIFIED category `cpi_bracket:{series_key}:{period_key}` (period_key =
+    the exact 'YYYY-MM' data month this event's own description states) -- NOT a bare 'cpi_bracket' category
+    matched by date-proximity, which is what the earlier version of this function did and which was
+    confirmed live to accidentally blend TWO adjacent months' resolved bracket sets together into one
+    nonsensical combined odds figure (August's and September's Core CPI YoY brackets both fell inside a
+    +/-40-day window around September's release date). Exact-period matching in the category itself removes
+    that ambiguity entirely -- get_cpi_bracket_odds no longer does date-window matching at all.
+
+    Returns {"inserted": n, "mapping": [{"event_title", "series_key", "period_key"}, ...]} -- the mapping
+    list is for reporting exactly which Polymarket event resolved which calendar row (spec item 3's "report
+    the mapping per row")."""
+    all_events, seen_slugs = [], set()
+    for query in ("CPI", "Inflation US"):
+        try:
+            resp = requests.get(
+                POLYMARKET_SEARCH_URL, params={"q": query, "limit_per_type": 40},
+                headers={"User-Agent": "Mozilla/5.0"}, timeout=15,
+            )
+            resp.raise_for_status()
+            for ev in resp.json().get("events") or []:
+                slug = ev.get("slug")
+                if slug and slug not in seen_slugs:
+                    seen_slugs.add(slug)
+                    all_events.append(ev)
+        except Exception as e:
+            print(f"[polymarket_cpi_brackets] search '{query}' failed: {e}")
+
+    def _to_float(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    def _as_list(v):
+        if isinstance(v, str):
+            try:
+                return json.loads(v)
+            except (json.JSONDecodeError, TypeError):
+                return []
+        return v or []
+
+    cur = conn.cursor()
+    inserted, mapping = 0, []
+    for ev in all_events:
+        description = ev.get("description") or ""
+        markets = ev.get("markets") or []
+        if "bureau of labor statistics" not in description.lower() or len(markets) < 3:
+            continue
+        series_key = _classify_cpi_bracket_event(ev.get("title"))
+        period_key = _extract_period_key(description)
+        if not series_key or not period_key:
+            continue
+        mapping.append({"event_title": ev.get("title"), "series_key": series_key, "period_key": period_key})
+        category = f"cpi_bracket:{series_key}:{period_key}"
+        for m in markets:
+            outcomes, prices = _as_list(m.get("outcomes")), _as_list(m.get("outcomePrices"))
+            price_map = dict(zip(outcomes, prices))
+            yes_price, no_price = _to_float(price_map.get("Yes")), _to_float(price_map.get("No"))
+            market_id = str(m.get("id") or m.get("conditionId") or m.get("question"))
+            cur.execute(
+                """INSERT INTO polymarket_events
+                       (market_id, question, category, yes_price, no_price, volume, liquidity,
+                        end_date, active, last_updated)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(market_id) DO UPDATE SET
+                       question=excluded.question, category=excluded.category,
+                       yes_price=excluded.yes_price, no_price=excluded.no_price,
+                       volume=excluded.volume, liquidity=excluded.liquidity,
+                       end_date=excluded.end_date, active=excluded.active, last_updated=excluded.last_updated""",
+                (market_id, m.get("question"), category, yes_price, no_price,
+                 _to_float(m.get("volume")), _to_float(m.get("liquidity")),
+                 m.get("endDate"), 1, datetime.utcnow().isoformat()),
+            )
+            inserted += 1
+    conn.commit()
+    return {"inserted": inserted, "mapping": mapping}
+
+
+_CPI_BRACKET_MIN_VOLUME = 10000
+
+
+def _compute_live_cpi_bracket_odds(conn, series_key, period_key, forecast_raw):
+    """Pure bucket math against WHATEVER is currently stored for this exact (series_key, period_key) --
+    live Yes-prices, which read as a resolved 100/0 split once BLS has actually released the data (Polymarket
+    settles the matching bucket to 1.0 and every other to 0.0). Callers must not surface this post-release --
+    see get_cpi_bracket_odds, the public dispatcher that decides live-vs-frozen-snapshot. Returns None if no
+    bracket market is stored for this exact period (never a guess, never a cross-month blend); {'thin_market':
+    True, 'combined_volume': ...} below spec's $10,000 threshold."""
+    rows = conn.execute(
+        "SELECT question, yes_price, volume FROM polymarket_events "
+        "WHERE category=? AND active=1 AND yes_price IS NOT NULL",
+        (f"cpi_bracket:{series_key}:{period_key}",),
+    ).fetchall()
+    if not rows:
+        return None
+    combined_volume = sum(v or 0 for _, _, v in rows)
+    if combined_volume < _CPI_BRACKET_MIN_VOLUME:
+        return {"thin_market": True, "combined_volume": round(combined_volume, 2)}
+
+    hotter, cooler = 0.0, 0.0
+    for question, yes_price, _ in rows:
+        point = _BRACKET_POINT_RE.search(question)
+        flat_or_less = _BRACKET_FLAT_OR_LESS_RE.search(question)
+        or_less = _BRACKET_OR_LESS_RE.search(question)
+        or_more = _BRACKET_OR_MORE_RE.search(question)
+        if point:
+            threshold, is_open_below, is_open_above = float(point.group(1)), False, False
+        elif flat_or_less:
+            threshold, is_open_below, is_open_above = float(flat_or_less.group(1)), True, False
+        elif or_less:
+            threshold, is_open_below, is_open_above = float(or_less.group(1)), True, False
+        elif or_more:
+            threshold, is_open_below, is_open_above = float(or_more.group(1)), False, True
+        else:
+            continue  # unparseable bucket text -- skipped, never guessed
+        if threshold > forecast_raw or (is_open_above and threshold >= forecast_raw):
+            hotter += yes_price
+        elif threshold < forecast_raw or (is_open_below and threshold <= forecast_raw):
+            cooler += yes_price
+
+    total = hotter + cooler
+    if total <= 0:
+        return {"thin_market": True, "combined_volume": round(combined_volume, 2)}
+    return {
+        "thin_market": False, "combined_volume": round(combined_volume, 2),
+        "hotter_pct": round(hotter / total * 100, 1), "cooler_pct": round(cooler / total * 100, 1),
+    }
+
+
+def _cpi_period_key(scheduled_date):
+    """A CPI release on scheduled_date reports the PRIOR calendar month's data -- 'October 2026'
+    release date (e.g. 2026-10-14) -> period_key '2026-09'."""
+    d = pd.Timestamp(scheduled_date).replace(day=1) - timedelta(days=1)
+    return f"{d.year}-{d.month:02d}"
+
+
+def snapshot_live_cpi_odds(conn, now=None):
+    """Spec item 4 -- 'snapshot odds before release... and store them.' Called from full_refresh (and
+    opportunistically from get_cpi_bracket_odds itself on every pre-release read, see below) so a snapshot
+    exists by release time without requiring a dashboard visit at exactly the right moment. For every CPI
+    series_key currently tracked in macro_events with a real forecast but no actual yet, computes the
+    CURRENT live odds and appends one row to macro_cpi_odds_snapshots (append-only -- this is a timestamped
+    history, never updated in place, so 'the latest snapshot before release' is a real query, not a guess).
+    Skips (no row written) wherever _compute_live_cpi_bracket_odds returns None/thin_market -- never stores
+    a fabricated split."""
+    now = now or datetime.utcnow()
+    rows = conn.execute(
+        "SELECT DISTINCT series_key, scheduled_date, forecast_raw FROM macro_events "
+        "WHERE series_key LIKE '%cpi%' AND forecast_raw IS NOT NULL AND actual_raw IS NULL"
+    ).fetchall()
+    written = 0
+    for series_key, scheduled_date, forecast_raw in rows:
+        period_key = _cpi_period_key(scheduled_date)
+        odds = _compute_live_cpi_bracket_odds(conn, series_key, period_key, forecast_raw)
+        if not odds or odds.get("thin_market"):
+            continue
+        conn.execute(
+            "INSERT INTO macro_cpi_odds_snapshots (series_key, scheduled_date, snapshot_at, hotter_pct, "
+            "cooler_pct, combined_volume) VALUES (?,?,?,?,?,?)",
+            (series_key, scheduled_date, now.isoformat(), odds["hotter_pct"], odds["cooler_pct"],
+             odds["combined_volume"]),
+        )
+        written += 1
+    conn.commit()
+    return written
+
+
+def get_cpi_bracket_odds(conn, series_key, scheduled_date, forecast_raw):
+    """Spec items 3-5 -- P(actual > forecast) / P(actual < forecast) from real Polymarket CPI bracket
+    markets for the EXACT data month this release covers (see _cpi_period_key) -- never a cross-month blend
+    (the bug the old date-window version had, confirmed live against real August/September Core CPI YoY
+    data). Returns None -- never a guess -- if series_key isn't a CPI series, forecast_raw is missing, or no
+    bracket event matches this exact period at all ("never force a match"). Returns {'thin_market': True,
+    'combined_volume': ...} below spec's $10,000 threshold -- never a fabricated 50/50 from a market with
+    almost no real volume (the OTHER bug confirmed live: a prior version's over-wide date window silently
+    combined two different months' resolved outcomes into something that read as a coin-flip split).
+
+    Spec item 4 (pre-release snapshot): once this release's actual has landed (macro_events.actual_raw is
+    set), Polymarket's own bracket prices have already resolved to 100/0 and are USELESS as "odds" -- this
+    looks up the LATEST row in macro_cpi_odds_snapshots taken before this event's own scheduled release time
+    instead, tagged {'pre_release': True}. Returns None ('—') if no such snapshot was ever captured -- this
+    is the honest, expected outcome for a release that happened before this feature existed, or any release
+    whose combined bracket volume never crossed $10,000 pre-release (snapshot_live_cpi_odds never stores a
+    thin-market snapshot). Before release, computes live (and opportunistically snapshots this same read, so
+    a snapshot is available even between full_refresh runs)."""
+    if not series_key or "cpi" not in series_key or forecast_raw is None:
+        return None
+    period_key = _cpi_period_key(scheduled_date)
+
+    row = conn.execute(
+        "SELECT actual_raw, scheduled_time_et FROM macro_events WHERE series_key=? AND scheduled_date=?",
+        (series_key, scheduled_date),
+    ).fetchone()
+    already_released = bool(row and row[0] is not None)
+
+    if already_released:
+        time_et = (row[1] if row else None) or "08:30"
+        release_cutoff_et = pd.Timestamp(f"{scheduled_date} {time_et}", tz="America/New_York")
+        snap = conn.execute(
+            "SELECT hotter_pct, cooler_pct, combined_volume FROM macro_cpi_odds_snapshots "
+            "WHERE series_key=? AND scheduled_date=? AND snapshot_at <= ? ORDER BY snapshot_at DESC LIMIT 1",
+            (series_key, scheduled_date, release_cutoff_et.tz_convert("UTC").tz_localize(None).isoformat()),
+        ).fetchone()
+        if not snap:
+            return None
+        hotter_pct, cooler_pct, combined_volume = snap
+        return {"thin_market": False, "combined_volume": combined_volume, "hotter_pct": hotter_pct,
+                "cooler_pct": cooler_pct, "pre_release": True}
+
+    odds = _compute_live_cpi_bracket_odds(conn, series_key, period_key, forecast_raw)
+    if odds and not odds.get("thin_market"):
+        conn.execute(
+            "INSERT INTO macro_cpi_odds_snapshots (series_key, scheduled_date, snapshot_at, hotter_pct, "
+            "cooler_pct, combined_volume) VALUES (?,?,?,?,?,?)",
+            (series_key, scheduled_date, datetime.utcnow().isoformat(), odds["hotter_pct"], odds["cooler_pct"],
+             odds["combined_volume"]),
+        )
+        conn.commit()
+        odds = dict(odds, pre_release=False)
+    return odds
+
+
 # --------------------------------------------------------------------------
 # compute_divergence — smart money vs retail scoring. Unchanged from prior
 # version: reads directly from options_flow / dark_pool_signals /
@@ -3833,7 +4921,11 @@ def _read_buybacks_cache(conn, ticker, limit=4):
     if df.empty:
         return df
     df = df.sort_values("period").reset_index(drop=True)
-    df["buyback_magnitude"] = df["buyback_value"].abs()
+    # pd.read_sql_query gives buyback_value an object dtype (not float) when the column has a mix of real
+    # numbers and SQL NULL -- None.abs() crashes outright (confirmed live, pre-existing bug surfaced while
+    # testing the 2026-10-13 digest rebuild, unrelated to it). pd.to_numeric coerces NULL/None to a real
+    # NaN first, which .abs() handles fine (NaN -> NaN), same as every other _safe_num-style guard here.
+    df["buyback_magnitude"] = pd.to_numeric(df["buyback_value"], errors="coerce").abs()
     df["ticker"] = ticker
     return df
 
@@ -4526,7 +5618,7 @@ def cached_leaps_candidates(conn, ticker, max_age_hours=1, force_refresh=False):
 # already integrated and doesn't require a new fragile dependency.
 # --------------------------------------------------------------------------
 
-def calculate_expected_move_iv(price, iv, days=5):
+def calculate_expected_move_iv(price, iv, days=5, expiry=None, reference_date=None):
     """Ported verbatim from new_top.py. price: underlying price. iv: IV as
     a percent (e.g. 42.5, not 0.425). days: horizon in calendar days.
 
@@ -4535,7 +5627,21 @@ def calculate_expected_move_iv(price, iv, days=5):
     `atm_strike = min(calls["strike"], key=lambda x: abs(x - current_price))`
     then averages exactly that one strike's call+put IV -- the true ATM
     pair, not the whole chain. Confirmed this survived the new_top.py port
-    unchanged."""
+    unchanged.
+
+    Volatility Dislocations Stage 2 (2026-09-25 follow-up: "reuse the
+    existing straddle-implied-move function... extend it to accept a
+    target expiry, do NOT write new options math") -- `expiry` (a
+    "YYYY-MM-DD" string) is a pure additive override: when given, `days`
+    is computed from it instead of used directly, against
+    `reference_date` (defaults to today). No existing caller passes
+    `expiry`, so every current call site (days=5/10 for the "Expected
+    1/2-week swing" stats) is byte-for-byte unchanged. The formula itself
+    -- price * (iv/100) * sqrt(days/365) -- is not touched at all."""
+    if expiry is not None:
+        exp_date = datetime.strptime(expiry, "%Y-%m-%d").date()
+        ref_date = reference_date or date.today()
+        days = max((exp_date - ref_date).days, 0)
     return round(price * (iv / 100) * math.sqrt(days / 365), 2)
 
 
@@ -6219,6 +7325,25 @@ _IV_INSIGHT_PHRASES = {
 }
 
 
+def _as_badge_str(v):
+    """`v` is frequently read off a per-row pandas Series from
+    DataFrame.iterrows() -- a well-documented pandas footgun: when a row
+    mixes numeric columns (strike, volume_oi_ratio, ...) with object/
+    string columns (the *_badge columns annotate_options_badges() adds),
+    iterrows() unifies the WHOLE row into one Series dtype, which can
+    silently coerce a missing badge's real Python None into a float NaN.
+    `if not badge:`/`bool(nan)` doesn't catch this -- NaN is truthy in
+    Python -- so a NaN badge slips through as a real value. Confirmed
+    live twice: once inside " + ".join() ("sequence item N: expected str
+    instance, float found"), and again inside html.escape() (called from
+    interp_badge_html in the SWING FORECAST Options Strategy cards --
+    "'float' object has no attribute 'replace'", since html.escape calls
+    .replace() on its argument with no type check). Any caller reading a
+    *_badge column off an .iterrows()-produced row should coerce through
+    this first, not just the ones that have already crashed."""
+    return v if isinstance(v, str) else None
+
+
 def generate_row_insight(row):
     """Deterministic, template-based one-line insight (Part 3) combining
     one contract's own badges (delta profile + IV level + vol/OI level +
@@ -6226,20 +7351,6 @@ def generate_row_insight(row):
     generation. `row` (a dict or pandas Series) needs option_type/strike/
     expiration plus the *_badge columns annotate_options_badges() adds.
     Returns None if there's no delta badge to build a sentence around."""
-    # `row` is frequently a per-row pandas Series from DataFrame.iterrows()
-    # -- a well-documented pandas footgun: when a row mixes numeric
-    # columns (strike, volume_oi_ratio, ...) with object/string columns
-    # (the *_badge columns), iterrows() unifies the WHOLE row into one
-    # Series dtype, which can silently coerce a missing badge's real
-    # Python None into a float NaN. `if not badge:`/`bool(nan)` doesn't
-    # catch this -- NaN is truthy in Python -- so a NaN badge slipped
-    # through and crashed " + ".join() downstream with "sequence item N:
-    # expected str instance, float found" (confirmed live). This coerces
-    # every badge back to a real string-or-None immediately, regardless
-    # of which pandas code path produced the row.
-    def _as_badge_str(v):
-        return v if isinstance(v, str) else None
-
     delta_badge = _as_badge_str(row.get("delta_badge"))
     if not delta_badge:
         return None
@@ -8080,13 +9191,17 @@ def _earnings_candidate_contracts(conn, ticker, direction, expirations, top_n=3)
             "open_interest": int(r["open_interest"]) if pd.notna(r["open_interest"]) else None,
             "volume": int(r["volume"]) if pd.notna(r["volume"]) else None,
             "spread_pct": _none_if_nan(r["spread_pct2"]), "dte": dte,
+            # _as_badge_str: `r` is an .iterrows() row Series over a frame mixing numeric columns (strike,
+            # delta, ...) with these *_badge string columns -- the confirmed-live pandas footgun (see
+            # _as_badge_str's own docstring) that crashed interp_badge_html/html.escape() with "'float'
+            # object has no attribute 'replace'" when a badge silently came back as NaN instead of a str.
             "badges": {
-                "delta": {"label": r["delta_badge"], "note": None},
-                "iv": {"label": r["iv_badge"], "note": None},
-                "vol_oi": {"label": r["vol_oi_badge"], "note": None},
-                "dte": {"label": r["dte_badge"], "note": None},
-                "theta": {"label": r["theta_badge"], "note": None},
-                "spread": {"label": r["spread_badge"], "note": None},
+                "delta": {"label": _as_badge_str(r["delta_badge"]), "note": None},
+                "iv": {"label": _as_badge_str(r["iv_badge"]), "note": None},
+                "vol_oi": {"label": _as_badge_str(r["vol_oi_badge"]), "note": None},
+                "dte": {"label": _as_badge_str(r["dte_badge"]), "note": None},
+                "theta": {"label": _as_badge_str(r["theta_badge"]), "note": None},
+                "spread": {"label": _as_badge_str(r["spread_badge"]), "note": None},
             },
         })
     return candidates
@@ -9110,8 +10225,17 @@ def _resolve_peers(ticker, conn, max_peers=4):
     own_sector = own.get("sector")
     if not own_sector:
         return []
+    # Peers must NOT depend on who is asking: this feeds
+    # generate_deep_analysis, whose output is cached in the GLOBAL ai_briefs
+    # table and served to every user -- so resolving "same-sector peers"
+    # from the requesting user's own watchlist would bake one user's
+    # tickers into a briefing other users read (and make it differ by
+    # who happened to generate it). Search the shared fundamentals cache
+    # instead, alphabetically for determinism.
     matches = []
-    for t in load_watchlist():
+    cached_tickers = [r[0] for r in conn.execute(
+        "SELECT DISTINCT ticker FROM fundamentals_info ORDER BY ticker").fetchall()]
+    for t in cached_tickers:
         if t.upper() == ticker.upper():
             continue
         info = _read_fundamentals_info_cache(conn, t) or {}
@@ -10161,6 +11285,25 @@ def get_cached_ai_brief(conn, ticker, max_age_hours=AI_BRIEF_CACHE_HOURS):
     return _read_ai_brief_cache(conn, ticker, max_age_hours=max_age_hours)
 
 
+# Hard guard (2026-10-13, digest rebuild Part 1): "Add a hard guard: if any Claude API call is attempted
+# during rendering or sending, raise and log loudly." Defense in depth on top of the structural guarantee
+# that render_edition_for_recipient / send_daily_digest_email only ever pass an ALREADY-BUILT featured_stock
+# into build_digest_content, which has no AI-calling code path of its own -- this guard exists for the case
+# where that structural guarantee is ever accidentally broken by a future edit.
+_DIGEST_RENDER_GUARD = {"active": False}
+
+
+@contextlib.contextmanager
+def digest_render_guard():
+    """Wrap any digest render/send code path in this. generate_deep_analysis raises immediately if called
+    while it's active, instead of silently billing a second (or Nth) API call."""
+    _DIGEST_RENDER_GUARD["active"] = True
+    try:
+        yield
+    finally:
+        _DIGEST_RENDER_GUARD["active"] = False
+
+
 def generate_deep_analysis(ticker: str, conn) -> dict:
     """Builds the full real-data AI Deep-Dive Briefing context for `ticker`
     (see _bundle_ai_context) and sends it to the Anthropic API -- reads
@@ -10182,6 +11325,16 @@ def generate_deep_analysis(ticker: str, conn) -> dict:
     invoked -- callers must check get_cached_ai_brief() first and only call
     this after explicit user confirmation.
     """
+    if _DIGEST_RENDER_GUARD["active"]:
+        digest_log.error(
+            "[DIGEST GUARD] generate_deep_analysis(%s) called while a digest render/send was in progress -- "
+            "this must never happen (the edition's Claude call only ever happens inside build_digest_edition). "
+            "Refusing the call.", ticker,
+        )
+        raise RuntimeError(
+            f"[DIGEST GUARD] generate_deep_analysis({ticker!r}) blocked -- attempted during digest "
+            f"render/send, which must make zero API calls."
+        )
     import anthropic
 
     api_key = os.environ.get("ANTHROPIC_API_KEY")
@@ -10217,6 +11370,18 @@ def generate_deep_analysis(ticker: str, conn) -> dict:
 
     brief["_fetched_at"] = datetime.utcnow().isoformat()
     brief["_cache_hit"] = False
+    # REAL (not estimated) usage/cost from this actual response -- internal bookkeeping only, never
+    # rendered into the briefing/digest itself. Added 2026-10-13 for digest_editions.claude_api_cost,
+    # which needs the true post-call figure, not estimate_ai_briefing_cost's pre-call approximation.
+    # Same claude-opus-5 list pricing _estimate_ai_briefing_cost already uses: $5/1M input, $25/1M output.
+    try:
+        in_tok, out_tok = response.usage.input_tokens, response.usage.output_tokens
+        brief["_usage"] = {
+            "input_tokens": in_tok, "output_tokens": out_tok,
+            "cost_usd": (in_tok / 1_000_000) * 5.00 + (out_tok / 1_000_000) * 25.00,
+        }
+    except Exception:
+        brief["_usage"] = None
     _persist_ai_brief(conn, ticker, brief)
     return brief
 
@@ -12159,19 +13324,439 @@ def fetch_fred_events(conn, series_ids=None):
     return events
 
 
+# --------------------------------------------------------------------------
+# Macro Calendar upgrade -- real forecast/previous/actual + surprise
+# detection. Additive to everything above: FOMC/FRED are untouched and keep
+# running exactly as before inside cached_macro_events(). TradingView's
+# unofficial economic-calendar endpoint (confirmed live during development,
+# no key needed) is the PRIMARY source for forecast/previous/actual for the
+# indicators below; ForexFactory's free JSON feed (also no key, also
+# confirmed live) is a forecast/previous-ONLY fallback -- it has no actual
+# field at all, confirmed live, and only ever covers the current week (no
+# "next week" endpoint exists at that host -- confirmed 404), so it can only
+# patch gaps within the current week, never further out.
+# --------------------------------------------------------------------------
+
+TRADINGVIEW_CALENDAR_URL = "https://economic-calendar.tradingview.com/events"
+FOREXFACTORY_THISWEEK_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+
+# TradingView's exact event titles (confirmed live 2026-10-14) -> (series_key, event_type). event_type
+# reuses the existing coarse buckets wherever one already exists (cpi/pce/nfp/gdp/retail_sales/
+# jobless_claims) so every EXISTING reader (render_macro_calendar_tab, get_watchlist_relevant_tickers,
+# get_macro_event_market_odds, get_macro_event_grounded_reasoning, the Swing Outlook panel) keeps working
+# unchanged; ppi/avg_hourly_earnings/ism are new buckets (additive -- nothing iterates a closed set of
+# event_types). Deliberately excludes "Fed Interest Rate Decision"/"Fed Press Conference"/"FOMC Minutes"/
+# "Fed * Speech" -- fomc_rate_decision stays solely sourced from FOMC_MEETING_DATES, and the Low-importance
+# payroll sub-components ("Nonfarm Payrolls Private"/"Government Payrolls"/"Manufacturing Payrolls") --
+# only the headline indicators the user named.
+_TRADINGVIEW_TITLE_TO_SERIES = {
+    "Inflation Rate MoM": ("cpi_mom", "cpi"), "Inflation Rate YoY": ("cpi_yoy", "cpi"),
+    "Core Inflation Rate MoM": ("core_cpi_mom", "cpi"), "Core Inflation Rate YoY": ("core_cpi_yoy", "cpi"),
+    "PPI MoM": ("ppi_mom", "ppi"), "Core PPI MoM": ("core_ppi_mom", "ppi"),
+    "PCE Price Index MoM": ("pce_mom", "pce"), "PCE Price Index YoY": ("pce_yoy", "pce"),
+    "Core PCE Price Index MoM": ("core_pce_mom", "pce"), "Core PCE Price Index YoY": ("core_pce_yoy", "pce"),
+    "Average Hourly Earnings MoM": ("avg_hourly_earnings_mom", "avg_hourly_earnings"),
+    "Average Hourly Earnings YoY": ("avg_hourly_earnings_yoy", "avg_hourly_earnings"),
+    "Non Farm Payrolls": ("nfp", "nfp"),
+    "Initial Jobless Claims": ("jobless_claims", "jobless_claims"),
+    "Retail Sales MoM": ("retail_sales_mom", "retail_sales"),
+    "GDP Growth Rate QoQ Adv": ("gdp_qoq", "gdp"),
+    "ISM Manufacturing PMI": ("ism_manufacturing", "ism"), "ISM Services PMI": ("ism_services", "ism"),
+}
+
+# Display-name rename (fix #1) -- TradingView's own CPI/PPI/PCE titles ("Inflation Rate MoM", "Core
+# Inflation Rate YoY") aren't the names traders actually use; renamed to the standard CPI/PPI/PCE vocabulary
+# at fetch time (the UNDERLYING series_key/mapping above is untouched, only the display event_name changes).
+# NFP/Jobless Claims/Retail Sales/GDP/ISM titles are already standard and are intentionally left as-is --
+# not asked for, and changing them further would be "beyond what was requested."
+_MACRO_SERIES_DISPLAY_NAME = {
+    "cpi_mom": "CPI MoM", "cpi_yoy": "CPI YoY",
+    "core_cpi_mom": "Core CPI MoM", "core_cpi_yoy": "Core CPI YoY",
+    "ppi_mom": "PPI MoM", "core_ppi_mom": "Core PPI MoM",
+    "pce_mom": "PCE MoM", "pce_yoy": "PCE YoY",
+    "core_pce_mom": "Core PCE MoM", "core_pce_yoy": "Core PCE YoY",
+}
+
+# ForexFactory's own title strings differ from TradingView's -- confirmed live against
+# ff_calendar_thisweek.json 2026-10-14 for the series that actually appeared in-window that week; the rest
+# are TradingView's own documented naming convention for the same releases and will be confirmed/adjusted
+# against a live pull the first time each one actually falls within a current week during real use (same
+# "verify against real data, don't guess" discipline as the rest of this file -- an unmatched title here
+# just means that one event never gets a ForexFactory-sourced fallback fill, never a crash).
+_FOREXFACTORY_TITLE_TO_SERIES = {
+    "CPI m/m": "cpi_mom", "CPI y/y": "cpi_yoy", "Core CPI m/m": "core_cpi_mom", "Core CPI y/y": "core_cpi_yoy",
+    "PPI m/m": "ppi_mom", "Core PPI m/m": "core_ppi_mom",
+    "Core PCE Price Index m/m": "core_pce_mom",
+    "Average Hourly Earnings m/m": "avg_hourly_earnings_mom",
+    "Non-Farm Employment Change": "nfp", "Unemployment Claims": "jobless_claims",
+    "Retail Sales m/m": "retail_sales_mom", "Advance GDP q/q": "gdp_qoq",
+    "ISM Manufacturing PMI": "ism_manufacturing", "ISM Services PMI": "ism_services",
+}
+
+# Direction map (spec item 3) -- "a config table, editable": a plain module-level constant, same idiom as
+# FOMC_MEETING_DATES/FRED_MACRO_SERIES above (edit this dict, no separate admin UI). hotter_bad: a print
+# ABOVE forecast is risk-off. higher_bad: a HIGHER value is risk-off (jobless claims -- more claims = weaker
+# economy). ambiguous: shown in amber regardless of sign, never emails an alert (spec 5b). min_surprise is
+# the smallest meaningfully-real surprise for that series (CPI-family reports to 1 decimal place, so 0.1pp
+# is the reporting precision floor below which "surprise" is just rounding noise, not a real signal).
+MACRO_DIRECTION_MAP = {
+    "cpi_mom": {"direction": "hotter_bad", "min_surprise": 0.1, "label": "CPI MoM"},
+    "cpi_yoy": {"direction": "hotter_bad", "min_surprise": 0.1, "label": "CPI YoY"},
+    "core_cpi_mom": {"direction": "hotter_bad", "min_surprise": 0.1, "label": "Core CPI MoM"},
+    "core_cpi_yoy": {"direction": "hotter_bad", "min_surprise": 0.1, "label": "Core CPI YoY"},
+    "ppi_mom": {"direction": "hotter_bad", "min_surprise": 0.1, "label": "PPI MoM"},
+    "core_ppi_mom": {"direction": "hotter_bad", "min_surprise": 0.1, "label": "Core PPI MoM"},
+    "pce_mom": {"direction": "hotter_bad", "min_surprise": 0.1, "label": "PCE MoM"},
+    "pce_yoy": {"direction": "hotter_bad", "min_surprise": 0.1, "label": "PCE YoY"},
+    "core_pce_mom": {"direction": "hotter_bad", "min_surprise": 0.1, "label": "Core PCE MoM"},
+    "core_pce_yoy": {"direction": "hotter_bad", "min_surprise": 0.1, "label": "Core PCE YoY"},
+    "avg_hourly_earnings_mom": {"direction": "hotter_bad", "min_surprise": 0.1, "label": "Avg Hourly Earnings MoM"},
+    "avg_hourly_earnings_yoy": {"direction": "hotter_bad", "min_surprise": 0.1, "label": "Avg Hourly Earnings YoY"},
+    "jobless_claims": {"direction": "higher_bad", "min_surprise": 10, "label": "Initial Jobless Claims"},
+    "nfp": {"direction": "ambiguous", "min_surprise": 20, "label": "Nonfarm Payrolls"},
+    "retail_sales_mom": {"direction": "ambiguous", "min_surprise": 0.2, "label": "Retail Sales MoM"},
+    "gdp_qoq": {"direction": "ambiguous", "min_surprise": 0.3, "label": "GDP QoQ"},
+    "ism_manufacturing": {"direction": "ambiguous", "min_surprise": 1.0, "label": "ISM Manufacturing PMI"},
+    "ism_services": {"direction": "ambiguous", "min_surprise": 1.0, "label": "ISM Services PMI"},
+}
+
+# Digest Macro Calendar section (email) -- "release with several measures" family grouping (spec item 2):
+# event_type is already the right grouping key (e.g. "cpi" covers CPI MoM/YoY + Core CPI MoM/YoY as 4
+# macro_events rows sharing one release day) -- these are just the human-readable family header names.
+_MACRO_EVENT_TYPE_FAMILY_LABEL = {
+    "cpi": "CPI", "ppi": "PPI", "pce": "PCE", "nfp": "Nonfarm Payrolls",
+    "jobless_claims": "Jobless Claims", "retail_sales": "Retail Sales", "gdp": "GDP", "ism": "ISM",
+    "avg_hourly_earnings": "Avg Hourly Earnings", "fomc_rate_decision": "FOMC Rate Decision",
+}
+
+_MACRO_SURPRISE_COLORS_HEX = {"risk_off": "#e66767", "risk_on": "#4caf7d", "ambiguous": "#e8c547", "in_line": "#8b9bab"}
+
+
+def _macro_surprise_chip_label(series_key, surprise, surprise_direction):
+    """'+0.1 hot' / '-0.1 cool' / '+15 high' / '-15 low' / '+0.3 mixed' / 'in line' -- same MACRO_DIRECTION_
+    MAP this whole feature already uses (spec item 2: 'same direction map as the dashboard'), just a label
+    string instead of the dashboard column's emoji-dot convention -- kept as a SEPARATE helper from the
+    dashboard's own Surprise-column formatting (dashboard.py) rather than refactoring that already-verified
+    code to share this, per 'don't change existing behavior beyond what's requested.' None if surprise/
+    direction aren't both available -- never a fabricated chip."""
+    if surprise is None or not surprise_direction:
+        return None
+    value_txt = f"{'+' if surprise > 0 else ''}{surprise:g}"
+    if surprise_direction == "in_line":
+        return "in line"
+    if surprise_direction == "ambiguous":
+        return f"{value_txt} mixed"
+    rule = MACRO_DIRECTION_MAP.get(series_key) or {}
+    word = ("high" if surprise_direction == "risk_off" else "low") if rule.get("direction") == "higher_bad" \
+        else ("hot" if surprise_direction == "risk_off" else "cool")
+    return f"{value_txt} {word}"
+
+
+def compute_macro_surprise(series_key, forecast_raw, actual_raw):
+    """Pure function -- None (never fabricated) if either value is missing. surprise = actual - forecast;
+    direction is resolved from MACRO_DIRECTION_MAP, 'ambiguous' always regardless of sign. Returns None if
+    series_key isn't in the direction map at all (e.g. a future series added to the TradingView title map
+    without a matching direction-map entry yet -- shown plainly rather than guessing a direction)."""
+    if forecast_raw is None or actual_raw is None:
+        return None
+    rule = MACRO_DIRECTION_MAP.get(series_key)
+    if not rule:
+        return None
+    # Rounded BEFORE the meaningful-surprise comparison, not after -- actual_raw - forecast_raw on real
+    # TradingView floats (e.g. 0.3 - 0.2) lands on 0.09999999999999998 due to plain float subtraction, which
+    # would fail an exact ">= 0.1" threshold check and silently mislabel a genuine, exactly-at-the-reporting-
+    # -precision surprise as "in line". Confirmed live: Core CPI MoM Oct 2026 (actual 0.3, forecast 0.2) hit
+    # exactly this case before this fix.
+    surprise = round(actual_raw - forecast_raw, 4)
+    if rule["direction"] == "ambiguous":
+        direction = "ambiguous"
+    else:  # hotter_bad and higher_bad both treat a positive surprise as risk-off
+        direction = "risk_off" if surprise > 0 else ("risk_on" if surprise < 0 else "in_line")
+    meaningful = abs(surprise) >= rule["min_surprise"]
+    return {"surprise": surprise, "direction": direction if meaningful else "in_line",
+            "meaningful": meaningful, "label": rule["label"]}
+
+
+def _tv_format_display(raw_value, unit):
+    """None stays '—' (never fabricated) -- never guesses a unit that wasn't given."""
+    if raw_value is None:
+        return None
+    if unit == "%":
+        return f"{raw_value:+.1f}%" if raw_value == round(raw_value, 1) else f"{raw_value:.2f}%"
+    return f"{raw_value:g}"
+
+
+def fetch_tradingview_macro_calendar(conn, days_ahead=60):
+    """PRIMARY source for forecast/previous/actual (spec item 1) -- TradingView's own unofficial economic-
+    calendar endpoint, confirmed live during development with NO key/auth needed (Origin header is enough).
+    US events only, importance >= 0 (Medium+High -- TradingView's own -1/0/1 = Low/Medium/High scale),
+    restricted to the headline indicators in _TRADINGVIEW_TITLE_TO_SERIES. Computes surprise/direction via
+    compute_macro_surprise and writes it onto the same row -- idempotent, safe to recompute every refresh.
+    Not independently verified beyond this development session's live checks (no CI/production run has
+    exercised this against a future TradingView schema change) -- if TradingView changes this endpoint's
+    shape, this fails safe into the except branch in cached_macro_events, same as a FRED outage does today.
+    Returns the list of event dicts inserted/updated."""
+    now = pd.Timestamp.now(tz="America/New_York")
+    frm = now.floor("D").isoformat()
+    to = (now + timedelta(days=days_ahead)).floor("D").isoformat()
+    resp = requests.get(
+        TRADINGVIEW_CALENDAR_URL, params={"from": frm, "to": to, "countries": "US"},
+        headers={"Origin": "https://www.tradingview.com", "User-Agent": "Mozilla/5.0"}, timeout=12,
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+    raw_events = payload.get("result") or []
+
+    events = []
+    now_str = datetime.utcnow().isoformat()
+    for e in raw_events:
+        mapping = _TRADINGVIEW_TITLE_TO_SERIES.get(e.get("title"))
+        importance = e.get("importance")
+        # NOT `e.get("importance") or -1` -- importance=0 (TradingView's own "Medium") is falsy in Python,
+        # so that would have silently collapsed every genuine Medium-impact event (headline PCE, jobless
+        # claims, average hourly earnings, Core PPI) into -1/Low and dropped it here. Confirmed live: this
+        # exact bug was dropping every Medium-impact TradingView series before this fix.
+        if not mapping or importance is None or importance < 0:
+            continue
+        series_key, event_type = mapping
+        try:
+            ev_dt = pd.Timestamp(e["date"]).tz_convert("America/New_York")
+        except (KeyError, ValueError, TypeError):
+            continue
+        scheduled_date = ev_dt.date().isoformat()
+        unit = e.get("unit")
+        # Deliberately e.get("forecast")/("actual")/("previous"), NOT the "...Raw" fields -- confirmed live
+        # that TradingView's own "scale" field (e.g. "K" for jobless claims) means the "...Raw" fields are
+        # in the UNDERLYING unit (actualRaw=200000) while "forecast"/"actual"/"previous" are already
+        # TradingView's own human-scaled numbers (forecast=200) that MACRO_DIRECTION_MAP's min_surprise
+        # thresholds (and the "±10K" convention a trader actually reads) assume. Using the "Raw" fields here
+        # would have made jobless claims' real "+3K surprise" register as "+3000" against a min_surprise of
+        # 10, silently breaking the surprise/direction call for every scaled series.
+        forecast_raw, actual_raw, prior_raw = e.get("forecast"), e.get("actual"), e.get("previous")
+        surprise_info = compute_macro_surprise(series_key, forecast_raw, actual_raw)
+        impact_level = "High" if e.get("importance") == 1 else "Medium"
+        events.append({
+            "event_id": f"TV_{series_key}_{scheduled_date}", "event_type": event_type,
+            "event_name": _MACRO_SERIES_DISPLAY_NAME.get(series_key, e.get("title")), "scheduled_date": scheduled_date,
+            "scheduled_time_et": ev_dt.strftime("%H:%M"), "source": "tradingview",
+            "prior_value": _tv_format_display(prior_raw, unit), "forecast_value": _tv_format_display(forecast_raw, unit),
+            "actual_value": _tv_format_display(actual_raw, unit), "impact_level": impact_level,
+            "fetched_at": now_str, "series_key": series_key, "forecast_raw": forecast_raw,
+            "actual_raw": actual_raw, "prior_raw": prior_raw, "unit": unit,
+            "surprise": surprise_info["surprise"] if surprise_info else None,
+            "surprise_direction": surprise_info["direction"] if surprise_info else None,
+            "forecast_source": "tradingview" if forecast_raw is not None else None,
+            "prior_source": "tradingview" if prior_raw is not None else None,
+        })
+    _upsert_macro_events(conn, events)
+    return events
+
+
+_FF_NUMERIC_RE = re.compile(r"-?\d+\.?\d*")
+
+
+def _parse_forexfactory_number(text):
+    """ForexFactory's forecast/previous come as strings like '3.6%', '230K', '1.95M' -- real values, not
+    guessed, just differently formatted than TradingView's raw floats. Returns (value, unit) or (None, None)
+    for a blank/unparseable string -- never fabricates a number from an empty field."""
+    if not text or not isinstance(text, str):
+        return None, None
+    m = _FF_NUMERIC_RE.search(text)
+    if not m:
+        return None, None
+    value = float(m.group())
+    if "%" in text:
+        return value, "%"
+    if "K" in text.upper():
+        return value, "K"
+    if "M" in text.upper():
+        return value, "M"
+    return value, None
+
+
+def fetch_forexfactory_calendar(conn):
+    """FALLBACK for forecast/previous ONLY (spec item 1) -- ForexFactory's free, keyless JSON feed,
+    confirmed live during development to have genuinely NO actual field (matches the user's own
+    description) and to cover only the current week (no 'next week' endpoint exists at this host --
+    confirmed 404 during development). Only fills forecast_value/forecast_raw/prior_value/prior_raw for a
+    macro_events row whose TradingView-sourced forecast is STILL NULL -- never overwrites a TradingView
+    value, never invents an actual. Logs which source served the value via forecast_source/prior_source
+    (spec item 1's 'log which source served each value').
+
+    ForexFactory's own event titles (_FOREXFACTORY_TITLE_TO_SERIES) were only confirmed live against
+    whichever US High/Medium events actually fell in-window on 2026-10-14; an unmapped title here is a
+    silent no-op for that one event (it simply keeps showing TradingView's own value, or '—' if TradingView
+    had none either), never a crash and never a fabricated fallback value."""
+    resp = requests.get(FOREXFACTORY_THISWEEK_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=12)
+    resp.raise_for_status()
+    raw_events = resp.json()
+
+    filled = 0
+    now_str = datetime.utcnow().isoformat()
+    for e in raw_events:
+        if e.get("country") != "USD" or e.get("impact") not in ("High", "Medium"):
+            continue
+        series_key = _FOREXFACTORY_TITLE_TO_SERIES.get(e.get("title"))
+        if not series_key:
+            continue
+        try:
+            scheduled_date = pd.Timestamp(e["date"]).tz_convert("America/New_York").date().isoformat()
+        except (KeyError, ValueError, TypeError):
+            continue
+        event_id = f"TV_{series_key}_{scheduled_date}"
+        existing = conn.execute(
+            "SELECT forecast_raw, prior_raw FROM macro_events WHERE event_id=?", (event_id,)
+        ).fetchone()
+        if existing is None:
+            continue  # only patches a row TradingView already created this refresh -- never invents a new one
+        forecast_raw_existing, prior_raw_existing = existing
+        forecast_raw, unit_f = _parse_forexfactory_number(e.get("forecast"))
+        prior_raw, unit_p = _parse_forexfactory_number(e.get("previous"))
+        updates = {}
+        if forecast_raw_existing is None and forecast_raw is not None:
+            updates["forecast_raw"] = forecast_raw
+            updates["forecast_value"] = _tv_format_display(forecast_raw, unit_f)
+            updates["forecast_source"] = "forexfactory"
+        if prior_raw_existing is None and prior_raw is not None:
+            updates["prior_raw"] = prior_raw
+            updates["prior_value"] = _tv_format_display(prior_raw, unit_p)
+            updates["prior_source"] = "forexfactory"
+        if not updates:
+            continue
+        set_clause = ", ".join(f"{k}=?" for k in updates)
+        conn.execute(f"UPDATE macro_events SET {set_clause} WHERE event_id=?", (*updates.values(), event_id))
+        filled += 1
+    conn.commit()
+    return filled
+
+
+# event_type -> how to turn FRED's own stored actual_value/prior_value (both raw index/level readings --
+# see fetch_fred_events' docstring) into something actually comparable to TradingView's percentage/change
+# figures, and which TradingView series_key(s) that comparable value should be checked against:
+#   "pct": FRED's series is a monthly/quarterly INDEX (CPIAUCSL, PCEPILFE) -- MoM% = (actual/prior-1)*100
+#          from this release's own adjacent pair; YoY% needs a second FRED row ~365 days earlier.
+#   "diff": FRED's series is a LEVEL whose headline figure is the period-over-period CHANGE, not a ratio
+#           (PAYEMS -- "nonfarm payrolls" is actually the month's employment gain, already thousands-of-
+#           persons on both sides) -- diff = actual-prior.
+#   "level_div1000": FRED reports a raw count (ICSA, individual claims); TradingView already reports
+#                    jobless claims in thousands -- divide by 1000 before comparing, same quantity either way.
+# "gdp" is deliberately NOT included here: FRED's GDP series is a nominal dollar level, and deriving a
+# comparable annualized QoQ growth rate needs BEA's own chained-dollar/annualization convention, which this
+# codebase doesn't implement. Approximating it risks flagging a pure methodology difference as a data
+# "mismatch" -- skipped rather than guessed, same anti-hallucination discipline as everywhere else here.
+_FRED_CROSSCHECK_RULES = {
+    "cpi": {"kind": "pct", "mom_series": "cpi_mom", "yoy_series": "cpi_yoy"},
+    # PCEPILFE is Core PCE (FRED_MACRO_SERIES' own event_name says so) even though it shares the coarse
+    # "pce" event_type bucket with headline PCE -- must cross-check against the CORE TradingView series,
+    # not headline, or this would silently compare two different releases.
+    "pce": {"kind": "pct", "mom_series": "core_pce_mom", "yoy_series": "core_pce_yoy"},
+    "retail_sales": {"kind": "pct", "mom_series": "retail_sales_mom", "yoy_series": None},
+    "nfp": {"kind": "diff", "mom_series": "nfp", "yoy_series": None},
+    "jobless_claims": {"kind": "level_div1000", "mom_series": "jobless_claims", "yoy_series": None},
+}
+
+
+def _cross_check_fred_actuals(conn):
+    """Read-only cross-check (per explicit instruction: keep the FRED path intact, never remove it) --
+    derives a value from FRED's own already-fetched rows (fetch_fred_events' macro_events rows, source=
+    'fred') that's actually unit-comparable to the matching TradingView series (see _FRED_CROSSCHECK_RULES
+    -- a raw index/level is NOT directly comparable to a % change, which an earlier version of this function
+    got wrong and would have flagged a false mismatch on every single release), and flags fred_mismatch=1
+    (logged at WARNING) when both exist and disagree beyond that series' own MACRO_DIRECTION_MAP min_surprise
+    tolerance. NEVER overwrites TradingView's displayed value -- FRED has no forecast concept at all, so it
+    can't drive surprise/direction/odds on its own; this only adds a visible '⚠ differs from FRED'
+    annotation. Only meaningful when FRED_API_KEY is set (the FRED rows wouldn't exist otherwise)."""
+    flagged = 0
+
+    def _check(event_type, scheduled_date, fred_value, series_key):
+        nonlocal flagged
+        if fred_value is None or series_key is None:
+            return
+        tv_row = conn.execute(
+            "SELECT event_id, actual_raw FROM macro_events WHERE source='tradingview' AND series_key=? "
+            "AND scheduled_date BETWEEN ? AND ? AND actual_raw IS NOT NULL ORDER BY scheduled_date LIMIT 1",
+            (series_key, (pd.Timestamp(scheduled_date) - timedelta(days=5)).date().isoformat(),
+             (pd.Timestamp(scheduled_date) + timedelta(days=5)).date().isoformat()),
+        ).fetchone()
+        if not tv_row:
+            return
+        event_id, tv_actual = tv_row
+        tolerance = MACRO_DIRECTION_MAP.get(series_key, {}).get("min_surprise", 0.1)
+        if abs(tv_actual - fred_value) > tolerance:
+            conn.execute("UPDATE macro_events SET fred_mismatch=1 WHERE event_id=?", (event_id,))
+            digest_log.warning(
+                "[MACRO CALENDAR] %s (%s): TradingView actual %s vs. FRED-derived %s (event_type=%s)",
+                event_id, series_key, tv_actual, round(fred_value, 2), event_type,
+            )
+            flagged += 1
+
+    for event_type, rule in _FRED_CROSSCHECK_RULES.items():
+        fred_rows = conn.execute(
+            "SELECT scheduled_date, prior_value, actual_value FROM macro_events WHERE source='fred' "
+            "AND event_type=? AND actual_value IS NOT NULL", (event_type,),
+        ).fetchall()
+        for scheduled_date, prior_text, actual_text in fred_rows:
+            try:
+                prior, actual = float(prior_text), float(actual_text)
+            except (TypeError, ValueError):
+                continue
+            if rule["kind"] == "diff":
+                _check(event_type, scheduled_date, actual - prior, rule["mom_series"])
+            elif rule["kind"] == "level_div1000":
+                _check(event_type, scheduled_date, actual / 1000, rule["mom_series"])
+            elif rule["kind"] == "pct":
+                mom = (actual / prior - 1) * 100 if prior else None
+                _check(event_type, scheduled_date, mom, rule["mom_series"])
+                if rule["yoy_series"]:
+                    yoy_window = conn.execute(
+                        "SELECT actual_value FROM macro_events WHERE source='fred' AND event_type=? "
+                        "AND scheduled_date BETWEEN ? AND ? AND actual_value IS NOT NULL "
+                        "ORDER BY scheduled_date DESC LIMIT 1",
+                        (event_type, (pd.Timestamp(scheduled_date) - timedelta(days=380)).date().isoformat(),
+                         (pd.Timestamp(scheduled_date) - timedelta(days=350)).date().isoformat()),
+                    ).fetchone()
+                    if yoy_window and yoy_window[0] is not None:
+                        try:
+                            year_ago = float(yoy_window[0])
+                            yoy = (actual / year_ago - 1) * 100 if year_ago else None
+                            _check(event_type, scheduled_date, yoy, rule["yoy_series"])
+                        except (TypeError, ValueError):
+                            pass
+    conn.commit()
+    return flagged
+
+
 def _upsert_macro_events(conn, events):
+    """FOMC/FRED events never set the new Macro Calendar upgrade columns
+    (series_key/forecast_raw/actual_raw/prior_raw/unit/surprise/
+    surprise_direction/forecast_source/prior_source/fred_mismatch) --
+    .get(...) leaves them NULL for those rows, exactly as before this
+    migration existed. fetch_tradingview_macro_calendar/
+    fetch_forexfactory_calendar populate them; the ON CONFLICT clause
+    additionally updates them so a later refresh (e.g. an actual landing)
+    overwrites cleanly."""
     for ev in events:
         conn.execute(
             """INSERT INTO macro_events
                    (event_id, event_type, event_name, scheduled_date, scheduled_time_et, source,
-                    prior_value, forecast_value, actual_value, impact_level, fetched_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                    prior_value, forecast_value, actual_value, impact_level, fetched_at,
+                    series_key, forecast_raw, actual_raw, prior_raw, unit, surprise, surprise_direction,
+                    forecast_source, prior_source)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(event_id) DO UPDATE SET
+                   event_name=excluded.event_name,
                    actual_value=excluded.actual_value, prior_value=excluded.prior_value,
-                   forecast_value=excluded.forecast_value, fetched_at=excluded.fetched_at""",
+                   forecast_value=excluded.forecast_value, fetched_at=excluded.fetched_at,
+                   series_key=excluded.series_key, forecast_raw=excluded.forecast_raw,
+                   actual_raw=excluded.actual_raw, prior_raw=excluded.prior_raw, unit=excluded.unit,
+                   surprise=excluded.surprise, surprise_direction=excluded.surprise_direction,
+                   forecast_source=excluded.forecast_source, prior_source=excluded.prior_source""",
             (ev["event_id"], ev["event_type"], ev["event_name"], ev["scheduled_date"],
              ev["scheduled_time_et"], ev["source"], ev["prior_value"], ev["forecast_value"],
-             ev["actual_value"], ev["impact_level"], ev["fetched_at"]),
+             ev["actual_value"], ev["impact_level"], ev["fetched_at"],
+             ev.get("series_key"), ev.get("forecast_raw"), ev.get("actual_raw"), ev.get("prior_raw"),
+             ev.get("unit"), ev.get("surprise"), ev.get("surprise_direction"),
+             ev.get("forecast_source"), ev.get("prior_source")),
         )
     conn.commit()
 
@@ -12185,7 +13770,14 @@ def cached_macro_events(conn, max_age_hours=24, force_refresh=False):
     the FOMC schedule (which needs no network call beyond the optional
     rate-range lookup) still succeeds and is still usable; each failure
     is logged to fetch_log separately so SETTINGS can show FRED as down
-    without implicating the FOMC schedule."""
+    without implicating the FOMC schedule.
+
+    Macro Calendar upgrade: TradingView (primary, keyless) and ForexFactory
+    (forecast/previous-only fallback, keyless) are fetched/logged the same
+    independent way -- a TradingView outage never blocks FOMC/FRED, and vice
+    versa. FRED is left completely untouched; when FRED_API_KEY is set, its
+    actuals are cross-checked (never overwritten) against TradingView's via
+    _cross_check_fred_actuals after both have run."""
     if force_refresh or should_refetch(conn, "macro_events", None, max_age_hours):
         try:
             fetch_fomc_schedule(conn)
@@ -12197,15 +13789,47 @@ def cached_macro_events(conn, max_age_hours=24, force_refresh=False):
             _log_fetch(conn, "macro_events", None, True, rows_returned=len(fred_events))
         except Exception as e:
             _log_fetch(conn, "macro_events", None, False, error_message=str(e))
+        try:
+            tv_events = fetch_tradingview_macro_calendar(conn)
+            _log_fetch(conn, "macro_events_tradingview", None, True, rows_returned=len(tv_events))
+        except Exception as e:
+            _log_fetch(conn, "macro_events_tradingview", None, False, error_message=str(e))
+        try:
+            ff_filled = fetch_forexfactory_calendar(conn)
+            _log_fetch(conn, "macro_events_forexfactory", None, True, rows_returned=ff_filled)
+        except Exception as e:
+            _log_fetch(conn, "macro_events_forexfactory", None, False, error_message=str(e))
+        if os.environ.get("FRED_API_KEY"):
+            try:
+                _cross_check_fred_actuals(conn)
+            except Exception as e:
+                digest_log.warning("[MACRO CALENDAR] FRED cross-check failed: %s", e)
 
     rows = conn.execute(
         """SELECT event_id, event_type, event_name, scheduled_date, scheduled_time_et, source,
-                  prior_value, forecast_value, actual_value, impact_level, fetched_at
+                  prior_value, forecast_value, actual_value, impact_level, fetched_at,
+                  series_key, forecast_raw, actual_raw, prior_raw, unit, surprise, surprise_direction,
+                  forecast_source, prior_source, fred_mismatch, alert_sent_at
            FROM macro_events ORDER BY scheduled_date"""
     ).fetchall()
     keys = ["event_id", "event_type", "event_name", "scheduled_date", "scheduled_time_et", "source",
-            "prior_value", "forecast_value", "actual_value", "impact_level", "fetched_at"]
-    return [dict(zip(keys, r)) for r in rows]
+            "prior_value", "forecast_value", "actual_value", "impact_level", "fetched_at",
+            "series_key", "forecast_raw", "actual_raw", "prior_raw", "unit", "surprise", "surprise_direction",
+            "forecast_source", "prior_source", "fred_mismatch", "alert_sent_at"]
+    return _dedupe_fred_rows_covered_by_tradingview([dict(zip(keys, r)) for r in rows])
+
+
+def _dedupe_fred_rows_covered_by_tradingview(rows):
+    """Fix #2 -- once a real TradingView-sourced row exists for an (event_type, scheduled_date) pair, the
+    FRED-sourced row for that SAME pair is a raw index/level duplicate that adds no information and reads as
+    wrong in the calendar (confirmed live: FRED's CPI row shows the raw CPI-U index, e.g. 336.298, alongside
+    TradingView's real CPI MoM/YoY percentages for the identical release -- 'never show raw index levels').
+    FRED's row is NEVER deleted from the DB here -- only suppressed from this read -- _cross_check_fred_
+    actuals still needs the real row to compare against, and this function runs on every read, so a FRED row
+    that predates its matching TradingView row (or one TradingView never covers, e.g. no mapped series yet)
+    is left visible exactly as before."""
+    tv_pairs = {(r["event_type"], r["scheduled_date"]) for r in rows if r.get("source") == "tradingview"}
+    return [r for r in rows if not (r.get("source") == "fred" and (r["event_type"], r["scheduled_date"]) in tv_pairs)]
 
 
 def get_macro_events_in_range(conn, start_date, end_date, overlay_impact_filter="auto"):
@@ -12235,12 +13859,18 @@ def get_macro_events_in_range(conn, start_date, end_date, overlay_impact_filter=
     start = pd.Timestamp(start_date).date().isoformat()
     end = pd.Timestamp(end_date).date().isoformat()
     rows = conn.execute(
-        """SELECT event_id, event_type, event_name, scheduled_date, scheduled_time_et, impact_level
+        """SELECT event_id, event_type, event_name, scheduled_date, scheduled_time_et, impact_level, source,
+                  forecast_value, actual_value, prior_value, surprise, surprise_direction, series_key,
+                  forecast_raw
            FROM macro_events WHERE scheduled_date BETWEEN ? AND ? ORDER BY scheduled_date""",
         (start, end),
     ).fetchall()
-    keys = ["event_id", "event_type", "event_name", "scheduled_date", "scheduled_time_et", "impact_level"]
-    results = [dict(zip(keys, r)) for r in rows]
+    keys = ["event_id", "event_type", "event_name", "scheduled_date", "scheduled_time_et", "impact_level", "source",
+            "forecast_value", "actual_value", "prior_value", "surprise", "surprise_direction", "series_key",
+            "forecast_raw"]
+    # Fix #2 -- "never show raw index levels in the calendar" (this function feeds the digest's macro week
+    # view, Swing Outlook's event table via get_macro_events_near, and chart overlays -- all "the calendar").
+    results = _dedupe_fred_rows_covered_by_tradingview([dict(zip(keys, r)) for r in rows])
 
     if overlay_impact_filter != "auto":
         return results
@@ -12773,6 +14403,224 @@ def get_macro_event_grounded_reasoning(ticker, conn, event, horizon_days):
         ),
         "grounded_in": "none", "detail": None,
     }
+
+
+def get_macro_release_banner_state(conn, now_et=None):
+    """Spec item 5 -- the single source both the dashboard's top-of-page banner and the digest's pre-
+    Featured-Stock callout read, so they can never disagree (same 'one function, every renderer' convention
+    as get_macro_event_grounded_reasoning above).
+
+    PRE-release (5a): any High-impact event scheduled today or tomorrow with a real forecast on record.
+    CPI gets its live Polymarket bracket odds (get_cpi_bracket_odds) folded into the banner text when a
+    real, non-thin market exists; every other event type shows forecast/previous only (never a fabricated
+    probability). Returns at most one banner -- the SOONEST qualifying event -- to keep the banner readable
+    on a day with more than one High-impact release.
+
+    POST-release (5b, display only -- the one-time EMAIL alert itself is check_and_send_macro_release_alerts,
+    a separate function): any event alert_sent_at'd today, for the dashboard's red banner. Ambiguous-
+    direction surprises never reach here with an email already sent (check_and_send_macro_release_alerts
+    never sends for them) but CAN still show here if alert_sent_at is NULL -- this function surfaces
+    ANY already-actual, meaningfully-surprising High-impact release today, amber for ambiguous/risk_on,
+    red for risk_off, regardless of whether an email went out for it.
+
+    Returns {'pre_release': {...}|None, 'post_release': {...}|None}; either or both can be None on a quiet
+    day. Never guesses -- an event missing forecast_raw simply isn't eligible for the pre-release banner,
+    and the post-release banner only fires once actual_raw is actually on record."""
+    now_et = now_et if now_et is not None else pd.Timestamp.now(tz="America/New_York")
+    today = now_et.date().isoformat()
+    tomorrow = (now_et + timedelta(days=1)).date().isoformat()
+    footnote = "A hot print raises sell-off risk; it doesn't guarantee one."
+
+    pre_rows = conn.execute(
+        "SELECT event_id, event_name, series_key, scheduled_date, scheduled_time_et, forecast_value, "
+        "prior_value, forecast_raw FROM macro_events WHERE impact_level='High' "
+        "AND scheduled_date IN (?, ?) AND forecast_value IS NOT NULL AND (actual_value IS NULL) "
+        "ORDER BY scheduled_date, scheduled_time_et", (today, tomorrow),
+    ).fetchall()
+    pre_release = None
+    if pre_rows:
+        event_id, name, series_key, sched_date, sched_time, fcst, prior, forecast_raw = pre_rows[0]
+        when = "tomorrow" if sched_date == tomorrow else "today"
+        time_txt = _format_et_time_12h(sched_time) or "soon"
+        odds_txt = ""
+        if series_key and "cpi" in (series_key or "") and forecast_raw is not None:
+            odds = get_cpi_bracket_odds(conn, series_key, sched_date, forecast_raw)
+            if odds and not odds.get("thin_market"):
+                odds_txt = f" Prediction markets: {odds['hotter_pct']:.0f}% chance of a hotter print."
+        pre_release = {
+            "event_id": event_id, "text": (
+                f"⚠️ {name} {when} {time_txt} — high impact. Forecast {fcst} (prev {prior or '—'})."
+                f"{odds_txt} Volatility risk — consider holding off on new buys until after the release. "
+                f"{footnote}"
+            ),
+        }
+
+    post_rows = conn.execute(
+        "SELECT event_id, event_name, actual_value, forecast_value, prior_value, surprise_direction "
+        "FROM macro_events WHERE impact_level='High' AND scheduled_date=? AND actual_value IS NOT NULL "
+        "AND surprise_direction IS NOT NULL AND surprise_direction != 'in_line' "
+        "ORDER BY scheduled_time_et DESC", (today,),
+    ).fetchall()
+    post_release = None
+    if post_rows:
+        event_id, name, actual, fcst, prior, direction = post_rows[0]
+        if direction == "risk_off":
+            severity = "🔴"; tail = "Elevated sell-off risk today."
+        elif direction == "ambiguous":
+            severity = "🟡"; tail = "Direction isn't clear-cut for this release -- no directional call."
+        else:
+            severity = "🟢"; tail = "Typically supportive, not a sell-off signal."
+        post_release = {
+            "event_id": event_id, "direction": direction, "text": (
+                f"{severity} {name} {actual} vs {fcst} forecast (prev {prior or '—'}) — "
+                f"{'hotter' if direction in ('risk_off',) else 'cooler' if direction == 'risk_on' else 'a surprise'} "
+                f"than expected. {tail} {footnote}"
+            ),
+        }
+    return {"pre_release": pre_release, "post_release": post_release}
+
+
+def _release_datetime_utc(scheduled_date, scheduled_time_et):
+    """scheduled_date + scheduled_time_et (ET wall time) -> naive UTC Timestamp, the same convention
+    since_iso/fetched_at use everywhere else in this file. None on any bad input -- never guessed."""
+    try:
+        return pd.Timestamp(f"{scheduled_date} {scheduled_time_et or '08:30'}", tz="America/New_York") \
+            .tz_convert("UTC").tz_localize(None)
+    except (ValueError, TypeError):
+        return None
+
+
+def get_upcoming_high_impact_releases(conn, now_et=None):
+    """Digest Macro Calendar section (spec item 3, amber banner) -- EVERY High-impact release scheduled
+    today/tomorrow with a real forecast on record and no actual yet, soonest first (get_macro_release_
+    banner_state's own singular 'pre_release' shows only the soonest one -- this is the fuller list the
+    calendar section's banner needs when more than one High-impact release lands the same day, e.g. PPI and
+    Retail Sales both on the same morning). Each entry includes CPI bracket odds when a real, non-thin
+    Polymarket market exists for it -- never a fabricated split (get_cpi_bracket_odds' own guarantee)."""
+    now_et = now_et if now_et is not None else pd.Timestamp.now(tz="America/New_York")
+    today = now_et.date().isoformat()
+    tomorrow = (now_et + timedelta(days=1)).date().isoformat()
+    rows = conn.execute(
+        "SELECT event_id, event_name, series_key, scheduled_date, scheduled_time_et, forecast_value, "
+        "prior_value, forecast_raw FROM macro_events WHERE impact_level='High' "
+        "AND scheduled_date IN (?, ?) AND forecast_value IS NOT NULL AND actual_value IS NULL "
+        "ORDER BY scheduled_date, scheduled_time_et", (today, tomorrow),
+    ).fetchall()
+    results = []
+    for event_id, name, series_key, sched_date, sched_time, fcst, prior, forecast_raw in rows:
+        odds_text = None
+        if series_key and "cpi" in series_key and forecast_raw is not None:
+            odds = get_cpi_bracket_odds(conn, series_key, sched_date, forecast_raw)
+            if odds and not odds.get("thin_market"):
+                odds_text = f"{odds['hotter_pct']:.0f}% hotter"
+        results.append({
+            "event_id": event_id, "event_name": name, "scheduled_date": sched_date,
+            "scheduled_time_et": sched_time, "forecast_value": fcst, "prior_value": prior,
+            "odds_text": odds_text,
+        })
+    return results
+
+
+def get_recent_risk_off_releases(conn, since_iso):
+    """Digest Macro Calendar section (spec item 3, red banner) -- every High-impact release that actually
+    landed (actual_value set) with a meaningful risk-off surprise, whose real release time is at/after
+    since_iso (the prior edition's own send time -- so a once-daily digest catches a surprise that happened
+    since it last went out, not just 'today'). since_iso is compared as the same naive-UTC-isoformat string
+    every other since_iso comparison in this file already uses."""
+    rows = conn.execute(
+        "SELECT event_id, event_name, scheduled_date, scheduled_time_et, actual_value, forecast_value, "
+        "prior_value FROM macro_events WHERE impact_level='High' AND surprise_direction='risk_off' "
+        "AND actual_value IS NOT NULL"
+    ).fetchall()
+    try:
+        since_dt = pd.Timestamp(since_iso)
+        # since_iso is a bare naive-UTC isoformat string everywhere else in this file, but confirmed live
+        # that render_edition_for_recipient's own since_iso can arrive tz-aware -- normalize to naive UTC
+        # (not a blind tz_localize, which would silently shift a non-UTC offset) so the comparison against
+        # _release_datetime_utc's always-naive-UTC result never raises.
+        if since_dt.tzinfo is not None:
+            since_dt = since_dt.tz_convert("UTC").tz_localize(None)
+    except (ValueError, TypeError):
+        since_dt = None
+    results = []
+    for event_id, name, sched_date, sched_time, actual, fcst, prior in rows:
+        release_dt = _release_datetime_utc(sched_date, sched_time)
+        if release_dt is None or (since_dt is not None and release_dt < since_dt):
+            continue
+        results.append({
+            "event_id": event_id, "event_name": name, "scheduled_date": sched_date,
+            "actual_value": actual, "forecast_value": fcst, "prior_value": prior,
+        })
+    results.sort(key=lambda r: r["scheduled_date"])
+    return results
+
+
+def send_macro_alert_email(conn, event):
+    """Spec item 5b -- ONE short plain+HTML email to the admin account only (de._get_edition_admin_email),
+    never the subscriber list. Reuses get_effective_from_email/get_effective_from_name and the same
+    SMTP_HOST/PORT/USER/PASSWORD env vars send_daily_digest_email already uses -- no new SMTP path, no new
+    sender identity. Returns True on a confirmed send, False otherwise (never raises -- the caller,
+    check_and_send_macro_release_alerts, treats False as 'leave alert_sent_at NULL, try again next tick')."""
+    admin_email = _get_edition_admin_email(conn)
+    smtp_host, smtp_port = os.environ.get("SMTP_HOST"), os.environ.get("SMTP_PORT")
+    smtp_user, smtp_password = os.environ.get("SMTP_USER"), os.environ.get("SMTP_PASSWORD")
+    if not (admin_email and smtp_host and smtp_port and smtp_user and smtp_password):
+        print("[send_macro_alert_email] SMTP not fully configured or no active admin -- skipping.")
+        return False
+    from_email, from_name = get_effective_from_email(conn), get_effective_from_name(conn)
+    subject = f"Macro alert: {event['event_name']} — {event['actual_value']} vs {event['forecast_value']} forecast"
+    text_body = event["text"]
+    html_body = f"<html><body style='font-family:Georgia,serif;font-size:14px;'><p>{html.escape(text_body)}</p></body></html>"
+    try:
+        msg = EmailMIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"] = formataddr((from_name, from_email))
+        msg["To"] = admin_email
+        msg.attach(EmailMIMEText(text_body, "plain"))
+        msg.attach(EmailMIMEText(html_body, "html"))
+        with smtplib.SMTP(smtp_host, int(smtp_port), timeout=15) as server:
+            server.starttls()
+            server.login(smtp_user, smtp_password)
+            server.sendmail(from_email, [admin_email], msg.as_string())
+        return True
+    except Exception as e:
+        print(f"[send_macro_alert_email] send failed: {e}")
+        return False
+
+
+def check_and_send_macro_release_alerts(conn, now_et=None):
+    """Spec item 5b -- 'one alert per event, never repeated'. Queries macro_events for High-impact,
+    risk-off, meaningfully-surprising releases whose actual has landed TODAY and alert_sent_at is still
+    NULL; sends via send_macro_alert_email, then sets alert_sent_at immediately on a CONFIRMED send only --
+    the idempotency guard a retried tick (or a retried full-page-load) relies on. Ambiguous/risk_on
+    surprises never reach here (spec: 'Ambiguous indicators: amber banner, no email') -- they still show in
+    the dashboard's post-release banner via get_macro_release_banner_state, just never emailed.
+
+    Called from digest/send.py's tick() (before its own early-return for a quiet digest-schedule reason --
+    a release can land on a day the digest itself is skipped) and from dashboard.py's full-load catch-up, so
+    it fires whether or not launchd is configured. Both call sites wrap this in their own try/except; a
+    failure here never blocks the digest send or the page render."""
+    now_et = now_et if now_et is not None else pd.Timestamp.now(tz="America/New_York")
+    today = now_et.date().isoformat()
+    rows = conn.execute(
+        "SELECT event_id, event_name, actual_value, forecast_value, prior_value FROM macro_events "
+        "WHERE impact_level='High' AND scheduled_date=? AND actual_value IS NOT NULL "
+        "AND surprise_direction='risk_off' AND alert_sent_at IS NULL", (today,),
+    ).fetchall()
+    sent = 0
+    for event_id, name, actual, fcst, prior in rows:
+        text = (
+            f"🔴 {name} {actual} vs {fcst} forecast (prev {prior or '—'}) — hotter than expected. "
+            f"Elevated sell-off risk today. A hot print raises sell-off risk; it doesn't guarantee one."
+        )
+        event = {"event_name": name, "actual_value": actual, "forecast_value": fcst, "text": text}
+        if send_macro_alert_email(conn, event):
+            conn.execute(
+                "UPDATE macro_events SET alert_sent_at=? WHERE event_id=?", (datetime.utcnow().isoformat(), event_id)
+            )
+            conn.commit()
+            sent += 1
+    return sent
 
 
 def get_divergence_score_trend(ticker, conn, lookback_sessions=10):
@@ -13858,9 +15706,12 @@ def full_refresh(tickers=None, db_path=DEFAULT_DB_PATH, progress_callback=None, 
     fetcher's cache window unless force_refresh=True bypasses it entirely.
     progress_callback(msg) is called with a short status string after each
     step, if provided."""
-    tickers = tickers or load_watchlist()
     init_db(db_path)
     conn = get_connection(db_path)
+    # No explicit tickers -> the union of every active user's watchlist
+    # (the GLOBAL shared data pool has to cover all of them); a dashboard
+    # REFRESH click passes just that user's own tickers instead.
+    tickers = tickers or get_all_watchlist_tickers(conn)
 
     def _report(msg):
         print(msg)
@@ -13892,6 +15743,25 @@ def full_refresh(tickers=None, db_path=DEFAULT_DB_PATH, progress_callback=None, 
             _report(f"Polymarket macro-relevant events: {n} synced")
         except Exception as e:
             _report(f"Polymarket macro fetch failed: {e}")
+
+        try:
+            # CPI bracket markets (Macro Calendar upgrade) -- NOT covered by the keyword-matched call just
+            # above (no "cpi" keyword in MACRO_KEYWORDS, and these questions don't contain "inflation";
+            # confirmed live during development that the existing call surfaces zero of them).
+            result = fetch_polymarket_cpi_brackets(conn)
+            _report(f"Polymarket CPI bracket markets: {result['inserted']} synced "
+                    f"({len(result['mapping'])} event(s) classified)")
+        except Exception as e:
+            _report(f"Polymarket CPI bracket fetch failed: {e}")
+
+        try:
+            # Captures "odds as of just before release" (spec item 4) -- must run AFTER the CPI bracket
+            # fetch just above, and independently of whether anyone opens the dashboard before the next
+            # release, so a frozen snapshot is reliably available once Polymarket's own prices resolve.
+            n = snapshot_live_cpi_odds(conn)
+            _report(f"CPI odds snapshots captured: {n}")
+        except Exception as e:
+            _report(f"CPI odds snapshot failed: {e}")
 
         try:
             # Populates fed_rate_history BEFORE the per-ticker options-flow
@@ -14499,12 +16369,17 @@ def compute_implied_target_price(entry_low, entry_high, target_pct):
     return round(midpoint * (1 + float(target_pct) / 100.0), 2)
 
 
-def get_entry_zones(conn):
-    """All auto-derived entry zones on record, alphabetical by ticker."""
+def get_entry_zones(conn, user_email):
+    """This user's auto-derived entry zones, alphabetical by ticker."""
+    email = _require_user_email(user_email)
     cols = ["ticker", "entry_low", "entry_high", "target_pct", "target_horizon_days",
             "implied_target_price", "reasoning", "last_zone_status", "zone_entered_at",
-            "computed_at", "created_at", "updated_at"]
-    rows = conn.execute(f"SELECT {', '.join(cols)} FROM entry_zones ORDER BY ticker").fetchall()
+            "computed_at", "created_at", "updated_at", "anchor_kind", "anchor_level", "anchor_touches",
+            "anchor_volume", "backtest_accuracy", "backtest_sessions", "divergence_score",
+            "divergence_label"]
+    rows = conn.execute(
+        f"SELECT {', '.join(cols)} FROM entry_zones WHERE user_email=? ORDER BY ticker", (email,)
+    ).fetchall()
     return [dict(zip(cols, r)) for r in rows]
 
 
@@ -14518,8 +16393,8 @@ def _classify_zone_status(price, entry_low, entry_high):
     return "in_zone"
 
 
-def check_entry_zones(conn):
-    """Part 2. For every configured entry_zones row, compares the current
+def check_entry_zones(conn, user_email):
+    """Part 2. For every one of THIS user's configured entry_zones rows, compares the current
     cached price against [entry_low, entry_high] and updates
     last_zone_status on EVERY call (so the next check always has an
     accurate prior state, including detecting a future re-entry after
@@ -14528,8 +16403,9 @@ def check_entry_zones(conn):
     -> in_zone transition; a zone already 'in_zone' last check is left
     alone, so it doesn't re-trigger on every check while price just sits
     inside."""
+    email = _require_user_email(user_email)
     newly_triggered = []
-    for zone in get_entry_zones(conn):
+    for zone in get_entry_zones(conn, email):
         ticker = zone["ticker"]
         price = get_latest_cached_price(conn, ticker)
         status = _classify_zone_status(price, zone["entry_low"], zone["entry_high"])
@@ -14538,14 +16414,16 @@ def check_entry_zones(conn):
         now = datetime.utcnow().isoformat()
         if status == "in_zone" and zone["last_zone_status"] != "in_zone":
             conn.execute(
-                "UPDATE entry_zones SET last_zone_status=?, zone_entered_at=?, updated_at=? WHERE ticker=?",
-                (status, now, now, ticker),
+                "UPDATE entry_zones SET last_zone_status=?, zone_entered_at=?, updated_at=? "
+                "WHERE user_email=? AND ticker=?",
+                (status, now, now, email, ticker),
             )
             newly_triggered.append({**zone, "last_zone_status": status, "zone_entered_at": now,
                                      "current_price": price})
         else:
             conn.execute(
-                "UPDATE entry_zones SET last_zone_status=?, updated_at=? WHERE ticker=?", (status, now, ticker)
+                "UPDATE entry_zones SET last_zone_status=?, updated_at=? WHERE user_email=? AND ticker=?",
+                (status, now, email, ticker)
             )
         conn.commit()
     return newly_triggered
@@ -14800,7 +16678,7 @@ def derive_entry_zone(ticker, conn):
     }
 
 
-def refresh_entry_zone(conn, ticker, force_refresh=False):
+def refresh_entry_zone(conn, user_email, ticker, force_refresh=False):
     """Persists derive_entry_zone()'s output into entry_zones -- on a
     genuine failure (derived["ready"] is False, e.g. no confirmed support
     below the current price) as much as on success, storing entry_low/
@@ -14836,9 +16714,10 @@ def refresh_entry_zone(conn, ticker, force_refresh=False):
     here, the next check_entry_zones() tick reads a None status from
     _classify_zone_status and simply leaves last_zone_status as whatever
     it last was, rather than erroring."""
+    email = _require_user_email(user_email)
     if not force_refresh:
         existing_computed_at = conn.execute(
-            "SELECT computed_at FROM entry_zones WHERE ticker=?", (ticker,)
+            "SELECT computed_at FROM entry_zones WHERE user_email=? AND ticker=?", (email, ticker)
         ).fetchone()
         if existing_computed_at and existing_computed_at[0]:
             computed_at = pd.Timestamp(existing_computed_at[0])
@@ -14849,39 +16728,71 @@ def refresh_entry_zone(conn, ticker, force_refresh=False):
 
     derived = derive_entry_zone(ticker, conn)
     now = datetime.utcnow().isoformat()
-    prior = conn.execute("SELECT created_at FROM entry_zones WHERE ticker=?", (ticker,)).fetchone()
+    prior = conn.execute(
+        "SELECT created_at FROM entry_zones WHERE user_email=? AND ticker=?", (email, ticker)
+    ).fetchone()
 
     if derived["ready"]:
         entry_low, entry_high = derived["entry_low"], derived["entry_high"]
         target_pct, target_horizon_days = derived["target_pct"], derived["target_horizon_days"]
         implied_target_price, reasoning = derived["implied_target_price"], derived["reasoning"]
+        anchor = derived.get("anchor_support") or {}
+        anchor_kind, anchor_level = anchor.get("kind"), anchor.get("level")
+        anchor_touches, anchor_volume = anchor.get("touches"), anchor.get("volume")
+        swing_bt = derived.get("swing_backtest") or {}
+        # Same has_swing_backtest gate derive_entry_zone itself used to decide whether to cite this in
+        # `reasoning` -- a thin/absent backtest is stored as NULL here too, not a misleadingly-precise
+        # number from too few sessions.
+        if swing_bt and (swing_bt.get("sessions_backtested") or 0) >= ENTRY_ZONE_MIN_BACKTEST_SESSIONS:
+            backtest_accuracy = swing_bt.get("direction_accuracy")
+            backtest_sessions = swing_bt.get("sessions_backtested")
+        else:
+            backtest_accuracy = backtest_sessions = None
+        divergence_score, divergence_label = derived.get("divergence_score"), derived.get("divergence_label")
     else:
         entry_low = entry_high = target_pct = target_horizon_days = implied_target_price = None
         reasoning = derived["reason"]
+        anchor_kind = anchor_level = anchor_touches = anchor_volume = None
+        backtest_accuracy = backtest_sessions = None
+        divergence_score = divergence_label = None
 
     conn.execute(
         """INSERT INTO entry_zones
-               (ticker, entry_low, entry_high, target_pct, target_horizon_days, implied_target_price,
-                reasoning, computed_at, created_at, updated_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?)
-           ON CONFLICT(ticker) DO UPDATE SET
+               (user_email, ticker, entry_low, entry_high, target_pct, target_horizon_days,
+                implied_target_price, reasoning, computed_at, created_at, updated_at,
+                anchor_kind, anchor_level, anchor_touches, anchor_volume, backtest_accuracy,
+                backtest_sessions, divergence_score, divergence_label)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(user_email, ticker) DO UPDATE SET
                entry_low=excluded.entry_low, entry_high=excluded.entry_high, target_pct=excluded.target_pct,
                target_horizon_days=excluded.target_horizon_days,
                implied_target_price=excluded.implied_target_price, reasoning=excluded.reasoning,
-               computed_at=excluded.computed_at, updated_at=excluded.updated_at""",
-        (ticker, entry_low, entry_high, target_pct, target_horizon_days, implied_target_price, reasoning,
-         now, prior[0] if prior else now, now),
+               computed_at=excluded.computed_at, updated_at=excluded.updated_at,
+               anchor_kind=excluded.anchor_kind, anchor_level=excluded.anchor_level,
+               anchor_touches=excluded.anchor_touches, anchor_volume=excluded.anchor_volume,
+               backtest_accuracy=excluded.backtest_accuracy, backtest_sessions=excluded.backtest_sessions,
+               divergence_score=excluded.divergence_score, divergence_label=excluded.divergence_label""",
+        (email, ticker, entry_low, entry_high, target_pct, target_horizon_days, implied_target_price,
+         reasoning, now, prior[0] if prior else now, now, anchor_kind, anchor_level, anchor_touches,
+         anchor_volume, backtest_accuracy, backtest_sessions, divergence_score, divergence_label),
     )
     conn.commit()
     return derived
 
 
-def refresh_all_entry_zones(conn, tickers):
+def refresh_all_entry_zones(conn, user_email, tickers, force_refresh=False):
     """Part 1: runs derive_entry_zone (via refresh_entry_zone's TTL gate)
     for every watchlist ticker automatically -- the scheduler-driven
     replacement for the old manual add-a-zone form. Returns only the
-    zones actually (re)computed this call (skips excluded)."""
-    return [r for r in (refresh_entry_zone(conn, t) for t in tickers) if r is not None]
+    zones actually (re)computed this call (skips excluded).
+
+    force_refresh (2026-09-25, additive, default False so the existing
+    background-scan call site is byte-for-byte unchanged) bypasses the
+    TTL gate for every ticker -- backs the WATCHLIST SIGNALS tab's single
+    "Recompute all" button, replacing what used to be N individual
+    per-ticker force_refresh=True buttons."""
+    return [r for r in (refresh_entry_zone(conn, user_email, t, force_refresh=force_refresh) for t in tickers)
+            if r is not None]
 
 
 # --------------------------------------------------------------------------
@@ -14986,24 +16897,34 @@ def synthesize_rating_signal(ticker, conn, lookback_days=30):
     }
 
 
-def get_watchlist_signals_since(conn, since_iso):
+def get_watchlist_signals_since(conn, user_email, since_iso, tickers):
     """Entry-zone triggers + newly-seen rating changes at/after `since_iso`
+    FOR THIS USER: zones come from the user's own entry_zones rows, and
+    rating actions (a global table shared by every user) are filtered to
+    `tickers` -- the user's own watchlist -- so one user never sees analyst
+    activity on a ticker only some other user follows.
     -- the one query both the WATCHLIST SIGNALS tab's 'since your last
     visit' summary and send_daily_digest_email's 'since the last digest'
     body run, just against different baselines (a session-local
     last-viewed marker vs. digest_email_log's last sent_at)."""
+    email = _require_user_email(user_email)
+    tickers = list(tickers or [])
     zone_rows = conn.execute(
         """SELECT ticker, entry_low, entry_high, target_pct, target_horizon_days, implied_target_price,
                   reasoning, zone_entered_at
-           FROM entry_zones WHERE last_zone_status='in_zone' AND zone_entered_at >= ?
+           FROM entry_zones WHERE user_email=? AND last_zone_status='in_zone' AND zone_entered_at >= ?
            ORDER BY zone_entered_at DESC""",
-        (since_iso,),
+        (email, since_iso),
     ).fetchall()
-    action_rows = conn.execute(
-        """SELECT ticker, firm, action_date, from_grade, to_grade, first_seen_at FROM seen_analyst_actions
-           WHERE first_seen_at >= ? ORDER BY first_seen_at DESC""",
-        (since_iso,),
-    ).fetchall()
+    if tickers:
+        placeholders = ",".join("?" * len(tickers))
+        action_rows = conn.execute(
+            f"""SELECT ticker, firm, action_date, from_grade, to_grade, first_seen_at FROM seen_analyst_actions
+                WHERE first_seen_at >= ? AND ticker IN ({placeholders}) ORDER BY first_seen_at DESC""",
+            (since_iso, *tickers),
+        ).fetchall()
+    else:
+        action_rows = []
     zcols = ["ticker", "entry_low", "entry_high", "target_pct", "target_horizon_days", "implied_target_price",
              "reasoning", "zone_entered_at"]
     acols = ["ticker", "firm", "action_date", "from_grade", "to_grade", "first_seen_at"]
@@ -15011,34 +16932,6 @@ def get_watchlist_signals_since(conn, since_iso):
         "triggered_zones": [dict(zip(zcols, r)) for r in zone_rows],
         "new_actions": [dict(zip(acols, r)) for r in action_rows],
     }
-
-
-WATCHLIST_SIGNALS_LAST_VIEWED_PATH = "watchlist_signals_last_viewed.json"
-
-
-def load_watchlist_signals_last_viewed(path=WATCHLIST_SIGNALS_LAST_VIEWED_PATH):
-    """Persisted 'last time the WATCHLIST SIGNALS tab was actually
-    opened' marker -- same small-JSON-file pattern as load_pinned_runners/
-    load_runners_refresh_interval, so it survives restarts/reloads like
-    those do. Drives the tab's 'since your last visit' summary and which
-    rating-change rows get a NEW badge. Returns None (not today) if
-    missing, so a genuine first-ever visit reads as 'everything currently
-    triggered/seen is new,' not 'nothing is new.'"""
-    try:
-        with open(path, "r") as f:
-            value = json.load(f)
-        if isinstance(value, str) and value:
-            return value
-    except (FileNotFoundError, json.JSONDecodeError, ValueError):
-        pass
-    return None
-
-
-def save_watchlist_signals_last_viewed(value=None, path=WATCHLIST_SIGNALS_LAST_VIEWED_PATH):
-    value = value or datetime.utcnow().isoformat()
-    with open(path, "w") as f:
-        json.dump(value, f)
-    return value
 
 
 # --------------------------------------------------------------------------
@@ -15072,33 +16965,37 @@ _MACRO_IMPACT_COLORS_HEX = {"High": "#e66767", "Medium": "#e8c547", "Low": "#8b9
 # the domain identity actually verified in SES right now (see the SES
 # cutover this constant was added for), not a placeholder.
 DEFAULT_DIGEST_FROM_EMAIL = "digest@monotrading.io"
+DEFAULT_DIGEST_FROM_NAME = "Monotrading Daily"
 
 _EMAIL_CONFIG_COLS = [
-    "recipient_email", "from_email", "enabled", "frequency", "send_time_et", "wait_for_runners",
+    "recipient_email", "from_email", "enabled", "frequency", "weekly_day", "send_time_et", "wait_for_runners",
     "wait_for_predictions", "sections_included", "last_sent_date", "last_digest_sent_at", "last_send_status",
-    "last_send_error",
+    "last_send_error", "last_test_sent_at", "last_test_send_status", "last_test_send_error",
 ]
 
 
-def get_email_config(conn):
-    """Reads the singleton email_config row (id=1), seeding it with safe
-    defaults on first-ever call -- so every other function here can
+def get_email_config(conn, user_email):
+    """Reads THIS user's email_config row (one per user), seeding it with
+    safe defaults on first-ever call -- so every other function here can
     assume the row already exists rather than each handling a missing-row
-    case separately. `from_email` here is the raw STORED value (possibly
-    NULL) -- see get_effective_from_email for the env-var-override
-    resolution actually used when sending."""
-    row = conn.execute(f"SELECT {', '.join(_EMAIL_CONFIG_COLS)} FROM email_config WHERE id=1").fetchone()
+    case separately. (The sender identity is no longer per-user -- see
+    get_effective_from_email.)"""
+    email = _require_user_email(user_email)
+    row = conn.execute(
+        f"SELECT {', '.join(_EMAIL_CONFIG_COLS)} FROM email_config WHERE user_email=?", (email,)
+    ).fetchone()
     if not row:
         conn.execute(
             """INSERT INTO email_config
-                   (id, recipient_email, from_email, enabled, frequency, send_time_et, wait_for_runners,
+                   (user_email, recipient_email, from_email, enabled, frequency, send_time_et, wait_for_runners,
                     wait_for_predictions, sections_included, updated_at)
-               VALUES (1, NULL, ?, 0, 'daily', '07:30', 1, 1, ?, ?)""",
-            (DEFAULT_DIGEST_FROM_EMAIL, json.dumps(DEFAULT_DIGEST_SECTIONS), datetime.utcnow().isoformat()),
+               VALUES (?, NULL, NULL, 0, 'daily', '07:30', 1, 1, ?, ?)""",
+            (email, json.dumps(DEFAULT_DIGEST_SECTIONS), datetime.utcnow().isoformat()),
         )
         conn.commit()
-        return get_email_config(conn)
+        return get_email_config(conn, email)
     cfg = dict(zip(_EMAIL_CONFIG_COLS, row))
+    cfg["weekly_day"] = cfg["weekly_day"] if cfg["weekly_day"] in (0, 1, 2, 3, 4) else 0
     cfg["enabled"] = bool(cfg["enabled"])
     cfg["wait_for_runners"] = bool(cfg["wait_for_runners"])
     cfg["wait_for_predictions"] = bool(cfg["wait_for_predictions"])
@@ -15112,8 +17009,9 @@ def get_email_config(conn):
 
 
 def get_effective_from_email(conn):
-    """Part 4: EMAIL_FROM (env var) > email_config.from_email (in-app
-    setting) > DEFAULT_DIGEST_FROM_EMAIL, in that order -- the same
+    """Part 4: EMAIL_FROM (env var) > app_settings 'from_email' (GLOBAL,
+    admin-managed in-app setting -- the sender identity belongs to the
+    deployment/SES account, not to any one user) > DEFAULT_DIGEST_FROM_EMAIL, in that order -- the same
     precedence style as everything else in this file that has both an
     env var and a DB-backed setting (env var wins, since it represents
     whoever controls the deployment overriding the in-app default).
@@ -15122,18 +17020,32 @@ def get_effective_from_email(conn):
     as, completely independent of which verified identity you SEND FROM,
     and using it as a From: address either isn't a valid verified sender
     (rejected) or isn't even a syntactically valid email address at all."""
-    return os.environ.get("EMAIL_FROM") or get_email_config(conn)["from_email"] or DEFAULT_DIGEST_FROM_EMAIL
+    # EMAIL_FROM may be given as either "digest@x.io" or "Name <digest@x.io>"; only the bare address is
+    # ever used for the SMTP envelope sender (see get_effective_from_name for the display name).
+    env_from = parseaddr(os.environ.get("EMAIL_FROM") or "")[1]
+    return env_from or get_app_setting(conn, "from_email") or DEFAULT_DIGEST_FROM_EMAIL
 
 
-def save_email_config(conn, **fields):
-    """Updates only the passed keyword fields on the singleton row;
+def get_effective_from_name(conn):
+    """Display name shown in the recipient's inbox ("Monotrading Daily
+    <digest@monotrading.io>"): a name inside an EMAIL_FROM env var > the
+    global app_settings 'from_name' (admin-editable) > DEFAULT_DIGEST_FROM_NAME."""
+    env_name = parseaddr(os.environ.get("EMAIL_FROM") or "")[0]
+    return env_name or get_app_setting(conn, "from_name") or DEFAULT_DIGEST_FROM_NAME
+
+
+def save_email_config(conn, user_email, **fields):
+    """Updates only the passed keyword fields on THIS user's row;
     anything not passed keeps its current value. `sections_included` may
     be passed as a plain list (JSON-encoded here); enabled/wait_for_*
     accept any truthy/falsy value (coerced to 0/1)."""
-    get_email_config(conn)  # ensures the row exists before UPDATE
+    email = _require_user_email(user_email)
+    get_email_config(conn, email)  # ensures the row exists before UPDATE
     sets, params = [], []
     for k, v in fields.items():
-        if k not in _EMAIL_CONFIG_COLS:
+        if k not in _EMAIL_CONFIG_COLS or k == "from_email":
+            # from_email is a GLOBAL setting now (app_settings), never
+            # writable through a per-user config row.
             continue
         if k == "sections_included" and isinstance(v, list):
             v = json.dumps(v)
@@ -15145,7 +17057,8 @@ def save_email_config(conn, **fields):
         return
     sets.append("updated_at=?")
     params.append(datetime.utcnow().isoformat())
-    conn.execute(f"UPDATE email_config SET {', '.join(sets)} WHERE id=1", params)
+    params.append(email)
+    conn.execute(f"UPDATE email_config SET {', '.join(sets)} WHERE user_email=?", params)
     conn.commit()
 
 
@@ -15157,20 +17070,7 @@ def save_email_config(conn, **fields):
 # table owns WHO receives it and their unsubscribe state.
 # --------------------------------------------------------------------------
 
-def _migrate_recipient_to_subscribers(conn):
-    """One-time migration: if email_config still has a recipient_email
-    and that address has no email_subscribers row yet, create one. No-op
-    on every call after the first real migration (or if there was never
-    a recipient_email to migrate) -- safe to call unconditionally from
-    init_db, same idempotent-seed discipline as _seed_news_sources/
-    _seed_firm_tiers."""
-    row = conn.execute("SELECT recipient_email FROM email_config WHERE id=1").fetchone()
-    if not row or not row[0]:
-        return
-    add_email_subscriber(conn, row[0])
-
-
-def add_email_subscriber(conn, email):
+def add_email_subscriber(conn, user_email, email):
     """Idempotent: an already-subscribed (or already-unsubscribed --
     re-adding doesn't silently re-subscribe someone who opted out) address
     just returns its existing token unchanged. Returns the subscriber's
@@ -15178,28 +17078,125 @@ def add_email_subscriber(conn, email):
     basic sanity check (Part 1: 'validate basic format') -- the caller
     (SETTINGS' Add Subscriber button) is what surfaces that as a real
     error message; this function just refuses to insert garbage."""
+    owner = _require_user_email(user_email)
     email = (email or "").strip().lower()
     if not is_valid_email_format(email):
         return None
-    existing = conn.execute("SELECT unsubscribe_token FROM email_subscribers WHERE email=?", (email,)).fetchone()
+    existing = conn.execute(
+        "SELECT unsubscribe_token FROM email_subscribers WHERE user_email=? AND email=?", (owner, email)
+    ).fetchone()
     if existing:
         return existing[0]
     token = uuid.uuid4().hex
+    # 2026-10-13 single-global-edition rebuild: a new subscriber under the admin's (functionally, the
+    # ONLY functionally-relevant) subscriber list is seeded with the admin's CURRENT "Sections to
+    # include" checkboxes -- a one-time copy, not a live reference, so it's independently editable
+    # afterward. A subscriber row added under any other account (the vestigial self-subscription
+    # create_user/ensure_self_subscription still creates, now unused since sending is admin-only) gets
+    # NULL, which already means "all sections" wherever sections_included is read.
+    sections_seed = None
+    if owner == _get_edition_admin_email(conn):
+        admin_config = get_email_config(conn, owner)
+        sections_seed = admin_config.get("sections_included")
+        sections_seed = json.dumps(sections_seed) if isinstance(sections_seed, list) else sections_seed
     conn.execute(
-        "INSERT INTO email_subscribers (email, unsubscribe_token, subscribed_at, unsubscribed) VALUES (?,?,?,0)",
-        (email, token, datetime.utcnow().isoformat()),
+        "INSERT INTO email_subscribers (user_email, email, unsubscribe_token, subscribed_at, unsubscribed, "
+        "sections_included) VALUES (?,?,?,?,0,?)",
+        (owner, email, token, datetime.utcnow().isoformat(), sections_seed),
     )
     conn.commit()
     return token
 
 
-def get_active_subscribers(conn):
-    """Every subscriber who hasn't unsubscribed -- what send_daily_
-    digest_email actually iterates over for a real (non-test) send."""
+def ensure_self_subscription(conn, user_email):
+    """Every user is subscribed to their OWN digest, at their own Google
+    address, by default -- so a regular user (who can't manage recipients)
+    only has to switch the digest on. Done at most ONCE per user (tracked
+    by a preference flag), and only if they have no recipients at all, so
+    an address later removed or unsubscribed by an admin/the recipient is
+    never silently re-added."""
+    email = _require_user_email(user_email)
+    if get_user_pref(conn, email, "self_subscribed_done", False):
+        return False
+    added = False
+    if not conn.execute("SELECT 1 FROM email_subscribers WHERE user_email=? LIMIT 1", (email,)).fetchone():
+        added = bool(add_email_subscriber(conn, email, email))
+    set_user_pref(conn, email, "self_subscribed_done", True)
+    return added
+
+
+def get_active_subscribers(conn, user_email):
+    """Every one of THIS user's recipients who hasn't unsubscribed -- what
+    send_daily_digest_email actually iterates over for a real (non-test)
+    send."""
+    owner = _require_user_email(user_email)
     rows = conn.execute(
-        "SELECT email, unsubscribe_token FROM email_subscribers WHERE unsubscribed=0 ORDER BY subscribed_at"
+        "SELECT email, unsubscribe_token, sections_included FROM email_subscribers "
+        "WHERE user_email=? AND unsubscribed=0 ORDER BY subscribed_at", (owner,)
     ).fetchall()
-    return [{"email": r[0], "unsubscribe_token": r[1]} for r in rows]
+    return [{"email": r[0], "unsubscribe_token": r[1], "sections_included": r[2]} for r in rows]
+
+
+def get_subscriber_sections_included(sub_row):
+    """This subscriber's own section preferences, or DEFAULT_DIGEST_SECTIONS (all of them) if theirs is
+    NULL/unset/unparseable -- NULL/missing always means "all sections," never a silently-hidden one."""
+    raw = (sub_row or {}).get("sections_included")
+    if not raw:
+        return list(DEFAULT_DIGEST_SECTIONS)
+    try:
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+        return list(parsed) if isinstance(parsed, list) else list(DEFAULT_DIGEST_SECTIONS)
+    except (TypeError, ValueError):
+        return list(DEFAULT_DIGEST_SECTIONS)
+
+
+def get_subscriber_by_token(conn, token):
+    """Looks up a subscriber by their unsubscribe_token -- the SAME token the "Manage preferences" link
+    uses (tokenized the same way as unsubscribe; no separate token/column). Returns None if the token
+    doesn't match any subscriber. Used by both the no-login manage-preferences page and unsubscribe_by_token."""
+    row = conn.execute(
+        """SELECT user_email, email, unsubscribed, sections_included FROM email_subscribers
+           WHERE unsubscribe_token=?""",
+        (token,),
+    ).fetchone()
+    if not row:
+        return None
+    return {"user_email": row[0], "email": row[1], "unsubscribed": bool(row[2]), "sections_included": row[3]}
+
+
+def set_subscriber_sections_included(conn, token, sections):
+    """Updates ONE subscriber's own section preferences by token -- used by both the admin's subscriber-
+    list editor and the tokenized, no-login "Manage preferences" page. `sections` is a plain list of
+    section keys (an empty list is valid -- "receive the email but with every section hidden" is a real,
+    if odd, choice the subscriber is allowed to make; it is NOT the same as unsubscribing). Returns True
+    if a matching subscriber was found and updated."""
+    valid = [s for s in (sections or []) if s in DEFAULT_DIGEST_SECTIONS]
+    cur = conn.execute(
+        "UPDATE email_subscribers SET sections_included=? WHERE unsubscribe_token=?",
+        (json.dumps(valid), token),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def set_subscriber_active(conn, token, active):
+    """Flips a subscriber's receive-yes/no state by token -- reuses the exact same `unsubscribed` column
+    unsubscribe_by_token already owns, just token-addressable in both directions (that function is
+    unsubscribe-only). Returns the matched email, or None if the token doesn't match any subscriber.
+    Used by both the tokenized, no-login "Manage preferences" page and the admin's subscriber-list
+    editor."""
+    if not active:
+        return unsubscribe_by_token(conn, token)
+    row = conn.execute("SELECT email FROM email_subscribers WHERE unsubscribe_token=?", (token,)).fetchone()
+    if not row:
+        return None
+    conn.execute(
+        "UPDATE email_subscribers SET unsubscribed=0, unsubscribed_at=NULL, bounce_count=0 "
+        "WHERE unsubscribe_token=?",
+        (token,),
+    )
+    conn.commit()
+    return row[0]
 
 
 _EMAIL_FORMAT_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -15214,40 +17211,47 @@ def is_valid_email_format(email):
     return bool(_EMAIL_FORMAT_RE.match((email or "").strip()))
 
 
-def get_all_subscribers(conn):
+def get_all_subscribers(conn, user_email):
     """Every subscriber row, active AND unsubscribed alike (Part 1) --
     the SETTINGS table shows both so who opted out stays visible instead
     of silently disappearing. Ordered active-first (most actionable),
     then by subscribed_at within each group."""
+    owner = _require_user_email(user_email)
     rows = conn.execute(
-        """SELECT email, unsubscribe_token, subscribed_at, unsubscribed, unsubscribed_at, bounce_count
-           FROM email_subscribers ORDER BY unsubscribed ASC, subscribed_at ASC"""
+        """SELECT email, unsubscribe_token, subscribed_at, unsubscribed, unsubscribed_at, bounce_count,
+               sections_included
+           FROM email_subscribers WHERE user_email=? ORDER BY unsubscribed ASC, subscribed_at ASC""",
+        (owner,),
     ).fetchall()
-    cols = ["email", "unsubscribe_token", "subscribed_at", "unsubscribed", "unsubscribed_at", "bounce_count"]
+    cols = ["email", "unsubscribe_token", "subscribed_at", "unsubscribed", "unsubscribed_at", "bounce_count",
+            "sections_included"]
     return [dict(zip(cols, r)) for r in rows]
 
 
-def remove_email_subscriber(conn, email):
+def remove_email_subscriber(conn, user_email, email):
     """Hard delete -- Part 1's own distinction from unsubscribe (which
     just flips a flag, preserving history/dedup-of-re-adds): this is the
     admin removing someone outright, e.g. a typo'd address that should
     never have been added. Returns True if a row was actually deleted."""
+    owner = _require_user_email(user_email)
     email = (email or "").strip().lower()
-    cur = conn.execute("DELETE FROM email_subscribers WHERE email=?", (email,))
+    cur = conn.execute("DELETE FROM email_subscribers WHERE user_email=? AND email=?", (owner, email))
     conn.commit()
     return cur.rowcount > 0
 
 
-def resubscribe_email(conn, email):
+def resubscribe_email(conn, user_email, email):
     """Re-activates a previously-unsubscribed address (Part 1: 'in case
     someone asks to be re-added') -- clears unsubscribed/unsubscribed_at
     and resets bounce_count (a stale bounce history from before shouldn't
     count against them going forward), but keeps the ORIGINAL
     subscribed_at, since that's genuinely when they first joined."""
+    owner = _require_user_email(user_email)
     email = (email or "").strip().lower()
     conn.execute(
-        "UPDATE email_subscribers SET unsubscribed=0, unsubscribed_at=NULL, bounce_count=0 WHERE email=?",
-        (email,),
+        "UPDATE email_subscribers SET unsubscribed=0, unsubscribed_at=NULL, bounce_count=0 "
+        "WHERE user_email=? AND email=?",
+        (owner, email),
     )
     conn.commit()
 
@@ -15259,6 +17263,11 @@ def unsubscribe_by_token(conn, token):
     (dashboard.py's query-param handler) uses this to show an honest
     confirmation vs. an honest "that link isn't valid" message, never a
     generic success for a token that matched nothing."""
+    # The token is globally unique and identifies exactly ONE (user,
+    # recipient) subscription row -- so this only ever unsubscribes that
+    # recipient from that one user's digest, never from another user's
+    # digest they may separately receive. Works without any login (an
+    # emailed link must be usable by someone with no account).
     row = conn.execute("SELECT email FROM email_subscribers WHERE unsubscribe_token=?", (token,)).fetchone()
     if not row:
         return None
@@ -15279,25 +17288,30 @@ def unsubscribe_by_token(conn, token):
 EMAIL_BOUNCE_AUTO_UNSUBSCRIBE_THRESHOLD = 3
 
 
-def record_send_bounce(conn, email, error):
+def record_send_bounce(conn, user_email, email, error):
     """Increments this subscriber's bounce_count and auto-unsubscribes
     them once EMAIL_BOUNCE_AUTO_UNSUBSCRIBE_THRESHOLD is reached, logging
     clearly either way. Called from send_daily_digest_email's per-
     recipient send loop on a hard SMTP failure for that specific address
     (distinct from a whole-batch connection failure, which isn't any one
     subscriber's fault and never bounces anyone)."""
+    owner = _require_user_email(user_email)
     email = (email or "").strip().lower()
-    row = conn.execute("SELECT bounce_count FROM email_subscribers WHERE email=?", (email,)).fetchone()
+    row = conn.execute(
+        "SELECT bounce_count FROM email_subscribers WHERE user_email=? AND email=?", (owner, email)
+    ).fetchone()
     if not row:
         return
     new_count = (row[0] or 0) + 1
     now = datetime.utcnow().isoformat()
     conn.execute(
-        "UPDATE email_subscribers SET bounce_count=?, last_bounce_at=? WHERE email=?", (new_count, now, email)
+        "UPDATE email_subscribers SET bounce_count=?, last_bounce_at=? WHERE user_email=? AND email=?",
+        (new_count, now, owner, email),
     )
     if new_count >= EMAIL_BOUNCE_AUTO_UNSUBSCRIBE_THRESHOLD:
         conn.execute(
-            "UPDATE email_subscribers SET unsubscribed=1, unsubscribed_at=? WHERE email=?", (now, email)
+            "UPDATE email_subscribers SET unsubscribed=1, unsubscribed_at=? WHERE user_email=? AND email=?",
+            (now, owner, email),
         )
         print(f"[record_send_bounce] {email} auto-unsubscribed after {new_count} hard bounces: {error}")
     else:
@@ -15305,7 +17319,7 @@ def record_send_bounce(conn, email, error):
     conn.commit()
 
 
-def log_runners_scan(conn, runner_rows):
+def log_runners_scan(conn, user_email, runner_rows):
     """The RUNNERS tab's own unusual-activity scan block (dashboard.py) is
     this function's ONLY call site -- a purely additive logging side-
     effect alongside that tab's existing computation, changing nothing
@@ -15313,23 +17327,73 @@ def log_runners_scan(conn, runner_rows):
     price, chg_pct, vol_ratio, ...) -- whatever that scan already
     computed. Upserts once per calendar day so a later same-day rerun
     (e.g. price moved further) keeps the freshest read, not the first."""
-    today = date.today().isoformat()
+    owner = _require_user_email(user_email)
+    today = today_et().isoformat()
     conn.execute(
-        """INSERT INTO runners_scan_log (scan_date, runner_rows_json, scanned_at) VALUES (?,?,?)
-           ON CONFLICT(scan_date) DO UPDATE SET
+        """INSERT INTO runners_scan_log (user_email, scan_date, runner_rows_json, scanned_at) VALUES (?,?,?,?)
+           ON CONFLICT(user_email, scan_date) DO UPDATE SET
                runner_rows_json=excluded.runner_rows_json, scanned_at=excluded.scanned_at""",
-        (today, json.dumps(runner_rows, default=str), datetime.utcnow().isoformat()),
+        (owner, today, json.dumps(runner_rows, default=str), datetime.utcnow().isoformat()),
     )
     conn.commit()
 
 
-def get_todays_runner_rows(conn, as_of_date=None):
+def compute_and_log_runner_scan(conn, user_email, watchlist):
+    """The RUNNERS tab's unusual-activity scan, moved here verbatim (Part 2e of the launchd digest build: the
+    headless scheduled-send path needs to run this itself when today's scan hasn't happened yet, since there's
+    no UI open to do it) so dashboard.py's RUNNERS tab and digest/send.py's headless path share exactly one
+    implementation -- neither re-derives "what counts as unusual" on its own.
+
+    Same thresholds as always: volume >=2x the 20-day average, OR an intraday move >=3%; ranked by
+    "unusualness" (vol_ratio + |chg_pct|/3), capped at the top 4, logged via log_runners_scan (even the
+    empty-list outcome, so a genuine "scanned, found nothing" is distinguishable from "hasn't scanned yet").
+
+    Returns (top_rows, tickers, total_flagged) -- top_rows: up to 4 dicts {ticker, price, chg_pct, volume,
+    vol_ratio}, most-unusual first; tickers: just their symbols; total_flagged: how many watchlist tickers
+    were flagged before capping to 4 (dashboard.py's "Top N of M flagged" caption)."""
+    all_rows = []
+    for t in watchlist:
+        # price_max_age_hours=0.5 (2026-09-30 bug fix): the generic 4h price-history TTL left this
+        # "unusual REAL-TIME activity" scan showing a ticker's PRIOR session close for up to 4 hours
+        # whenever its last check happened to land near market open -- confirmed live (BE/LULU/ORCL stuck
+        # on yesterday's close mid-morning, no staleness warning shown since market_is_open suppresses it).
+        # info (fundamentals) freshness is unrelated and untouched at max_age_hours=12.
+        f_env_r = cached_fundamentals(conn, t, max_age_hours=12, price_max_age_hours=0.5)
+        pdf = f_env_r["data"]["price_df"]
+        if pdf.empty or len(pdf) < 21:
+            continue
+        latest = pdf.iloc[-1]
+        avg_vol_20d = pdf["Volume"].tail(21).iloc[:-1].mean()
+        vol_ratio = (latest["Volume"] / avg_vol_20d) if avg_vol_20d else None
+        chg_pct = float((pdf["Close"].iloc[-1] / pdf["Close"].iloc[-2] - 1) * 100) if len(pdf) > 1 else None
+        unusual_vol = vol_ratio is not None and vol_ratio >= 2.0
+        big_move = chg_pct is not None and abs(chg_pct) >= 3.0
+        if not (unusual_vol or big_move):
+            continue
+        unusualness = (vol_ratio or 0) + abs(chg_pct or 0) / 3.0
+        all_rows.append({"ticker": t, "price": float(latest["Close"]), "chg_pct": chg_pct,
+                          "volume": int(latest["Volume"]), "vol_ratio": vol_ratio, "_unusualness": unusualness})
+
+    all_rows.sort(key=lambda r: r["_unusualness"], reverse=True)
+    total_flagged = len(all_rows)
+    top = [{k: v for k, v in r.items() if k != "_unusualness"} for r in all_rows[:4]]
+    log_runners_scan(conn, user_email, [
+        {"ticker": r["ticker"], "price": r["price"], "chg_pct": r["chg_pct"], "vol_ratio": r["vol_ratio"]}
+        for r in top
+    ])
+    return top, [r["ticker"] for r in top], total_flagged
+
+
+def get_todays_runner_rows(conn, user_email, as_of_date=None):
     """None if today's Runners scan hasn't logged anything yet (the
     genuine 'not ready' state is_daily_digest_ready checks for) -- an
     empty list is a real, different state ('scan ran, found zero
     runners today')."""
-    scan_date = (as_of_date or date.today()).isoformat() if not isinstance(as_of_date, str) else as_of_date
-    row = conn.execute("SELECT runner_rows_json FROM runners_scan_log WHERE scan_date=?", (scan_date,)).fetchone()
+    scan_date = (as_of_date or today_et()).isoformat() if not isinstance(as_of_date, str) else as_of_date
+    owner = _require_user_email(user_email)
+    row = conn.execute(
+        "SELECT runner_rows_json FROM runners_scan_log WHERE user_email=? AND scan_date=?", (owner, scan_date)
+    ).fetchone()
     if not row:
         return None
     try:
@@ -15338,8 +17402,8 @@ def get_todays_runner_rows(conn, as_of_date=None):
         return []
 
 
-def get_todays_runner_tickers(conn, as_of_date=None):
-    rows = get_todays_runner_rows(conn, as_of_date=as_of_date)
+def get_todays_runner_tickers(conn, user_email, as_of_date=None):
+    rows = get_todays_runner_rows(conn, user_email, as_of_date=as_of_date)
     return None if rows is None else [r["ticker"] for r in rows]
 
 
@@ -15435,7 +17499,7 @@ def get_market_holiday_name(d):
     return _US_MARKET_HOLIDAY_NAMES.get(key)
 
 
-def is_daily_digest_ready(conn):
+def is_daily_digest_ready(conn, user_email):
     """Part 4. Returns (ready: bool, reasons: list[str]) -- reasons is
     empty iff ready. Only checks the gates the user has actually enabled
     in email_config (wait_for_runners/wait_for_predictions); with both
@@ -15443,10 +17507,10 @@ def is_daily_digest_ready(conn):
     a genuinely persisted runners_scan_log row for today (see
     log_runners_scan) -- not merely 'the RUNNERS tab happens to be open
     right now,' which would make this unusable as a background gate."""
-    config = get_email_config(conn)
+    config = get_email_config(conn, user_email)
     reasons = []
-    today = date.today().isoformat()
-    runner_tickers = get_todays_runner_tickers(conn) if (config["wait_for_runners"] or config["wait_for_predictions"]) else None
+    today = today_et().isoformat()
+    runner_tickers = get_todays_runner_tickers(conn, user_email) if (config["wait_for_runners"] or config["wait_for_predictions"]) else None
 
     if config["wait_for_runners"] and runner_tickers is None:
         reasons.append("Today's Runners scan has not run yet.")
@@ -15468,8 +17532,366 @@ def is_daily_digest_ready(conn):
     return (len(reasons) == 0, reasons)
 
 
+# --------------------------------------------------------------------------
+# DIGEST FOUNDATION: one price snapshot per ticker, NaN-proof number
+# formatting, a pre-send HTML validator, and the manual featured-stock
+# override. Everything a digest section prints as a number goes through
+# these -- see PriceSnapshot / fmt_* below.
+# --------------------------------------------------------------------------
+
+import logging
+from zoneinfo import ZoneInfo
+
+ET_ZONE = ZoneInfo("America/New_York")
+
+
+def now_et():
+    """The current moment in America/New_York -- the ONE clock every digest scheduling decision (send-time
+    comparison, "today", Runners-scan/Day-Prediction session keys) is measured against, regardless of what
+    timezone the machine running this process is actually set to. Never use datetime.now()/date.today() for
+    anything the digest schedule cares about -- see today_et()."""
+    return datetime.now(ET_ZONE)
+
+
+def today_et():
+    """The current ET calendar date -- what "today" means everywhere in the digest/Runners/Day-Prediction
+    scheduling system (runners_scan_log.scan_date, day_predictions.session_date, email_config.last_sent_date,
+    the digest's own as_of_date). NOT datetime.date.today(): that's the machine's LOCAL date, which on a
+    Pacific machine can differ from the ET date for up to 3 hours every evening -- exactly the class of bug
+    requirement 4 describes (a naive-local-date timestamp wrongly blocking/permitting the next ET day's
+    send)."""
+    return now_et().date()
+
+
+digest_log = logging.getLogger("smart_money.digest")
+if not digest_log.handlers:
+    _digest_handler = logging.StreamHandler()
+    _digest_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    digest_log.addHandler(_digest_handler)
+    digest_log.setLevel(logging.INFO)
+    digest_log.propagate = False
+
+
+def _finite(v):
+    """float(v) if v is a finite real number, else None. Never NaN/inf, and
+    never a str/bool masquerading as a number."""
+    if v is None or isinstance(v, (bool, str)):
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def pct_change(new, old):
+    """(new/old - 1) * 100, or None if either input is None/NaN/inf or old is 0."""
+    n, o = _finite(new), _finite(old)
+    if n is None or o is None or o == 0:
+        return None
+    return (n / o - 1.0) * 100.0
+
+
+def safe_div(a, b):
+    x, y = _finite(a), _finite(b)
+    if x is None or y is None or y == 0:
+        return None
+    return x / y
+
+
+def fmt_money(v, na="—"):
+    """"$441.36" / "-$3.10" / na. The only way a price reaches the template."""
+    f = _finite(v)
+    if f is None:
+        return na
+    return f"-${abs(f):,.2f}" if round(f, 2) < 0 else f"${abs(f):,.2f}"
+
+
+def fmt_pct(v, na="—", signed=True, digits=1):
+    """"+4.1%" / "-44.8%" / "0.0%" / na. A value that rounds to zero prints
+    as an unsigned "0.0%" so a sign can never contradict the digits."""
+    f = _finite(v)
+    if f is None:
+        return na
+    if round(f, digits) == 0:
+        return f"{0:.{digits}f}%"
+    return f"{f:+.{digits}f}%" if signed else f"{f:.{digits}f}%"
+
+
+def fmt_mult(v, na="—"):
+    """"2.2×" / na."""
+    f = _finite(v)
+    return na if f is None else f"{f:.1f}×"
+
+
+def fmt_num(v, digits=0, na="—"):
+    f = _finite(v)
+    return na if f is None else f"{f:,.{digits}f}"
+
+
 def _fmt_pct(v, digits=1):
-    return f"{v:+.{digits}f}%" if v is not None else "—"
+    """Legacy name used throughout the digest -- now NaN-proof."""
+    return fmt_pct(v, digits=digits)
+
+
+@dataclass
+class PriceSnapshot:
+    """Everything the digest needs to say about ONE ticker's price, taken
+    ONCE per digest build and shared by every section, so a ticker can
+    never show two different prices/RSIs in the same email. Any field that
+    can't be computed is None -- never NaN, never 0.0 as a stand-in."""
+    ticker: str
+    last: float | None = None
+    prev_close: float | None = None
+    open_: float | None = None
+    change_pct: float | None = None          # last vs prev_close
+    month_ago_close: float | None = None
+    high_52w: float | None = None
+    low_52w: float | None = None
+    volume: float | None = None
+    avg_volume_30d: float | None = None
+    rel_volume: float | None = None          # volume / avg_volume_30d
+    rsi: float | None = None
+    macd_hist: float | None = None
+    expected_move_1w_abs: float | None = None
+    as_of: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    macd_hist_prev: float | None = None      # extra: lets the Runners read say "rising/falling" from the same source
+    expected_move_2w_abs: float | None = None  # extra: same IV + formula as the 1-week move, 10 trading days
+
+
+def get_price_snapshot(ticker, conn=None):
+    """Builds a PriceSnapshot from ONE yfinance history call
+    (period="1y", interval="1d") plus a last-price fallback chain. `conn`
+    (optional) is only used to read the cached ATM implied vol for the
+    one-week expected move (options data can't come from price history)."""
+    ticker = (ticker or "").strip().upper()
+    snap = PriceSnapshot(ticker=ticker)
+    try:
+        tk = yf.Ticker(ticker)
+        hist = tk.history(period="1y", interval="1d")
+    except Exception as e:
+        digest_log.warning("[SNAPSHOT] %s: history fetch failed (%s)", ticker, e)
+        return snap
+    if hist is None or hist.empty or "Close" not in hist:
+        digest_log.warning("[SNAPSHOT] %s: no price history returned", ticker)
+        return snap
+    closes = hist["Close"].dropna()
+
+    # last: first FINITE, positive value from the chain (a warning names the winner when it isn't the first)
+    info_cache = {}
+
+    def _info():
+        if "v" not in info_cache:
+            try:
+                info_cache["v"] = tk.get_info() or {}
+            except Exception:
+                info_cache["v"] = {}
+        return info_cache["v"]
+
+    chain = [
+        ("fast_info.last_price", lambda: tk.fast_info.last_price),
+        ("info.currentPrice", lambda: _info().get("currentPrice")),
+        ("info.regularMarketPrice", lambda: _info().get("regularMarketPrice")),
+        ("history.Close[-1]", lambda: closes.iloc[-1] if len(closes) else None),
+    ]
+    for i, (name, fn) in enumerate(chain):
+        try:
+            v = _finite(fn())
+        except Exception:
+            v = None
+        if v is not None and v > 0:
+            snap.last = v
+            if i > 0:
+                digest_log.warning("[SNAPSHOT] %s: last price came from %s (earlier sources unavailable)", ticker, name)
+            break
+    if snap.last is None:
+        digest_log.warning("[SNAPSHOT] %s: no usable last price from any source", ticker)
+
+    if len(closes) >= 2:
+        pc = _finite(closes.iloc[-2])
+        snap.prev_close = pc if pc and pc > 0 else None
+    snap.change_pct = pct_change(snap.last, snap.prev_close)
+    if "Open" in hist and len(hist):
+        o = _finite(hist["Open"].iloc[-1])
+        snap.open_ = o if o and o > 0 else None
+    if len(closes):
+        cutoff = closes.index[-1] - pd.Timedelta(days=30)
+        older = closes[closes.index <= cutoff]
+        m = _finite(older.iloc[-1]) if len(older) else None
+        snap.month_ago_close = m if m and m > 0 else None
+
+    hi = _finite(hist["High"].max()) if "High" in hist else None
+    lo = _finite(hist["Low"].min()) if "Low" in hist else None
+    if snap.last is not None:
+        hi = max(hi, snap.last) if hi is not None else None
+        lo = min(lo, snap.last) if lo is not None else None
+    snap.high_52w = hi if hi and hi > 0 else None
+    snap.low_52w = lo if lo and lo > 0 else None
+
+    if "Volume" in hist and len(hist) >= 11:
+        vol = _finite(hist["Volume"].iloc[-1])
+        prior = hist["Volume"].iloc[-31:-1].dropna()
+        avg = _finite(prior.mean()) if len(prior) >= 10 else None
+        snap.volume = vol if vol and vol > 0 else None
+        snap.avg_volume_30d = avg if avg and avg > 0 else None
+        snap.rel_volume = safe_div(snap.volume, snap.avg_volume_30d)
+
+    try:
+        tech = _add_technicals(hist)
+        snap.rsi = _finite(tech["RSI14"].iloc[-1])
+        snap.macd_hist = _finite(tech["MACD_hist"].iloc[-1])
+        snap.macd_hist_prev = _finite(tech["MACD_hist"].iloc[-2]) if len(tech) >= 2 else None
+    except Exception as e:
+        digest_log.warning("[SNAPSHOT] %s: technicals unavailable (%s)", ticker, e)
+
+    if conn is not None and snap.last is not None:
+        try:
+            row = conn.execute(
+                "SELECT atm_avg_iv_pct FROM earnings_signal WHERE ticker=? ORDER BY fetched_at DESC LIMIT 1",
+                (ticker,),
+            ).fetchone()
+            iv = _finite(row[0]) if row else None
+            if iv is not None and iv > 0:
+                snap.expected_move_1w_abs = _finite(calculate_expected_move_iv(snap.last, iv, days=5))
+                snap.expected_move_2w_abs = _finite(calculate_expected_move_iv(snap.last, iv, days=10))
+        except Exception:
+            pass
+    return snap
+
+
+class SnapshotCache:
+    """One PriceSnapshot per ticker for the duration of ONE digest build.
+    Every section reads through .get(), so the same ticker can't be fetched
+    twice (or show two different prices) within an email."""
+
+    def __init__(self, conn=None):
+        self.conn = conn
+        self._by_ticker = {}
+
+    def get(self, ticker):
+        t = (ticker or "").strip().upper()
+        if t not in self._by_ticker:
+            self._by_ticker[t] = get_price_snapshot(t, conn=self.conn)
+        return self._by_ticker[t]
+
+
+# ---- pre-send HTML validation ----
+
+_TAG_RE = re.compile(r"<[^>]+>")
+_STYLE_RE = re.compile(r"<style.*?</style>", re.S | re.I)
+_BAD_TEXT_PATTERNS = [
+    ("nan", re.compile(r"(?<![A-Za-z0-9])nan(?![A-Za-z0-9])", re.I)),
+    ("inf", re.compile(r"(?<![A-Za-z0-9])-?inf(?:inity)?(?![A-Za-z0-9])", re.I)),
+    ("None", re.compile(r"(?<![A-Za-z0-9])None(?![A-Za-z0-9])")),
+    ("null", re.compile(r"(?<![A-Za-z0-9])null(?![A-Za-z0-9])", re.I)),
+    ("%%", re.compile(r"%%")),
+    ("$-", re.compile(r"\$-")),
+]
+_EMPTY_CELL_RE = re.compile(r"<t[dh][^>]*>\s*</t[dh]>", re.I)
+
+
+def validate_digest_html(html_text):
+    """Scans a rendered digest for anything that means a number failed to
+    format: 'nan', 'inf', 'None', 'null', '%%', '$-', and empty table
+    cells. Text patterns are checked against the VISIBLE text (tags and CSS
+    stripped) so attribute/style content can't false-positive. Returns a
+    list of human-readable problems, each with ~60 chars of context."""
+    problems = []
+    visible = _TAG_RE.sub(" ", _STYLE_RE.sub("", html_text))
+    for label, rx in _BAD_TEXT_PATTERNS:
+        for m in rx.finditer(visible):
+            a, b = max(0, m.start() - 60), min(len(visible), m.end() + 60)
+            problems.append(f"'{label}' near: …{' '.join(visible[a:b].split())}…")
+    for m in _EMPTY_CELL_RE.finditer(html_text):
+        a, b = max(0, m.start() - 60), min(len(html_text), m.end() + 60)
+        problems.append(f"empty table cell near: …{' '.join(html_text[a:b].split())}…")
+    return problems
+
+
+# ---- manual featured-stock override (digest_settings) ----
+
+def get_digest_setting(conn, key, default=None):
+    row = conn.execute("SELECT value FROM digest_settings WHERE key=?", (key,)).fetchone()
+    return row[0] if row and row[0] is not None else default
+
+
+def set_digest_setting(conn, key, value):
+    conn.execute(
+        "INSERT INTO digest_settings (key, value, updated_at) VALUES (?,?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+        (key, value, datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+
+
+def delete_digest_setting(conn, key):
+    conn.execute("DELETE FROM digest_settings WHERE key=?", (key,))
+    conn.commit()
+
+
+FEATURED_OVERRIDE_ONCE_DAYS = 7      # a one-time pick that's never used (digest off) lapses after a week
+FEATURED_OVERRIDE_STICKY_DAYS = 14   # a forgotten sticky pick lapses on its own; the UI states this
+
+
+def _featured_override_key(user_email):
+    return f"featured_override:{_require_user_email(user_email)}"
+
+
+def get_featured_override(conn, user_email, include_expired=False):
+    """{"ticker","mode","expires_at"} or None. An override whose expires_at
+    date has passed is treated as unset (unless include_expired)."""
+    raw = get_digest_setting(conn, _featured_override_key(user_email))
+    if not raw:
+        return None
+    try:
+        ov = json.loads(raw)
+        ticker = str(ov["ticker"]).strip().upper()
+    except (ValueError, KeyError, TypeError):
+        return None
+    out = {"ticker": ticker, "mode": ov.get("mode") if ov.get("mode") in ("once", "sticky") else "once",
+           "expires_at": ov.get("expires_at")}
+    if not include_expired and out["expires_at"]:
+        try:
+            if date.today() > date.fromisoformat(out["expires_at"]):
+                return None
+        except ValueError:
+            pass
+    return out
+
+
+def set_featured_override(conn, user_email, ticker, mode="once", expires_at=None):
+    if mode not in ("once", "sticky"):
+        raise ValueError("mode must be 'once' or 'sticky'")
+    ticker = (ticker or "").strip().upper()
+    if not ticker:
+        raise ValueError("ticker is required")
+    if expires_at is None:
+        days = FEATURED_OVERRIDE_ONCE_DAYS if mode == "once" else FEATURED_OVERRIDE_STICKY_DAYS
+        expires_at = (date.today() + timedelta(days=days)).isoformat()
+    set_digest_setting(conn, _featured_override_key(user_email),
+                       json.dumps({"ticker": ticker, "mode": mode, "expires_at": expires_at}))
+    return get_featured_override(conn, user_email)
+
+
+def clear_featured_override(conn, user_email):
+    delete_digest_setting(conn, _featured_override_key(user_email))
+
+
+def _resolve_featured_override(conn, user_email, snapshots=None):
+    """The override ticker if one is set, unexpired, AND resolves to a real
+    price snapshot -- else None (with a WARNING when a set override can't
+    be honored, so it falls through to the ranked rule visibly)."""
+    ov = get_featured_override(conn, user_email)
+    if not ov:
+        return None
+    snaps = snapshots or SnapshotCache(conn)
+    snap = snaps.get(ov["ticker"])
+    if snap is None or _finite(snap.last) is None:
+        digest_log.warning("[DIGEST] Featured override %r could not be resolved to a price -- falling back to auto",
+                           ov["ticker"])
+        return None
+    return ov["ticker"]
+
 
 
 # --------------------------------------------------------------------------
@@ -15484,7 +17906,7 @@ _DAY_PREDICTION_MODE_LABEL = {"raw_pattern": "Mode 1", "bayesian": "Mode 2", "tr
 _DAY_PREDICTION_MODE_SCORE = {"raw_pattern": 1, "bayesian": 2, "trained_model": 3}
 
 
-def get_recently_featured_tickers(conn, days_back=6):
+def get_recently_featured_tickers(conn, user_email, days_back=6):
     """Tickers that were the Featured Stock in any digest actually sent in
     the last `days_back` days -- read from digest_email_log.featured_ticker
     (populated by send_daily_digest_email as of the repeat-avoidance fix
@@ -15492,16 +17914,17 @@ def get_recently_featured_tickers(conn, days_back=6):
     and are correctly ignored -- there's no way to know what they featured,
     and treating NULL as "not recently featured" is the safe default (it
     can only under-exclude, never wrongly block a ticker forever)."""
+    owner = _require_user_email(user_email)
     cutoff = (pd.Timestamp.now(tz="UTC") - timedelta(days=days_back)).isoformat()
     rows = conn.execute(
         "SELECT DISTINCT featured_ticker FROM digest_email_log "
-        "WHERE featured_ticker IS NOT NULL AND sent_at >= ?",
-        (cutoff,),
+        "WHERE user_email=? AND featured_ticker IS NOT NULL AND sent_at >= ?",
+        (owner, cutoff),
     ).fetchall()
     return {r[0] for r in rows}
 
 
-def select_featured_stock(conn):
+def select_featured_stock(conn, user_email, snapshots=None):
     """Part 1. Ranks today's Runners (falling back to the full watchlist
     if Runners hasn't found -- or hasn't yet scanned for -- anything
     today) by a simple combined score: largest same-day |% move| +
@@ -15514,7 +17937,8 @@ def select_featured_stock(conn):
     x0.5 -- a genuine popularity signal, not a guessed one: more cached
     posts means more people are actually talking about that ticker right
     now). Returns the single highest-scoring ticker, or None if the
-    watchlist is empty.
+    watchlist is empty. RETURNS (ticker, source) with source 'manual'
+    (an unexpired override that resolved to a real price) or 'auto'.
 
     Repeat-avoidance: without this, the same highest-conviction ticker
     (confirmed live: MU, day after day) can dominate this score every
@@ -15526,14 +17950,25 @@ def select_featured_stock(conn):
     happen if EVERY candidate was recently featured (a tiny watchlist edge
     case) -- in which case the exclusion is dropped entirely for this run
     rather than returning None, since a stale pick beats no pick."""
-    watchlist = load_watchlist()
+    watchlist = load_watchlist(conn, user_email)
     if not watchlist:
-        return None
+        return None, "auto"
 
-    runner_rows = get_todays_runner_rows(conn) or []
-    candidates = [r["ticker"] for r in runner_rows] if runner_rows else watchlist
+    # A manual pick (SETTINGS -> Digest settings) wins over the ranked rule below, which is unchanged.
+    override_ticker = _resolve_featured_override(conn, user_email, snapshots)
+    if override_ticker:
+        _ov = get_featured_override(conn, user_email)
+        digest_log.info("[DIGEST] Featured stock: %s (manual, %s)", override_ticker, _ov["mode"])
+        return override_ticker, "manual"
 
-    recently_featured = get_recently_featured_tickers(conn, days_back=6)
+    # Candidates come ONLY from this user's own watchlist: today's Runners
+    # rows are already per-user (runners_scan_log), and the recently-
+    # featured exclusion reads only this user's own send history.
+    runner_rows = get_todays_runner_rows(conn, user_email) or []
+    runner_candidates = [r["ticker"] for r in runner_rows if r["ticker"] in watchlist]
+    candidates = runner_candidates or watchlist
+
+    recently_featured = get_recently_featured_tickers(conn, user_email, days_back=6)
     fresh_candidates = [t for t in candidates if t not in recently_featured]
     if fresh_candidates:
         candidates = fresh_candidates
@@ -15578,7 +18013,8 @@ def select_featured_stock(conn):
         scored.append((ticker, total))
 
     scored.sort(key=lambda x: x[1], reverse=True)
-    return scored[0][0]
+    digest_log.info("[DIGEST] Featured stock: %s (auto, score %.1f)", scored[0][0], scored[0][1])
+    return scored[0][0], "auto"
 
 
 def _get_institutional_signal_table(ticker, conn):
@@ -15663,7 +18099,7 @@ def _get_institutional_signal_table(ticker, conn):
     return rows
 
 
-def get_featured_stock_section(ticker, conn):
+def get_featured_stock_section(ticker, conn, snapshot=None, source=None):
     """Part 1. Pulls (or, if the cached one is >4h old, freshly generates
     via generate_deep_analysis -- unmodified, including its own
     [CLAUDE API] cost logging) this ticker's AI Briefing, plus its 5 most
@@ -15695,19 +18131,611 @@ def get_featured_stock_section(ticker, conn):
     news_items = []
     if news_df is not None and not news_df.empty:
         for _, r in news_df.head(5).iterrows():
+            # "link" is carried through (news_cache has always had the column -- see _read_news_cache)
+            # purely for the Substack conversion's "News headlines: keep as text with links" (2026-10-14)
+            # -- the email's own HTML template never reads this key, so adding it changes zero email bytes.
+            link = r.get("link")
             news_items.append({
                 "title": r["title"], "publisher": r["publisher"],
                 "published_at": r["published_at"].isoformat() if pd.notna(r.get("published_at")) else None,
+                "link": link if isinstance(link, str) and link else None,
             })
 
+    # ONE price for this ticker: the digest's shared snapshot when the caller has one (the normal path),
+    # else the cached price -- never a third source.
+    price = _finite(snapshot.last) if snapshot is not None else get_latest_cached_price(conn, ticker)
+    analyst = _get_analyst_targets_section(ticker, conn)
+    if analyst is not None:
+        analyst["current_price"] = price
     return {
-        "ticker": ticker, "brief": brief, "news": news_items,
-        "current_price": get_latest_cached_price(conn, ticker),
+        "ticker": ticker, "brief": brief, "news": news_items, "current_price": price,
         "institutional_table": _get_institutional_signal_table(ticker, conn),
+        "analyst_targets": analyst, "source": source,
+        "swing_outlook": get_swing_outlook(conn, ticker),
     }
 
 
-def _runner_technical_read(conn, ticker):
+_REC_ORDER = [("strongBuy", "Strong Buy", "#0ca30c"), ("buy", "Buy", "#6cc06c"), ("hold", "Hold", "#8b9bab"),
+              ("sell", "Sell", "#eba0a0"), ("strongSell", "Strong Sell", "#e66767")]
+
+
+# --------------------------------------------------------------------------
+# 2-WEEK SWING OUTLOOK for the digest's featured stock. Pure plumbing over what the
+# SWING FORECAST tab already uses: compute_swing_forecast (the Overall Verdict payload),
+# log_swing_forecast (the idempotent per-day commit that also caches the simulated path),
+# get_committed_swing_path. No model, no scoring, no table of its own.
+# --------------------------------------------------------------------------
+
+SWING_OUTLOOK_HORIZON_DAYS = 10
+_SWING_MODE_LABEL = {"raw_pattern": "Mode 1: raw pattern", "bayesian": "Mode 2: Bayesian",
+                     "trained_model": "Mode 3: trained model"}
+
+
+def swing_move_pct(sw):
+    """Target vs the forecast's own start price -- the same arithmetic the dashboard's verdict uses."""
+    return pct_change(sw.get("target_price"), sw.get("current_price"))
+
+
+def swing_verdict_line(ticker, sw):
+    """The dashboard's verdict sentence, word for word (its markdown bold / colour dot removed):
+    'UP — NOW target $147.29 (+8.73%) by 2026-10-02 (10 trading days). Mode 3: trained model (225 reconciled
+    10-day session(s) on record, avg |error| 9.79%).'  None if the forecast has no usable target."""
+    move = swing_move_pct(sw)
+    if move is None or _finite(sw.get("target_price")) is None:
+        return None
+    h = sw.get("horizon_days")
+    mode = _SWING_MODE_LABEL.get(sw.get("mode"), sw.get("mode"))
+    err = _finite(sw.get("backtest_error_pct"))
+    return (f"{sw.get('predicted_direction')} — {ticker} target ${sw['target_price']:.2f} ({move:+.2f}%) by "
+            f"{sw.get('target_date')} ({h} trading days). {mode} ({sw.get('backtest_n') or 0} reconciled "
+            f"{h}-day session(s) on record" + (f", avg |error| {err:.2f}%" if err is not None else "") + ").")
+
+
+def build_swing_chart_data(conn, ticker, sw, history_days=30):
+    """Data for the email's projected-path chart -- the dashboard chart's three series (Close, projected path,
+    p10-p90 band) with its two rendering defects fixed at the data level:
+      (a) the projection STARTS AT the last plotted close. The committed path begins at the (earlier / differently
+          priced) commit-time start, so its points are re-anchored: the start offset fades linearly to zero at the
+          end, and the end is pinned to the verdict's target, so the line still lands exactly on the target.
+      (b) the band is a cone: zero width at the last close, widening linearly to [band_low, band_high] at the
+          target date -- shaded across the whole projected span, not a sliver at the far right.
+    None if there's no price history to anchor on."""
+    hist = get_history(conn, "price_history", ticker, days_back=60)
+    if hist is None or hist.empty:
+        return None
+    hist = hist.copy()
+    hist["date"] = pd.to_datetime(hist["date"])
+    hist = hist.sort_values("date").dropna(subset=["close"]).tail(history_days)
+    if hist.empty:
+        return None
+    last_date = hist["date"].iloc[-1]
+    anchor = float(hist["close"].iloc[-1])
+    target, target_date = _finite(sw.get("target_price")), pd.Timestamp(sw["target_date"])
+
+    committed = [(pd.Timestamp(d), float(p)) for d, p in get_committed_swing_path(
+        conn, ticker, sw["horizon_days"], sw["session_date"]) if _finite(p) is not None]
+    later = [(d, p) for d, p in committed if d > last_date]
+    path = [(last_date, anchor)]
+    if later and target is not None:
+        k = len(later)
+        d_start = anchor - committed[0][1]            # how far the committed start sits from the last close
+        d_end = target - later[-1][1]                 # pin the end to the verdict's target
+        for i, (d, p) in enumerate(later, 1):
+            frac = i / k
+            path.append((d, round(p + d_start * (1 - frac) + d_end * frac, 2)))
+    elif target is not None:
+        path.append((target_date, target))
+    band = None
+    lo, hi = _finite(sw.get("band_low")), _finite(sw.get("band_high"))
+    if lo is not None and hi is not None and len(path) >= 2:
+        n = len(path) - 1
+        band = {"dates": [d.isoformat() for d, _ in path],
+                "low": [round(anchor + (lo - anchor) * i / n, 2) for i in range(n + 1)],
+                "high": [round(anchor + (hi - anchor) * i / n, 2) for i in range(n + 1)]}
+    return {"hist_dates": [d.isoformat() for d in hist["date"]], "hist_close": [float(c) for c in hist["close"]],
+            "path": [(d.isoformat(), p) for d, p in path], "band": band,
+            "direction": sw.get("predicted_direction"), "horizon_days": sw["horizon_days"]}
+
+
+def get_swing_outlook(conn, ticker, horizon_days=SWING_OUTLOOK_HORIZON_DAYS):
+    """The featured stock's 10-day swing outlook, or None when there's no forecast for it (not enough
+    history, etc.) -- callers then omit the whole section. Commits the forecast the same way the SWING
+    FORECAST tab does (idempotent per ticker/horizon/day: first commit wins, and the cached path is shared), so
+    the email and the dashboard show one committed prediction and one path. That row is the same real,
+    published-to-readers prediction the track record is meant to grade."""
+    try:
+        sw = compute_swing_forecast(ticker, conn, horizon_days)
+    except Exception as e:
+        digest_log.warning("[DIGEST] %s: swing forecast unavailable (%s)", ticker, e)
+        return None
+    if not sw or not sw.get("ready") or _finite(sw.get("target_price")) is None or _finite(sw.get("current_price")) is None:
+        return None
+    try:
+        log_swing_forecast(conn, ticker, sw)
+    except Exception as e:
+        digest_log.warning("[DIGEST] %s: swing forecast commit failed (%s)", ticker, e)
+    keep = ("ticker", "horizon_days", "session_date", "target_date", "current_price", "target_price",
+            "predicted_direction", "band_low", "band_high", "confidence_level", "mode", "backtest_n",
+            "backtest_error_pct")
+    out = {k: sw.get(k) for k in keep}
+    try:
+        out["chart"] = build_swing_chart_data(conn, ticker, out)
+    except Exception as e:
+        digest_log.warning("[DIGEST] %s: swing chart data unavailable (%s)", ticker, e)
+        out["chart"] = None
+    return out
+
+
+def _get_analyst_targets_section(ticker, conn):
+    """The dashboard's EARNINGS & ANALYST TARGETS panel as plain data (same
+    cached_* calls, same fields): next earnings date, consensus
+    recommendation + analyst count, the latest reported EPS/revenue
+    beat-or-miss, the Strong Buy..Strong Sell breakdown, and the analyst
+    price-target Low/Mean/Median/High. The two charts themselves (breakdown
+    bar, price-target fan) are drawn by dashboard.py -- data_engine.py never
+    imports plotly -- and attached as inline images. None if there's
+    nothing at all to show."""
+    try:
+        targets = cached_analyst_targets(conn, ticker, max_age_hours=12).get("data") or {}
+        earnings = cached_earnings_calendar(conn, ticker, max_age_hours=12).get("data") or {}
+        ehr = cached_earnings_history_real(conn, ticker, max_age_hours=12).get("data") or []
+    except Exception as e:
+        print(f"[_get_analyst_targets_section] {ticker}: {e}")
+        return None
+    latest = None
+    for r in ehr:
+        if r.get("eps_beat_miss_pct") is not None or r.get("revenue_beat_miss_pct") is not None:
+            latest = {"date": r.get("earnings_date"), "eps_pct": r.get("eps_beat_miss_pct"),
+                      "rev_pct": r.get("revenue_beat_miss_pct")}
+            break
+    rec_counts = {k: targets.get(k) for k, _, _ in _REC_ORDER}
+    out = {
+        "next_earnings_date": earnings.get("next_earnings_date"),
+        # Yahoo reports the key "none" when there is no consensus -- that's "no data", not a rating to print.
+        "recommendation": (None if str(targets.get("recommendationKey") or "").strip().lower() in ("", "none", "null", "nan")
+                           else str(targets["recommendationKey"]).upper().replace("_", " ")),
+        "n_analysts": targets.get("numberOfAnalystOpinions"),
+        "latest_reported": latest,
+        "rec_counts": rec_counts if any(rec_counts.values()) else None,
+        "rec_period": targets.get("rec_period"),
+        "target_low": targets.get("targetLowPrice"), "target_mean": targets.get("targetMeanPrice"),
+        "target_median": targets.get("targetMedianPrice"), "target_high": targets.get("targetHighPrice"),
+        "current_price": get_latest_cached_price(conn, ticker),
+    }
+    has_targets = any(_finite(out[k]) is not None for k in ("target_low", "target_mean", "target_median", "target_high"))
+    if not (out["next_earnings_date"] or out["recommendation"] or out["rec_counts"] or has_targets):
+        return None
+    out["has_targets"] = has_targets
+    return out
+
+
+def _month_descriptor(m):
+    """Words for the past-month move, derived from the SAME signed number that's displayed."""
+    return ("a big run-up" if m >= 20 else "a strong month" if m >= 8 else "a modest gain" if m >= 2
+            else "about flat" if m > -2 else "a modest slide" if m > -8 else "a clear pullback" if m > -20
+            else "a sharp drop")
+
+
+def _rsi_descriptor(rsi):
+    return ("overheated — stocks often pause or pull back from here" if rsi >= 70
+            else "healthy uptrend, not overheated" if rsi >= 55
+            else "neutral — no strong push either way" if rsi >= 45
+            else "weak" if rsi >= 30 else "beaten down — sellers may be running out of steam")
+
+
+def _digest_levels(conn, ticker, brief=None):
+    """Support/resistance via the EXISTING detect_technical_levels (falls back to the briefing's stored copy)."""
+    try:
+        levels = detect_technical_levels(ticker, conn=conn)
+    except Exception as e:
+        digest_log.warning("[DIGEST] %s: technical levels unavailable (%s)", ticker, e)
+        levels = None
+    if not levels and brief:
+        levels = brief.get("technical_levels_snapshot")
+    return levels or {}
+
+
+def build_overview_sentence(snap):
+    """2-3 plain sentences assembled from clauses that are each emitted ONLY
+    if their data exists -- a missing field drops its clause, it never
+    prints a placeholder. Every direction word comes from the same signed
+    number it describes. None if there's nothing to say at all."""
+    t = snap.ticker
+    last, chg, rel = _finite(snap.last), _finite(snap.change_pct), _finite(snap.rel_volume)
+    sentences = []
+
+    if last is not None:
+        s1 = f"{t} trades at {fmt_money(last)}"
+        if chg is not None:
+            s1 += ", flat on the day" if round(chg, 1) == 0 else f", {'up' if chg > 0 else 'down'} {abs(chg):.1f}% on the day"
+        if rel is not None:
+            s1 += f" on {fmt_mult(rel)} normal volume"
+        sentences.append(s1 + ".")
+    pron = "It" if sentences else t
+
+    d = pct_change(snap.last, snap.high_52w)
+    m = pct_change(snap.last, snap.month_ago_close)
+    a = b = None
+    if d is not None:
+        a = (f"is at its 52-week high of {fmt_money(snap.high_52w)}" if round(d, 1) >= 0
+             else f"sits {abs(d):.1f}% below its 52-week high of {fmt_money(snap.high_52w)}")
+    if m is not None:
+        b = ("is flat over the past month" if round(m, 1) == 0
+             else f"is {'up' if m > 0 else 'down'} {abs(m):.1f}% over the past month")
+    if a and b:
+        sentences.append(f"{pron} {a} and {b}.")
+    elif a or b:
+        sentences.append(f"{pron} {a or b}.")
+
+    rsi, macd = _finite(snap.rsi), _finite(snap.macd_hist)
+    mom = None
+    if rsi is not None:
+        word = ("overbought" if rsi >= 70 else "strong" if rsi >= 55 else "neutral" if rsi >= 45
+                else "weak" if rsi >= 30 else "oversold")
+        mom = f"Momentum is {word} — RSI {rsi:.0f}"
+        if macd is not None:
+            weak = rsi < 45
+            mom += f" with MACD {'still ' if (weak and macd < 0) else ''}{'positive' if macd > 0 else 'negative' if macd < 0 else 'flat'}"
+        mom += " —"
+    em = _finite(snap.expected_move_1w_abs)
+    emtxt = None
+    if em is not None:
+        pct = safe_div(em, last)
+        emtxt = f"options are pricing a ±{fmt_money(em)}" + (f" (±{pct * 100:.1f}%)" if pct is not None else "") + " move over the next week"
+    if mom and emtxt:
+        sentences.append(f"{mom} and {emtxt}.")
+    elif mom:
+        sentences.append(mom.rstrip(" —") + ".")
+    elif emtxt:
+        sentences.append(emtxt[0].upper() + emtxt[1:] + ".")
+    return " ".join(sentences) or None
+
+
+def _build_key_stats(snap, levels):
+    """Nine label/value/note cards from the ONE snapshot (+ detected levels).
+    A card whose data is missing still renders, with "—" (so a gap is
+    visible, never a placeholder like 'nan' and never a silently shifted
+    grid); a note is only written when its number exists."""
+    last = _finite(snap.last)
+    stats = []
+
+    def add(label, value, note=None):
+        stats.append({"label": label, "value": value, "note": note})
+
+    chg = _finite(snap.change_pct)
+    add("Price", fmt_money(last),
+        None if chg is None else ("flat today" if round(chg, 1) == 0 else f"{'up' if chg > 0 else 'down'} {abs(chg):.1f}% today"))
+
+    m = pct_change(snap.last, snap.month_ago_close)
+    add("Past month", fmt_pct(m), None if m is None else _month_descriptor(m))
+
+    d = pct_change(snap.last, snap.high_52w)
+    add("vs 52-week high", fmt_pct(d), None if d is None else f"high was {fmt_money(snap.high_52w)}")
+
+    rsi = _finite(snap.rsi)
+    add("Momentum (RSI)", "—" if rsi is None else f"{rsi:.0f} out of 100", None if rsi is None else _rsi_descriptor(rsi))
+
+    macd = _finite(snap.macd_hist)
+    add("Trend direction", "—" if macd is None else ("Improving" if macd > 0 else "Fading" if macd < 0 else "Flat"),
+        None if macd is None else ("buyers are gaining ground" if macd > 0 else "sellers are gaining ground" if macd < 0
+                                    else "buyers and sellers are balanced"))
+
+    rel = _finite(snap.rel_volume)
+    add("Trading volume", "—" if rel is None else f"{fmt_mult(rel)} normal",
+        None if rel is None else ("heavy interest — something is drawing attention" if rel >= 2 else "busier than usual"
+                                   if rel >= 1.2 else "normal" if rel >= 0.8
+                                   else "quiet — a move on thin trading is less convincing"))
+
+    below = [lv["level"] for lv in levels.get("support_levels", []) if last is not None and lv["level"] < last]
+    above = [lv["level"] for lv in levels.get("resistance_levels", []) if last is not None and lv["level"] > last]
+    if below:
+        lv = max(below)
+        add("Nearest floor", fmt_money(lv), f"{abs(pct_change(lv, last) or 0):.1f}% below — where buyers stepped in before")
+    else:
+        add("Nearest floor", "—")
+    if above:
+        lv = min(above)
+        add("Nearest ceiling", fmt_money(lv), f"{abs(pct_change(lv, last) or 0):.1f}% above — where sellers showed up before")
+    else:
+        add("Nearest ceiling", "—")
+
+    em = _finite(snap.expected_move_1w_abs)
+    if em is None:
+        add("Expected 1-week swing", "—")
+    else:
+        pct = safe_div(em, last)
+        add("Expected 1-week swing", f"±{fmt_money(em)}" + (f" (±{pct * 100:.1f}%)" if pct is not None else ""),
+            "what options traders are pricing in")
+    em2 = _finite(snap.expected_move_2w_abs)
+    if em2 is None:
+        add("Expected 2-week swing", "—")
+    else:
+        pct2 = safe_div(em2, last)
+        add("Expected 2-week swing", f"±{fmt_money(em2)}" + (f" (±{pct2 * 100:.1f}%)" if pct2 is not None else ""),
+            "what options traders are pricing in")
+    return stats
+
+
+def pmset_wake_command_for(send_time_et, minutes_before=10, days="MTWRF"):
+    """The exact `sudo pmset repeat wakeorpoweron` command to wake THIS machine (whatever local timezone it's
+    actually set to -- never assumed to be Pacific or any other specific zone) `minutes_before` a given ET
+    send time, converted via zoneinfo (never a hardcoded ET-minus-N-hours offset, which would silently go
+    wrong across a DST transition where ET and the local zone change on different dates). Returns
+    (command_str, local_time_str, local_tz_name). Needs sudo, so this is never run automatically -- only
+    ever printed for a human to run themselves (Part 5: "This needs sudo so it can't follow the UI
+    automatically")."""
+    hour, minute = (int(x) for x in send_time_et.split(":"))
+    et_dt = datetime.now(ET_ZONE).replace(hour=hour, minute=minute, second=0, microsecond=0) - timedelta(minutes=minutes_before)
+    local_tz = datetime.now().astimezone().tzinfo
+    local_dt = et_dt.astimezone(local_tz)
+    local_time_str = local_dt.strftime("%H:%M:%S")
+    tz_name = local_dt.tzname() or "local time"
+    command = f"sudo pmset repeat wakeorpoweron {days} {local_time_str}"
+    return command, local_time_str, tz_name
+
+
+def _digest_html_stats_grid(stats):
+    """2-column grid of small label/value cells (email-safe nested tables)."""
+    def cell(st):
+        return (f"<td style='width:50%;padding:6px 10px 6px 0;border-bottom:1px solid #eee;vertical-align:top;'>"
+                f"<div style='font-family:-apple-system,Segoe UI,Arial,sans-serif;font-size:11px;color:#888;"
+                f"text-transform:uppercase;letter-spacing:.04em;'>{html.escape(st['label'])}</div>"
+                f"<div style='font-size:15px;font-weight:700;'>{html.escape(st['value'])}</div>"
+                + (f"<div style='font-family:-apple-system,Segoe UI,Arial,sans-serif;font-size:12px;color:#666;'>"
+                   f"{html.escape(st['note'])}</div>" if st.get("note") else "") + "</td>")
+
+    rows = []
+    for i in range(0, len(stats), 2):
+        pair = stats[i:i + 2]
+        tds = "".join(cell(st) for st in pair)
+        if len(pair) == 1:
+            tds += "<td style='width:50%;'>&nbsp;</td>"   # keeps the last row aligned to the grid
+        rows.append(f"<tr>{tds}</tr>")
+    return ("<table style='width:100%;border-collapse:collapse;margin:0 0 8px;' role='presentation'>"
+            + "".join(rows) + "</table>")
+
+
+def _digest_html_rec_bar(counts):
+    """HTML fallback for the Strong Buy..Strong Sell bar, used when the
+    chart image can't be produced (kaleido unavailable)."""
+    total = sum((counts.get(k) or 0) for k, _, _ in _REC_ORDER)
+    if not total:
+        return ""
+    segs = "".join(
+        f"<td style='width:{(counts.get(k) or 0) / total * 100:.1f}%;background:{color};color:#fff;"
+        f"text-align:center;font-size:11px;padding:4px 0;'>{counts.get(k) or ''}</td>"
+        for k, _, color in _REC_ORDER if counts.get(k)
+    )
+    legend = " &nbsp; ".join(
+        f"<span style='color:{color};'>■</span> {label} ({counts.get(k) or 0})" for k, label, color in _REC_ORDER
+    )
+    return (f"<table style='width:100%;border-collapse:collapse;margin:6px 0 2px;' role='presentation'><tr>{segs}</tr></table>"
+            f"<div style='font-family:-apple-system,Segoe UI,Arial,sans-serif;font-size:11px;color:#666;'>{legend}</div>")
+
+
+def _next_session_date(d):
+    """The next NYSE trading day after `d` (skips weekends and the holidays this file knows)."""
+    d = d + timedelta(days=1)
+    while d.weekday() >= 5 or is_market_holiday(d):
+        d += timedelta(days=1)
+    return d
+
+
+_DAY_PREDICTION_FOOTNOTE = (
+    "Targets are model forecasts for {when} 4:00 PM ET close, not guarantees. Confidence reflects backtest depth; "
+    "per-ticker hit rates are in the dashboard."
+)
+
+
+def _render_day_prediction_section(targets, sections_included, text_lines, html_parts, section_header,
+                                   as_of_date=None, now_et=None):
+    """Day Prediction targets as a compact table (same styling language as
+    Watchlist Signals): Ticker | Current | Target | Move | Dir | Conf. Move
+    is (target - current) / current with `current` from the shared price
+    snapshot; Dir comes from that same Move; rows are already sorted by
+    absolute Move. One footnote for the whole table -- no per-row prose."""
+    if "day_prediction_targets" not in sections_included or not targets:
+        return
+    html_parts.append(_sm("VISUAL", "day_prediction_targets"))
+    section_header(DIGEST_SECTION_LABELS["day_prediction_targets"], len(targets))
+    now_et = now_et if now_et is not None else pd.Timestamp.now(tz="America/New_York")
+    as_of = as_of_date or now_et.date()
+    after_close = now_et.date() >= as_of and now_et.hour >= 16
+    if after_close:
+        target_hdr = f"Target — next session close ({_next_session_date(as_of).strftime('%b %-d')})"
+        when = "the next session's"
+    else:
+        target_hdr, when = "Target", "today's"
+    footnote = _DAY_PREDICTION_FOOTNOTE.format(when=when)
+
+    text_lines.append(f"{'TICKER':<9}{'CURRENT':<11}{'TARGET':<11}{'MOVE':<9}{'DIR':<5}CONF.")
+    head = "".join(f"<th style='padding:4px 6px;'>{html.escape(h)}</th>"
+                   for h in ("Ticker", "Current", target_hdr, "Move", "Dir", "Conf."))
+    rows_html = []
+    for p in targets:
+        move = p.get("move_pct")
+        color = "#888"
+        arrow = "—"
+        if _finite(move) is not None:
+            r1 = round(move, 1)
+            arrow, color = (("▲", "#0ca30c") if r1 > 0 else ("▼", "#e66767") if r1 < 0 else ("■", "#8b9bab"))
+        conf = p.get("confidence_level") or "Early"
+        name = p["ticker"] + (" ★" if p.get("is_pinned") else "")
+        text_lines.append(f"{name:<9}{fmt_money(p.get('current_price')):<11}{fmt_money(p.get('target_price')):<11}"
+                          f"{fmt_pct(move):<9}{arrow:<5}{conf}")
+        cell = "padding:4px 6px;"
+        rows_html.append(
+            "<tr style='border-bottom:1px solid #eee;'>"
+            f"<td style='{cell}font-weight:700;'>{html.escape(name)}</td>"
+            f"<td style='{cell}'>{fmt_money(p.get('current_price'))}</td>"
+            f"<td style='{cell}'>{fmt_money(p.get('target_price'))}</td>"
+            f"<td style='{cell}color:{color};font-weight:700;'>{fmt_pct(move)}</td>"
+            f"<td style='{cell}color:{color};'>{arrow}</td>"
+            f"<td style='{cell}'>{html.escape(conf)}</td></tr>")
+    html_parts.append(
+        "<table style='width:100%;border-collapse:collapse;font-size:13px;margin-bottom:6px;'>"
+        f"<tr style='text-align:left;border-bottom:2px solid #1a1a1a;'>{head}</tr>" + "".join(rows_html) + "</table>"
+        f"<p style='margin:0 0 8px;color:#888;font-size:12px;'>{html.escape(footnote)}</p>")
+    text_lines.append("")
+    text_lines.append(footnote)
+    text_lines.append("")
+
+
+def _render_swing_outlook_section(featured, header_price, text_lines, html_parts):
+    """"2-Week Swing Outlook": the Overall Verdict payload as four cards (Current price / Target / Confidence
+    band / Confidence), the verdict line, and the projected-path chart image. `Current price` is the SAME value
+    as the featured header (passed in), never a second fetch. Omitted ENTIRELY (no header, no empty cards, no
+    image tag) when the featured ticker has no 10-day forecast."""
+    sw = featured.get("swing_outlook")
+    if not sw or _finite(sw.get("target_price")) is None:
+        return
+    h = sw.get("horizon_days") or SWING_OUTLOOK_HORIZON_DAYS
+    move = swing_move_pct(sw)
+    if move is not None and _finite(header_price) is not None and abs(header_price / sw["current_price"] - 1) > 0.005:
+        digest_log.warning("[DIGEST] %s swing forecast basis price %s differs from the header price %s",
+                           featured.get("ticker"), fmt_money(sw["current_price"]), fmt_money(header_price))
+    direction = (sw.get("predicted_direction") or "").upper()
+    up = direction == "UP"
+    color = "#0ca30c" if up else "#e66767" if direction == "DOWN" else "#8b9bab"
+    arrow = "↑" if (move or 0) > 0 else "↓" if (move or 0) < 0 else ""
+    lo, hi = _finite(sw.get("band_low")), _finite(sw.get("band_high"))
+    band_txt = f"{fmt_money(lo)} – {fmt_money(hi)}" if (lo is not None and hi is not None) else "—"
+    conf = sw.get("confidence_level") or "—"
+    target_label = f"Target ({h}d, {sw.get('target_date')})"
+
+    def card(label, value, delta=None, small=False):
+        return (f"<td class='digest-swing-card' style='width:25%;padding:0 3px;vertical-align:top;'>"
+                f"<div style='border:1px solid #e2e2e2;border-radius:6px;padding:8px 10px;'>"
+                f"<div style='font-family:-apple-system,Segoe UI,Arial,sans-serif;font-size:11px;color:#777;'>"
+                f"{html.escape(label)}</div>"
+                f"<div style='font-size:{15 if small else 19}px;font-weight:700;margin-top:2px;'>{html.escape(value)}</div>"
+                + (f"<div style='font-family:-apple-system,Segoe UI,Arial,sans-serif;font-size:12px;color:{color};'>"
+                   f"{html.escape(delta)}</div>" if delta else "") + "</div></td>")
+
+    delta_txt = f"{arrow} {fmt_pct(move, digits=2)}".strip() if move is not None else None
+    text_lines.append("\n2-WEEK SWING OUTLOOK:")
+    text_lines.append(f"  Current price: {fmt_money(header_price)}")
+    text_lines.append(f"  {target_label}: {fmt_money(sw['target_price'])}" + (f" {delta_txt}" if delta_txt else ""))
+    text_lines.append(f"  Confidence band (p10–p90): {band_txt}")
+    text_lines.append(f"  Confidence: {conf}")
+    html_parts.append(_sm("VISUAL", "swing_outlook_cards"))
+    html_parts.append("<h4 style='margin:14px 0 6px;font-size:14px;'>2-Week Swing Outlook</h4>")
+    html_parts.append(
+        "<table style='width:100%;border-collapse:collapse;margin:0 -3px 8px;' role='presentation'><tr>"
+        + card("Current price", fmt_money(header_price))
+        + card(target_label, fmt_money(sw["target_price"]), delta_txt)
+        + card("Confidence band (p10–p90)", band_txt, small=True)
+        + card("Confidence", conf)
+        + "</tr></table>")
+    line = swing_verdict_line(featured.get("ticker"), sw)
+    if line:
+        text_lines.append(f"  {line}")
+        dot_dir, _, rest = line.partition(" — ")
+        html_parts.append(_sm("PROSE", "swing_outlook_verdict"))
+        html_parts.append(f"<p style='margin:0 0 8px;'><b style='color:{color};'>● {html.escape(dot_dir)}</b> — "
+                          f"{html.escape(rest)}</p>")
+    cid = (featured.get("swing_cids") or {}).get("chart")
+    if cid:
+        html_parts.append(_sm("IMAGE", cid))
+        html_parts.append(f"<img src='cid:{cid}' width='600' alt='{html.escape(str(featured.get('ticker')))} "
+                          f"{h}-day projected path' style='width:100%;max-width:600px;border-radius:6px;margin:4px 0 8px;'>")
+    text_lines.append("")
+
+
+def _render_analyst_targets_section(featured, text_lines, html_parts):
+    """EARNINGS & ANALYST TARGETS -- same content as the dashboard panel:
+    Next earnings + Analyst recommendation cards, latest EPS/revenue
+    beat-miss, the recommendation breakdown bar, and the analyst
+    price-target chart (High/Average/Low fan). The two charts are inline
+    images when dashboard.py could render them (featured["analyst_cids"]),
+    with an HTML bar / plain-text targets as fallback so the section never
+    silently loses its numbers."""
+    at = featured.get("analyst_targets")
+    if not at:
+        return
+    cids = featured.get("analyst_cids") or {}
+    text_lines.append("\nEARNINGS & ANALYST TARGETS:")
+    html_parts.append("<h4 style='margin:14px 0 6px;font-size:14px;'>Earnings &amp; Analyst Targets</h4>")
+
+    def card(label, value, sub=None):
+        return (f"<td style='width:50%;padding:0 4px;vertical-align:top;'>"
+                f"<div style='border:1px solid #e2e2e2;border-radius:6px;padding:10px 12px;'>"
+                f"<div style='font-family:-apple-system,Segoe UI,Arial,sans-serif;font-size:12px;color:#777;'>"
+                f"{html.escape(label)}</div><div style='font-size:20px;font-weight:700;margin-top:2px;'>"
+                f"{html.escape(value)}</div>"
+                + (f"<div style='display:inline-block;margin-top:4px;padding:1px 8px;border-radius:10px;"
+                   f"background:#e6f4e6;color:#0a7a0a;font-size:12px;font-family:-apple-system,Segoe UI,Arial,"
+                   f"sans-serif;'>{html.escape(sub)}</div>" if sub else "")
+                + "</div></td>")
+
+    nxt = at.get("next_earnings_date")
+    nxt_txt = pd.Timestamp(nxt).strftime("%b %-d, %Y") if nxt else "—"
+    rec = at.get("recommendation") or "—"
+    n = at.get("n_analysts")
+    text_lines.append(f"  Next earnings: {nxt_txt}")
+    text_lines.append(f"  Analyst recommendation: {rec}" + (f" ({n} analysts)" if n else ""))
+    html_parts.append(_sm("VISUAL", "analyst_targets_cards"))
+    html_parts.append("<table style='width:100%;border-collapse:collapse;margin:0 -4px 8px;' role='presentation'><tr>"
+                      + card("Next earnings", nxt_txt) + card("Analyst recommendation", rec, f"{n} analysts" if n else None)
+                      + "</tr></table>")
+
+    lr = at.get("latest_reported")
+    if lr:
+        def part(label, pct):
+            if _finite(pct) is None:
+                return f"{label} —", "#888"
+            return f"{label} {'Beat' if pct >= 0 else 'Miss'} {fmt_pct(pct, digits=2)}", ("#0ca30c" if pct >= 0 else "#e66767")
+        eps_t, eps_c = part("EPS", lr.get("eps_pct"))
+        rev_t, rev_c = part("Revenue", lr.get("rev_pct"))
+        text_lines.append(f"  Latest reported ({lr['date']}): {eps_t} / {rev_t}")
+        html_parts.append(_sm("PROSE", "analyst_latest_reported"))
+        html_parts.append(
+            f"<p style='margin:0 0 6px;font-size:12px;color:#666;font-family:-apple-system,Segoe UI,Arial,sans-serif;'>"
+            f"Latest reported ({html.escape(str(lr['date']))}): <b style='color:{eps_c};'>{eps_t}</b> / "
+            f"<b style='color:{rev_c};'>{rev_t}</b></p>")
+
+    counts = at.get("rec_counts")
+    if counts:
+        total = sum(v or 0 for v in counts.values())
+        text_lines.append("  Analyst breakdown: " + ", ".join(
+            f"{label} {counts.get(k) or 0}" for k, label, _ in _REC_ORDER))
+        if cids.get("breakdown"):
+            html_parts.append(_sm("IMAGE", cids["breakdown"]))
+            html_parts.append(f"<img src='cid:{cids['breakdown']}' alt='Analyst recommendation breakdown' "
+                              f"style='width:100%;max-width:560px;margin:2px 0;'>")
+        else:
+            html_parts.append(_sm("VISUAL", "analyst_breakdown_chart"))
+            html_parts.append(_digest_html_rec_bar(counts))
+        html_parts.append(_sm("PROSE", "analyst_breakdown_caption"))
+        html_parts.append(
+            f"<p style='margin:0 0 10px;font-size:12px;color:#888;font-family:-apple-system,Segoe UI,Arial,sans-serif;'>"
+            f"Breakdown for period {html.escape(str(at.get('rec_period') or '—'))} · {total} analysts</p>")
+
+    if at.get("has_targets"):
+        cur, med = at.get("current_price"), at.get("target_median")
+        cap = ((f"Current {fmt_money(cur)} · " if _finite(cur) is not None else "")
+               + (f"Aggregated from {n} analysts via Yahoo Finance" if n else "Aggregated via Yahoo Finance")
+               + (f" · median {fmt_money(med)}" if _finite(med) is not None else "") + ".")
+        text_lines.append("  Analyst price targets (next 12 months): " + ", ".join(
+            f"{lab} {fmt_money(at[k])}" for lab, k in (("Low", "target_low"), ("Average", "target_mean"),
+                                                         ("Median", "target_median"), ("High", "target_high"))
+            if _finite(at.get(k)) is not None))
+        html_parts.append(_sm("PROSE", "analyst_price_targets_header"))
+        html_parts.append("<p style='margin:8px 0 2px;font-weight:700;'>Analyst Price Targets (next 12 months)</p>"
+                          f"<p style='margin:0 0 4px;font-size:12px;color:#888;font-family:-apple-system,Segoe UI,Arial,"
+                          f"sans-serif;'>{html.escape(cap)}</p>")
+        if cids.get("fan"):
+            html_parts.append(_sm("IMAGE", cids["fan"]))
+            html_parts.append(f"<img src='cid:{cids['fan']}' alt='Analyst price targets' "
+                              f"style='width:100%;max-width:560px;border-radius:6px;margin:4px 0 8px;'>")
+        else:
+            parts_ = [f"{lab} <b>{fmt_money(at[k])}</b>" for lab, k in (("Low", "target_low"), ("Average", "target_mean"),
+                                                                         ("High", "target_high")) if _finite(at.get(k)) is not None]
+            html_parts.append(_sm("VISUAL", "analyst_fan_chart"))
+            html_parts.append("<p style='margin:0 0 8px;'>" + " &nbsp;·&nbsp; ".join(parts_) + "</p>")
+
+
+def _runner_technical_read(conn, ticker, snap=None):
     """Part 5. One plain-language RSI + MACD-histogram line per Runner.
     The ONLY decision thresholds here (RSI<=30 / RSI>=70) are the exact
     ones already established elsewhere in this file for directional-lean
@@ -15718,13 +18746,19 @@ def _runner_technical_read(conn, ticker):
     changes which side of 30/70 the actual bias classification below
     keys off of. MACD histogram sign+slope (positive/negative,
     rising/falling vs. the prior session) is standard technical reading."""
-    hist = _read_price_history(conn, ticker, days_back=60)
-    if len(hist) < 3:
-        return None
-    hist = _add_technicals(hist)
-    rsi, macd_now, macd_prev = hist["RSI14"].iloc[-1], hist["MACD_hist"].iloc[-1], hist["MACD_hist"].iloc[-2]
-    if pd.isna(rsi) or pd.isna(macd_now) or pd.isna(macd_prev):
-        return None
+    if snap is not None:
+        # The digest passes its shared snapshot so this RSI is the SAME number shown in Key Stats.
+        rsi, macd_now, macd_prev = _finite(snap.rsi), _finite(snap.macd_hist), _finite(snap.macd_hist_prev)
+        if rsi is None or macd_now is None or macd_prev is None:
+            return None
+    else:
+        hist = _read_price_history(conn, ticker, days_back=60)
+        if len(hist) < 3:
+            return None
+        hist = _add_technicals(hist)
+        rsi, macd_now, macd_prev = hist["RSI14"].iloc[-1], hist["MACD_hist"].iloc[-1], hist["MACD_hist"].iloc[-2]
+        if pd.isna(rsi) or pd.isna(macd_now) or pd.isna(macd_prev):
+            return None
 
     if rsi >= 70:
         rsi_txt = f"RSI {rsi:.0f} (overbought)"
@@ -15762,9 +18796,36 @@ def _runner_technical_read(conn, ticker):
 # other HTML-templating dependency to reuse.
 # --------------------------------------------------------------------------
 
+def _sm(kind, key):
+    """A single, invisible boundary marker dropped into html_parts right before a logical section's HTML
+    begins -- 2026-10-14, Substack-fidelity rebuild. Renders as nothing in any email client/browser (it's
+    an HTML comment), so this changes zero visible email bytes; it exists purely so build_substack_markdown
+    /export_substack_zip/send_edition_to_substack can walk the SAME stored html_full the email actually
+    sent and slice out each section in the SAME order with the SAME content, instead of maintaining a
+    second, separately-curated section list that can drift out of sync (which is exactly how the old
+    build_substack_markdown ended up dropping most sections and truncating the Overview).
+
+    kind:
+      "PROSE"  -- rendered as markdown text in the post, in full, never truncated (headings/paragraphs/
+                  lists with no table/grid/card structure -- News, Overview, Outlook, verdict lines, etc.)
+      "VISUAL" -- this exact HTML slice is screenshotted to a PNG via headless Chrome at the email's own
+                  600px width, 2x device scale (stat grids, card rows, tables, badges, calendars).
+      "IMAGE"  -- an existing chart PNG the caller already has bytes for (featured price chart, swing
+                  projection, analyst breakdown/fan) -- key matches that chart's own cid name exactly, so
+                  the Substack code reuses the SAME file the email embeds rather than re-rendering it.
+      "STOP"   -- not a content section: everything from here to the end of the body is subscriber-only
+                  (unsubscribe/manage-preferences links, the monotrading.substack.com self-link, the
+                  data-quality footer note) -- the one deliberate exception to "every email section is in
+                  the post." _parse_digest_markers discards everything from a STOP marker onward.
+    Everything between one marker and the next (or end of body) belongs to the FIRST marker -- there is no
+    paired end marker, by design, so a forgotten close tag can never silently merge two sections."""
+    return f"<!--SM:{kind}:{key}-->"
+
+
 _DIGEST_HTML_OPEN = (
     "<html><head><style>@media (max-width:480px){.digest-week-col{display:block!important;"
-    "width:100%!important;padding:0!important;border:none!important;}}</style></head>"
+    "width:100%!important;padding:0!important;border:none!important;}"
+    ".digest-swing-card{display:inline-block!important;width:49%!important;box-sizing:border-box!important;}}</style></head>"
     "<body style=\"font-family:Georgia,'Times New Roman',serif;font-size:15px;line-height:1.65;"
     "color:#1a1a1a;max-width:600px;margin:0 auto;padding:0 16px 24px;background:#ffffff;\">"
 )
@@ -15777,10 +18838,13 @@ _DIGEST_HTML_CLOSE = "</body></html>"
 # every recipient) is substituted in by send_daily_digest_email's own
 # per-recipient loop, never baked in at content-build time.
 DIGEST_UNSUBSCRIBE_PLACEHOLDER = "{{UNSUBSCRIBE_URL}}"
+DIGEST_MANAGE_PLACEHOLDER = "{{MANAGE_PREFERENCES_URL}}"
+
 _DIGEST_HTML_FOOTER = (
     "<hr style='border:none;border-top:1px solid #e5e5e5;margin:28px 0 12px;'>"
     "<p style='font-family:-apple-system,Segoe UI,Arial,sans-serif;color:#888;font-size:12px;text-align:center;'>"
     f"<a href='{DIGEST_UNSUBSCRIBE_PLACEHOLDER}' style='color:#888;'>Unsubscribe</a>"
+    f" &nbsp;·&nbsp; <a href='{DIGEST_MANAGE_PLACEHOLDER}' style='color:#888;'>Manage preferences</a>"
     " &nbsp;·&nbsp; Read more analysis at <a href='https://monotrading.substack.com' style='color:#d4590c;'>"
     "monotrading.substack.com</a></p>"
 )
@@ -15802,8 +18866,8 @@ def _digest_html_callout(text, bg_color):
     return f"<p style='background:{bg_color};padding:10px 14px;border-radius:6px;margin:12px 0;'>{text}</p>"
 
 
-def build_digest_content(conn, sections_included, since_iso, as_of_date=None, incomplete_reasons=None,
-                          featured_stock=None, chart_cid=None):
+def build_digest_content(conn, user_email, sections_included, since_iso, as_of_date=None, incomplete_reasons=None,
+                          featured_stock=None, chart_cid=None, snapshots=None, now_et=None):
     """The SINGLE content-generation path for both the real send and the
     "Preview Today's Digest" button -- guaranteeing they can never
     disagree, since neither ever builds its own copy of this logic.
@@ -15828,16 +18892,39 @@ def build_digest_content(conn, sections_included, since_iso, as_of_date=None, in
     `inline_images` param), so build_digest_content itself stays
     chart-library-agnostic.
 
+    MULTI-USER: built entirely from THIS user's own watchlist, entry zones,
+    Runners scan, and send history (all keyed on `user_email`); the
+    underlying market data it reads (prices, divergence, predictions,
+    swing forecasts, macro events) is the shared global pool, filtered
+    down to this user's tickers.
+
     Returns {"subject", "text_body", "html_body", "sections" (raw data
     per included section, for programmatic use), "market_holiday": bool,
     "holiday_name": str|None}."""
-    as_of_date = as_of_date or date.today()
+    email = _require_user_email(user_email)
+    as_of_date = as_of_date or today_et()
     holiday_name = get_market_holiday_name(as_of_date)
     market_holiday = holiday_name is not None
-    watchlist = load_watchlist()
+    watchlist = load_watchlist(conn, email)
     today_iso = as_of_date.isoformat()
+    now_et = now_et if now_et is not None else pd.Timestamp.now(tz="America/New_York")
 
     sections = {}
+
+    # ONE PriceSnapshot per ticker, taken here at the top and read by EVERY section below (Featured Stock,
+    # Key Stats, Runners, Day Predictions, Watchlist Signals) -- so a ticker can't show two prices/RSIs.
+    snaps = snapshots if snapshots is not None else SnapshotCache(conn)
+    _runner_tickers = (get_todays_runner_tickers(conn, email, as_of_date=as_of_date) or []) if not market_holiday else []
+    _pinned_all = [t for t in load_pinned_runners(conn, email) if t in watchlist]
+    _needed = []
+    if "watchlist_signals" in sections_included:
+        _needed += watchlist
+    if "featured_stock" in sections_included and featured_stock:
+        _needed.append(featured_stock["ticker"])
+    if not market_holiday and ("todays_runners" in sections_included or "day_prediction_targets" in sections_included):
+        _needed += _runner_tickers + _pinned_all
+    for _t in dict.fromkeys(t.upper() for t in _needed):
+        snaps.get(_t)
 
     # Computed unconditionally (not gated by sections_included) since
     # send_daily_digest_email always needs the current per-ticker signal
@@ -15845,10 +18932,13 @@ def build_digest_content(conn, sections_included, since_iso, as_of_date=None, in
     # regardless of whether the Watchlist Signals section itself is
     # toggled on for THIS render.
     last_row = conn.execute(
-        "SELECT signals_snapshot_json FROM digest_email_log ORDER BY sent_at DESC LIMIT 1"
+        "SELECT signals_snapshot_json FROM digest_email_log WHERE user_email=? ORDER BY sent_at DESC LIMIT 1",
+        (email,),
     ).fetchone()
     prev_signals = json.loads(last_row[0]) if last_row and last_row[0] else {}
-    triggered_zone_tickers = {z["ticker"] for z in get_watchlist_signals_since(conn, since_iso)["triggered_zones"]}
+    triggered_zone_tickers = {
+        z["ticker"] for z in get_watchlist_signals_since(conn, email, since_iso, watchlist)["triggered_zones"]
+    }
     current_signals = {t: synthesize_rating_signal(t, conn)["signal"] for t in watchlist}
     sections["_current_signals_snapshot"] = current_signals
 
@@ -15860,31 +18950,40 @@ def build_digest_content(conn, sections_included, since_iso, as_of_date=None, in
     # meaningful to report when the market never opened).
     if not market_holiday:
         if "todays_runners" in sections_included:
-            runners = get_todays_runner_rows(conn, as_of_date=as_of_date) or []
+            runners = get_todays_runner_rows(conn, email, as_of_date=as_of_date) or []
             for r in runners:
-                r["technical_read"] = _runner_technical_read(conn, r["ticker"])
+                sn = snaps.get(r["ticker"])
+                # price / day change / volume all come from the shared snapshot, not the scan-time values
+                r["price"], r["chg_pct"], r["vol_ratio"] = sn.last, sn.change_pct, sn.rel_volume
+                r["technical_read"] = _runner_technical_read(conn, r["ticker"], snap=sn)
             sections["todays_runners"] = runners
 
         if "day_prediction_targets" in sections_included:
-            runner_tickers = get_todays_runner_tickers(conn, as_of_date=as_of_date) or []
+            runner_tickers = _runner_tickers
+            # The RUNNERS tab shows Day Predictions for the day's top movers AND for any tickers the user
+            # pinned there by hand -- so the email covers both (still limited to this user's watchlist).
+            pinned = [t for t in _pinned_all if t not in runner_tickers]
             targets = []
-            for t in runner_tickers:
+            for t in runner_tickers + pinned:
                 row = conn.execute(
-                    """SELECT target_price, predicted_direction, mode, confidence_level, model_start_price,
-                              session_date
-                       FROM day_predictions WHERE ticker=? AND session_date=? AND COALESCE(source,'live')='live'""",
+                    """SELECT target_price, mode, confidence_level FROM day_predictions
+                       WHERE ticker=? AND session_date=? AND COALESCE(source,'live')='live'""",
                     (t, today_iso),
                 ).fetchone()
                 if not row:
                     continue
-                target_price, direction, mode, confidence_level, current_price, session_date = row
-                move_pct = (target_price / current_price - 1) * 100 if current_price else None
-                track = get_day_prediction_track_record(conn, ticker=t)
+                target = _finite(row[0])
+                last = snaps.get(t).last                       # SAME price as Runners / Watchlist Signals
+                move = pct_change(target, last)                # recomputed from CURRENT price, not the session open
+                r1 = None if move is None else round(move, 1)
                 targets.append({
-                    "ticker": t, "target_price": target_price, "predicted_direction": direction, "mode": mode,
-                    "confidence_level": confidence_level, "current_price": current_price, "move_pct": move_pct,
-                    "session_date": session_date, "backtest_n": track.get("n") or 0,
+                    "ticker": t, "target_price": target, "current_price": last, "move_pct": move,
+                    # direction is DERIVED from the recomputed move so arrow and percent can never disagree
+                    "direction": None if r1 is None else ("UP" if r1 > 0 else "DOWN" if r1 < 0 else "FLAT"),
+                    "mode": row[1], "confidence_level": row[2], "is_pinned": t in pinned,
                 })
+            # biggest expected mover first; rows without a computable move last
+            targets.sort(key=lambda x: (x["move_pct"] is None, -abs(x["move_pct"] or 0.0), x["ticker"]))
             sections["day_prediction_targets"] = targets
 
         if "swing_forecast_highlights" in sections_included:
@@ -15900,6 +18999,8 @@ def build_digest_content(conn, sections_included, since_iso, as_of_date=None, in
             # High-confidence calls for the same setup shouldn't repeat.
             seen_keys, highlights = set(), []
             for ticker, horizon_days, target_price, direction, start_price, session_date in rows:
+                if ticker not in watchlist:
+                    continue  # swing_forecasts is global; only THIS user's tickers belong in their digest
                 key = (ticker, horizon_days)
                 if key in seen_keys:
                     continue
@@ -15912,21 +19013,24 @@ def build_digest_content(conn, sections_included, since_iso, as_of_date=None, in
         sections["_market_closed_sections_skipped"] = True
 
     if "watchlist_signals" in sections_included:
-        zones_by_ticker = {z["ticker"]: z for z in get_entry_zones(conn)}
+        zones_by_ticker = {z["ticker"]: z for z in get_entry_zones(conn, email)}
         table_rows = []
         for ticker in watchlist:
-            price = get_latest_cached_price(conn, ticker)
+            price = snaps.get(ticker).last                     # SAME price as Key Stats / Runners / Day Predictions
             zone = zones_by_ticker.get(ticker)
             status, distance_pct, zone_txt = None, None, "—"
-            if zone and zone.get("entry_low") is not None:
-                zone_txt = f"${zone['entry_low']:.2f}-${zone['entry_high']:.2f}"
-                status = zone.get("last_zone_status")
+            lo_, hi_ = (_finite(zone.get("entry_low")), _finite(zone.get("entry_high"))) if zone else (None, None)
+            if lo_ is not None and hi_ is not None:
+                zone_txt = f"{fmt_money(lo_)}-{fmt_money(hi_)}"
+                # status re-derived against the snapshot price so the label can't disagree with the price shown
+                # (falls back to the stored status only when there's no price)
+                status = (_classify_zone_status(price, lo_, hi_) if price is not None else None) or zone.get("last_zone_status")
                 if status == "in_zone":
                     distance_pct = 0.0
-                elif status == "above" and price is not None and zone["entry_high"]:
-                    distance_pct = (price - zone["entry_high"]) / zone["entry_high"] * 100
-                elif status == "below" and price is not None and zone["entry_low"]:
-                    distance_pct = -((zone["entry_low"] - price) / zone["entry_low"] * 100)
+                elif status == "above" and price is not None:
+                    distance_pct = pct_change(price, hi_)
+                elif status == "below" and price is not None:
+                    distance_pct = None if pct_change(lo_, price) is None else -pct_change(lo_, price)
             div_row = conn.execute(
                 "SELECT score FROM divergence_scores WHERE ticker=? AND score_formula_version='v2' "
                 "ORDER BY computed_date DESC LIMIT 1",
@@ -15998,14 +19102,28 @@ def build_digest_content(conn, sections_included, since_iso, as_of_date=None, in
         text_lines.append(f"🎌 Market closed today ({holiday_name}) -- Runners/Day Prediction/Swing Forecast "
                            f"sections are skipped; nothing meaningful to report while the market is shut.")
         text_lines.append("")
+        html_parts.append(_sm("PROSE", "market_holiday_callout"))
         html_parts.append(_digest_html_callout(f"🎌 Market closed today ({holiday_name}) — Runners/Day "
                                                  f"Prediction/Swing Forecast sections are skipped.", "#fff3cd"))
     if incomplete_reasons:
         gate_txt = " ".join(incomplete_reasons)
         text_lines.append(f"⚠️ Some sections may reflect incomplete data — {gate_txt}")
         text_lines.append("")
+        html_parts.append(_sm("PROSE", "incomplete_data_callout"))
         html_parts.append(_digest_html_callout(f"⚠️ Some sections may reflect incomplete data — "
                                                  f"{html.escape(gate_txt)}", "#fdecea"))
+
+    # Macro Calendar upgrade (spec item 5a) -- same spot as the two callouts above, same _sm/
+    # _digest_html_callout convention this session already built for Substack fidelity (zero extra plumbing
+    # needed there). Reads the SAME get_macro_release_banner_state the dashboard's top-of-page banner reads,
+    # so the two can never disagree. Pre-release only here -- the post-release state is the one-time EMAIL
+    # alert (check_and_send_macro_release_alerts), a separate mechanism, not part of the daily digest body.
+    macro_banner = get_macro_release_banner_state(conn, now_et).get("pre_release")
+    if macro_banner:
+        text_lines.append(macro_banner["text"])
+        text_lines.append("")
+        html_parts.append(_sm("PROSE", "macro_pre_release_banner"))
+        html_parts.append(_digest_html_callout(html.escape(macro_banner["text"]), "#fff3cd"))
 
     # ---- Featured Stock (Part 1/2) -- the lead section ----
     if featured:
@@ -16016,15 +19134,35 @@ def build_digest_content(conn, sections_included, since_iso, as_of_date=None, in
             f"📌 TODAY'S FEATURED STOCK: {html.escape(featured['ticker'])}</h2>"
         )
         if chart_cid:
+            html_parts.append(_sm("IMAGE", chart_cid))
             html_parts.append(
                 f"<img src='cid:{chart_cid}' alt='{html.escape(featured['ticker'])} price chart' "
                 f"style='width:100%;max-width:560px;border-radius:6px;margin:12px 0;'>"
             )
-        price = featured.get("current_price")
+        fsnap = snaps.get(featured["ticker"])
+        price = _finite(fsnap.last)
+        featured["current_price"] = price
+        if isinstance(featured.get("analyst_targets"), dict):
+            featured["analyst_targets"]["current_price"] = price
+        html_parts.append(_sm("PROSE", "featured_overview"))
         if price is not None:
-            text_lines.append(f"Current price: ${price:.2f}")
-            html_parts.append(f"<p style='color:#666;font-size:13px;'>Current price: <b>${price:.2f}</b></p>")
+            text_lines.append(f"Current price: {fmt_money(price)}")
+            html_parts.append(f"<p style='color:#666;font-size:13px;'>Current price: <b>{fmt_money(price)}</b></p>")
         brief = featured.get("brief")
+        overview = build_overview_sentence(fsnap)
+        if overview:
+            text_lines.append(f"\nOVERVIEW:\n{overview}")
+            html_parts.append(f"<h4 style='margin:14px 0 2px;font-size:14px;'>Overview</h4>"
+                               f"<p style='margin:0 0 8px;'>{html.escape(overview)}</p>")
+        key_stats = _build_key_stats(fsnap, _digest_levels(conn, featured["ticker"], brief))
+        text_lines.append("\nKEY STATS:")
+        html_parts.append(_sm("VISUAL", "key_stats"))
+        html_parts.append("<h4 style='margin:14px 0 2px;font-size:14px;'>Key Stats</h4>")
+        for st_ in key_stats:
+            text_lines.append(f"  {st_['label']}: {st_['value']}" + (f" — {st_['note']}" if st_.get("note") else ""))
+        html_parts.append(_digest_html_stats_grid(key_stats))
+        _render_swing_outlook_section(featured, price, text_lines, html_parts)
+        analyst_rendered = False
         if brief:
             # Part 1: Setup -> Overview, Institutional Analysis rendered
             # as a table (below) instead of prose, News Summary kept as-
@@ -16032,17 +19170,13 @@ def build_digest_content(conn, sections_included, since_iso, as_of_date=None, in
             # to Watch are intentionally NOT rendered here -- removed from
             # the email only; generate_deep_analysis/the Ticker Deep-Dive
             # tab still produce and store all of it unchanged.
-            overview = brief.get("setup")
-            if overview:
-                text_lines.append(f"\nOVERVIEW:\n{overview}")
-                html_parts.append(f"<h4 style='margin:14px 0 2px;font-size:14px;'>Overview</h4>"
-                                   f"<p style='margin:0 0 8px;'>{html.escape(overview)}</p>")
-
+            # (Overview + Key Stats are rendered above from the shared price snapshot.)
             inst_rows = featured.get("institutional_table") or []
             if inst_rows:
                 text_lines.append("\nINSTITUTIONAL ANALYSIS:")
                 for r in inst_rows:
                     text_lines.append(f"  {r['label']}: {r['detail']}")
+                html_parts.append(_sm("VISUAL", "institutional_analysis"))
                 html_parts.append(
                     "<h4 style='margin:14px 0 2px;font-size:14px;'>Institutional Analysis</h4>"
                     "<table style='width:100%;border-collapse:collapse;font-size:13px;margin-bottom:8px;'>"
@@ -16056,15 +19190,20 @@ def build_digest_content(conn, sections_included, since_iso, as_of_date=None, in
                     )
                 html_parts.append("</table>")
 
+            _render_analyst_targets_section(featured, text_lines, html_parts)
+            analyst_rendered = True
+
             news_summary = brief.get("news_summary")
             if news_summary:
                 text_lines.append(f"\nNEWS SUMMARY:\n{news_summary}")
+                html_parts.append(_sm("PROSE", "news_summary"))
                 html_parts.append(f"<h4 style='margin:14px 0 2px;font-size:14px;'>News Summary</h4>"
                                    f"<p style='margin:0 0 8px;'>{html.escape(news_summary)}</p>")
 
             outlook = brief.get("verdicts") or []
             if outlook:
                 text_lines.append("\nOUTLOOK:")
+                html_parts.append(_sm("PROSE", "outlook_verdicts"))
                 html_parts.append("<h4 style='margin:14px 0 2px;font-size:14px;'>Outlook</h4><ul style='margin:0 0 8px;padding-left:18px;'>")
                 for v in outlook:
                     text_lines.append(f"  - {v['horizon']} ({v['target_date']}): {v['bias']} ({v['confidence']} confidence) — risk: {v['key_risk']}")
@@ -16075,9 +19214,13 @@ def build_digest_content(conn, sections_included, since_iso, as_of_date=None, in
         else:
             text_lines.append("(AI Briefing unavailable for this ticker today.)")
             html_parts.append("<p style='color:#999;'>(AI Briefing unavailable for this ticker today.)</p>")
+        if not analyst_rendered:
+            # Analyst targets come from cached market data, not the AI briefing -- still shown without it.
+            _render_analyst_targets_section(featured, text_lines, html_parts)
         news = featured.get("news") or []
         if news:
             text_lines.append("\nRECENT NEWS:")
+            html_parts.append(_sm("PROSE", "recent_news"))
             html_parts.append("<h4 style='margin:14px 0 2px;font-size:14px;'>Recent News</h4><ul style='margin:0 0 8px;padding-left:18px;'>")
             for n in news:
                 text_lines.append(f"  - {n['title']} ({n['publisher']}, {n.get('published_at') or '—'})")
@@ -16097,6 +19240,7 @@ def build_digest_content(conn, sections_included, since_iso, as_of_date=None, in
     def _add_list_section(key, title, items, line_fn, html_fn):
         if key not in sections_included or not items:
             return
+        html_parts.append(_sm("PROSE", key))
         _section_header(title, len(items))
         for item in items:
             text_lines.append(f"  • {line_fn(item)}")
@@ -16110,41 +19254,29 @@ def build_digest_content(conn, sections_included, since_iso, as_of_date=None, in
         # Part 5: technical read appended to each Runner's line.
         def _runner_vol_txt(r):
             vr = r.get("vol_ratio")
-            return f"{vr:.1f}x vol" if vr else "big move"
+            return f"{fmt_mult(vr, na='')} vol" if _finite(vr) else "big move"
 
         _add_list_section(
             "todays_runners", DIGEST_SECTION_LABELS["todays_runners"], sections.get("todays_runners"),
-            lambda r: (f"{r['ticker']}: ${r['price']:.2f} ({_fmt_pct(r.get('chg_pct'))}, {_runner_vol_txt(r)})"
+            lambda r: (f"{r['ticker']}: {fmt_money(r['price'])} ({_fmt_pct(r.get('chg_pct'))}, {_runner_vol_txt(r)})"
                        + (f" — {r['technical_read']}" if r.get("technical_read") else "")),
-            lambda r: (f"<b>{html.escape(r['ticker'])}</b>: ${r['price']:.2f} ({_fmt_pct(r.get('chg_pct'))}, "
+            lambda r: (f"<b>{html.escape(r['ticker'])}</b>: {fmt_money(r['price'])} ({_fmt_pct(r.get('chg_pct'))}, "
                        f"{_runner_vol_txt(r)})"
                        + (f"<br><span style='color:#555;font-size:13px;'>{html.escape(r['technical_read'])}</span>"
                           if r.get("technical_read") else "")),
         )
 
-        # Part 3: current price, target price, % move, AND target date/time.
-        _add_list_section(
-            "day_prediction_targets", DIGEST_SECTION_LABELS["day_prediction_targets"],
-            sections.get("day_prediction_targets"),
-            lambda p: (f"{p['ticker']} — Current: ${p['current_price']:.2f} → Target: ${p['target_price']:.2f} "
-                       f"({p['predicted_direction']}, {_fmt_pct(p['move_pct'])}) by market close today "
-                       f"(4:00 PM ET) — {_DAY_PREDICTION_MODE_LABEL.get(p['mode'], p['mode'] or '—')}, "
-                       f"backtested on {p['backtest_n']} sessions"),
-            lambda p: (f"<b>{html.escape(p['ticker'])}</b> — Current: ${p['current_price']:.2f} → "
-                       f"Target: <b>${p['target_price']:.2f}</b> ({html.escape(p['predicted_direction'] or '')}, "
-                       f"{_fmt_pct(p['move_pct'])}) by market close today (4:00 PM ET) — "
-                       f"{html.escape(_DAY_PREDICTION_MODE_LABEL.get(p['mode'], p['mode'] or '—'))}, backtested on "
-                       f"{p['backtest_n']} sessions"),
-        )
+        _render_day_prediction_section(sections.get("day_prediction_targets"), sections_included,
+                                       text_lines, html_parts, _section_header, as_of_date=as_of_date, now_et=now_et)
 
         if "swing_forecast_highlights" in sections_included and sections.get("swing_forecast_highlights"):
             _add_list_section(
                 "swing_forecast_highlights", DIGEST_SECTION_LABELS["swing_forecast_highlights"],
                 sections.get("swing_forecast_highlights"),
-                lambda s: f"{s['ticker']} ({s['horizon_days']}d): target ${s['target_price']:.2f} "
+                lambda s: f"{s['ticker']} ({s['horizon_days']}d): target {fmt_money(s['target_price'])} "
                           f"({s['predicted_direction']}, High confidence)",
                 lambda s: (f"<b>{html.escape(s['ticker'])}</b> ({s['horizon_days']}d): target "
-                           f"${s['target_price']:.2f} ({html.escape(s['predicted_direction'] or '')})"),
+                           f"{fmt_money(s['target_price'])} ({html.escape(s['predicted_direction'] or '')})"),
             )
 
     # Part 4: FULL watchlist table, every ticker, closest-to-entry first,
@@ -16152,6 +19284,7 @@ def build_digest_content(conn, sections_included, since_iso, as_of_date=None, in
     # changed-only list.
     if "watchlist_signals" in sections_included and sections.get("watchlist_signals"):
         rows = sections["watchlist_signals"]
+        html_parts.append(_sm("VISUAL", "watchlist_signals"))
         _section_header(DIGEST_SECTION_LABELS["watchlist_signals"], len(rows))
         text_lines.append(f"{'TICKER':<7}{'PRICE':<10}{'ENTRY ZONE':<18}{'DIST':<9}{'SIGNAL':<10}{'DIV':<5}")
         html_parts.append(
@@ -16162,12 +19295,12 @@ def build_digest_content(conn, sections_included, since_iso, as_of_date=None, in
             "<th style='padding:4px 6px;'>Signal</th><th style='padding:4px 6px;'>Div. Score</th></tr>"
         )
         for r in rows:
-            price_txt = f"${r['price']:.2f}" if r["price"] is not None else "—"
+            price_txt = fmt_money(r["price"])
             dist_txt = (
                 "IN ZONE" if r["status"] == "in_zone"
-                else _fmt_pct(r["distance_pct"]) if r["distance_pct"] is not None else "—"
+                else _fmt_pct(r["distance_pct"])
             )
-            div_txt = f"{r['divergence_score']:.0f}" if r["divergence_score"] is not None else "—"
+            div_txt = fmt_num(r["divergence_score"])
             changed = r["zone_changed_today"] or r["signal_changed_today"]
             flag = " 🔔" if changed else ""
             text_lines.append(
@@ -16200,18 +19333,92 @@ def build_digest_content(conn, sections_included, since_iso, as_of_date=None, in
         weeks = sections["macro_events_week"]
         _section_header(DIGEST_SECTION_LABELS["macro_events_week"])
 
+        # Macro Calendar upgrade (email, spec items 3 & 1) -- amber/red banners ABOVE the two-column grid,
+        # same amber/red callout convention _digest_html_callout already uses for the holiday/incomplete-
+        # data callouts. Lists EVERY qualifying release, not just the soonest (get_macro_release_banner_
+        # state's top-of-email single-line version, left untouched, shows only the soonest -- see fix #4).
+        upcoming_high_impact = get_upcoming_high_impact_releases(conn, now_et)
+        if upcoming_high_impact:
+            lines = []
+            for r in upcoming_high_impact:
+                when = "tomorrow" if r["scheduled_date"] != today_iso else "today"
+                time_txt = _format_et_time_12h(r["scheduled_time_et"]) or "soon"
+                odds_txt = f" Markets: {r['odds_text']}." if r.get("odds_text") else ""
+                lines.append(
+                    f"{r['event_name']} {when} {time_txt} — Forecast {r['forecast_value'] or '—'} "
+                    f"(prev {r['prior_value'] or '—'}).{odds_txt}"
+                )
+            banner_text = "⚠️ " + " ".join(lines) + " A hot print raises sell-off risk; it doesn't guarantee one."
+            text_lines.append(banner_text)
+            text_lines.append("")
+            html_parts.append(_sm("PROSE", "macro_calendar_amber_banner"))
+            html_parts.append(_digest_html_callout(html.escape(banner_text), "#fff3cd"))
+
+        recent_risk_off = get_recent_risk_off_releases(conn, since_iso)
+        if recent_risk_off:
+            lines = [
+                f"{r['event_name']} {r['actual_value']} vs {r['forecast_value']} forecast "
+                f"(prev {r['prior_value'] or '—'}) — hotter than expected"
+                for r in recent_risk_off
+            ]
+            banner_text = "🔴 " + "; ".join(lines) + ". A hot print raises sell-off risk; it doesn't guarantee one."
+            text_lines.append(banner_text)
+            text_lines.append("")
+            html_parts.append(_sm("PROSE", "macro_calendar_red_banner"))
+            html_parts.append(_digest_html_callout(html.escape(banner_text), "#fdecea"))
+
+        html_parts.append(_sm("VISUAL", "macro_events_week"))
+
         def _week_range_label(week):
             return f"{pd.Timestamp(week['start']).strftime('%b %-d')} – {pd.Timestamp(week['end']).strftime('%b %-d')}"
+
+        def _group_by_family(events):
+            # Spec item 2 -- "a release with several measures (CPI, PPI) keeps one badge + event name, with
+            # each measure as its own sub-line." event_type is already the right grouping key (e.g. "cpi"
+            # covers CPI MoM/YoY + Core CPI MoM/YoY as separate macro_events rows for the same release day).
+            groups, order = {}, []
+            for e in events:
+                k = e["event_type"]
+                if k not in groups:
+                    groups[k] = []
+                    order.append(k)
+                groups[k].append(e)
+            return [(k, groups[k]) for k in order]
+
+        def _numbers_text(ev):
+            fcst, prior, actual = ev.get("forecast_value") or "—", ev.get("prior_value") or "—", ev.get("actual_value")
+            chip = _macro_surprise_chip_label(ev.get("series_key"), ev.get("surprise"), ev.get("surprise_direction"))
+            odds_text = None
+            series_key, forecast_raw = ev.get("series_key"), ev.get("forecast_raw")
+            if series_key and "cpi" in series_key and forecast_raw is not None:
+                odds = get_cpi_bracket_odds(conn, series_key, ev["scheduled_date"], forecast_raw)
+                if odds and not odds.get("thin_market"):
+                    odds_text = f"{odds['hotter_pct']:.0f}% hotter"
+            lines = []
+            if actual:
+                lines.append(f"{actual} · Fcst {fcst} · Prev {prior}" + (f"  [{chip}]" if chip else ""))
+            else:
+                lines.append(f"Fcst {fcst} · Prev {prior}")
+            if odds_text:
+                lines.append(f"Markets: {odds_text}")
+            return lines
 
         def _week_text_lines(week, title):
             out = [f"{title} ({_week_range_label(week)}):"]
             for d in week["days"]:
                 day_label = pd.Timestamp(d["date"]).strftime("%a, %b %-d")
-                ev_txt = (
-                    "; ".join(f"{e['event_name']} ({e['impact_level']})" for e in d["events"])
-                    if d["events"] else "—"
-                )
-                out.append(f"  {day_label}: {ev_txt}")
+                if not d["events"]:
+                    out.append(f"  {day_label}: —")
+                    continue
+                out.append(f"  {day_label}:")
+                for event_type, group in _group_by_family(d["events"]):
+                    header = group[0]["event_name"] if len(group) == 1 else _MACRO_EVENT_TYPE_FAMILY_LABEL.get(event_type, event_type.upper())
+                    out.append(f"    {header} ({group[0]['impact_level']})")
+                    for ev in group:
+                        if len(group) > 1:
+                            out.append(f"      {ev['event_name']}:")
+                        for num_line in _numbers_text(ev):
+                            out.append(f"      {num_line}")
             return out
 
         for line in _week_text_lines(weeks["this_week"], "THIS WEEK"):
@@ -16221,12 +19428,32 @@ def build_digest_content(conn, sections_included, since_iso, as_of_date=None, in
             text_lines.append(line)
         text_lines.append("")
 
-        def _event_badge_html(e):
-            color = _MACRO_IMPACT_COLORS_HEX.get(e["impact_level"], "#8b9bab")
-            badge = (f"<span style='display:inline-block;padding:1px 6px;border-radius:8px;font-size:9px;"
-                     f"font-weight:700;color:#fff;background:{color};margin-right:4px;'>"
-                     f"{html.escape((e['impact_level'] or '—').upper())}</span>")
-            return f"{badge}{html.escape(e['event_name'])}"
+        def _numbers_html(ev):
+            fcst, prior, actual = ev.get("forecast_value") or "—", ev.get("prior_value") or "—", ev.get("actual_value")
+            direction = ev.get("surprise_direction")
+            chip = _macro_surprise_chip_label(ev.get("series_key"), ev.get("surprise"), ev.get("surprise_direction"))
+            odds_text = None
+            series_key, forecast_raw = ev.get("series_key"), ev.get("forecast_raw")
+            if series_key and "cpi" in series_key and forecast_raw is not None:
+                odds = get_cpi_bracket_odds(conn, series_key, ev["scheduled_date"], forecast_raw)
+                if odds and not odds.get("thin_market"):
+                    odds_text = f"{odds['hotter_pct']:.0f}% hotter"
+            chip_html = ""
+            if chip:
+                chip_color = _MACRO_SURPRISE_COLORS_HEX.get(direction, "#8b9bab")
+                chip_html = (f" <span style='display:inline-block;padding:0 5px;border-radius:7px;font-size:9px;"
+                             f"font-weight:700;color:#fff;background:{chip_color};'>{html.escape(chip)}</span>")
+            parts = []
+            if actual:
+                parts.append(
+                    f"<div style='color:#888;font-size:11px;'><b style='color:#333;'>{html.escape(actual)}</b> · "
+                    f"Fcst {html.escape(fcst)} · Prev {html.escape(prior)}{chip_html}</div>"
+                )
+            else:
+                parts.append(f"<div style='color:#888;font-size:11px;'>Fcst {html.escape(fcst)} · Prev {html.escape(prior)}</div>")
+            if odds_text:
+                parts.append(f"<div style='color:#aaa;font-size:10px;'>Markets: {html.escape(odds_text)}</div>")
+            return "".join(parts)
 
         def _week_html_column(week, title):
             parts = [f"<div style='font-weight:700;font-size:13px;margin-bottom:8px;'>{html.escape(title)}<br>"
@@ -16234,10 +19461,23 @@ def build_digest_content(conn, sections_included, since_iso, as_of_date=None, in
                      f"{html.escape(_week_range_label(week))}</span></div>"]
             for d in week["days"]:
                 day_label = pd.Timestamp(d["date"]).strftime("%a, %b %-d")
-                ev_html = (
-                    "<br>".join(_event_badge_html(e) for e in d["events"]) if d["events"]
-                    else "<span style='color:#bbb;'>—</span>"
-                )
+                if not d["events"]:
+                    ev_html = "<span style='color:#bbb;'>—</span>"
+                else:
+                    group_blocks = []
+                    for event_type, group in _group_by_family(d["events"]):
+                        color = _MACRO_IMPACT_COLORS_HEX.get(group[0]["impact_level"], "#8b9bab")
+                        badge = (f"<span style='display:inline-block;padding:1px 6px;border-radius:8px;font-size:9px;"
+                                 f"font-weight:700;color:#fff;background:{color};margin-right:4px;'>"
+                                 f"{html.escape((group[0]['impact_level'] or '—').upper())}</span>")
+                        header = group[0]["event_name"] if len(group) == 1 else _MACRO_EVENT_TYPE_FAMILY_LABEL.get(event_type, event_type.upper())
+                        block = [f"{badge}{html.escape(header)}"]
+                        for ev in group:
+                            if len(group) > 1:
+                                block.append(f"<div style='color:#555;font-size:11px;margin-top:2px;'>{html.escape(ev['event_name'])}</div>")
+                            block.append(_numbers_html(ev))
+                        group_blocks.append("".join(block))
+                    ev_html = "<div style='margin-bottom:6px;'></div>".join(group_blocks)
                 parts.append(f"<div style='margin-bottom:8px;font-size:12px;line-height:1.5;'>"
                               f"<div style='color:#666;font-weight:700;'>{html.escape(day_label)}</div>{ev_html}</div>")
             return "".join(parts)
@@ -16259,18 +19499,723 @@ def build_digest_content(conn, sections_included, since_iso, as_of_date=None, in
 
     if not any(sections.get(k) for k in sections_included if not k.startswith("_")):
         text_lines.append("Nothing new to report since the last digest.")
+        html_parts.append(_sm("PROSE", "nothing_to_report"))
         html_parts.append("<p>Nothing new to report since the last digest.</p>")
 
     text_lines.append("View full details in the WATCHLIST SIGNALS tab.")
     text_lines.append(f"Unsubscribe: {DIGEST_UNSUBSCRIBE_PLACEHOLDER}")
+    text_lines.append(f"Manage preferences: {DIGEST_MANAGE_PLACEHOLDER}")
     text_lines.append("Read more analysis at monotrading.substack.com")
+    # STOP: everything from here on (unsubscribe/manage-preferences links, the monotrading.substack.com
+    # self-link, and the data-quality note possibly spliced in just below) is subscriber-only/email-only --
+    # the one deliberate exception _sm()'s docstring calls out. _parse_digest_markers stops collecting
+    # sections the instant it sees this marker, so none of it can ever leak into the Substack conversion.
+    html_parts.append(_sm("STOP", "footer"))
     html_parts.append(_DIGEST_HTML_FOOTER)
 
     html_body = _DIGEST_HTML_OPEN + "".join(html_parts) + _DIGEST_HTML_CLOSE
+
+    # Pre-send guardrail: scan the rendered email for anything that means a number failed to format. Problems
+    # are logged at ERROR with context and the email still goes out, but carries a small muted note in the
+    # footer so the gap is visible to the reader instead of silent.
+    problems = validate_digest_html(html_body)
+    for prob in problems:
+        digest_log.error("[DIGEST] data-quality problem for %s: %s", email, prob)
+    if problems:
+        note = f"⚠ data quality: {len(problems)} field(s) unavailable today"
+        html_body = html_body.replace(
+            _DIGEST_HTML_FOOTER,
+            f"<p style='font-family:-apple-system,Segoe UI,Arial,sans-serif;color:#aaa;font-size:11px;"
+            f"text-align:center;margin:12px 0 0;'>{html.escape(note)}</p>" + _DIGEST_HTML_FOOTER, 1)
+        for idx, line in enumerate(text_lines):
+            if line.startswith("Unsubscribe:"):
+                text_lines.insert(idx, note)
+                break
     return {
         "subject": subject, "text_body": "\n".join(text_lines), "html_body": html_body,
         "sections": sections, "market_holiday": market_holiday, "holiday_name": holiday_name,
+        "data_quality_problems": problems,
     }
+
+
+# ============================================================================
+# Single global digest edition (2026-10-13 rebuild, Part 1) -- "build once,
+# render per subscriber." The ONE Claude deep-analysis call for a calendar
+# date happens inside build_digest_edition() and ONLY there. Every other
+# caller (Preview, Send Test, the scheduled send, Send to Substack) reads the
+# stored row back via get_or_build_todays_edition()/get_digest_edition() and
+# re-renders from it via render_edition_for_recipient() -- which calls
+# build_digest_content() again per recipient (each wants different sections),
+# but ALWAYS with the already-built featured_stock dict passed back in, which
+# is what keeps that re-render from ever reaching generate_deep_analysis.
+#
+# This is a single shared publication now (2026-10-13 decision), built from
+# the ADMIN account's own watchlist/Runners/Day Predictions/Watchlist
+# Signals/featured-stock rule -- not a per-app-user digest. Per-user
+# email_config schedules (every account except the admin's) no longer drive
+# any send; they're left in place, unused, rather than deleted (dashboard.py
+# hides those controls from non-admin viewers).
+# ============================================================================
+
+def _get_edition_admin_email(conn):
+    """The one account the single global edition is built from -- the first active admin, by email.
+    Resolved live (not hardcoded) so this keeps working if the admin role is ever moved to a different
+    account; there is exactly one admin today (iamluiswong@gmail.com)."""
+    row = conn.execute("SELECT email FROM users WHERE role='admin' AND active=1 ORDER BY email LIMIT 1").fetchone()
+    return row[0] if row else None
+
+
+def get_digest_edition(conn, edition_date=None):
+    """Pure DB read -- the stored edition for this date, or None if it hasn't been built yet. Never builds,
+    never makes an API call. `sections` is content_json deserialized back to a dict (the same shape
+    build_digest_content's own `sections` return value has)."""
+    edition_date = edition_date or today_et()
+    date_str = edition_date.isoformat() if hasattr(edition_date, "isoformat") else edition_date
+    row = conn.execute(
+        """SELECT edition_date, featured_ticker, featured_source, built_at, content_json, html_full,
+               text_full, subject, claude_api_calls, claude_api_cost
+           FROM digest_editions WHERE edition_date=?""",
+        (date_str,),
+    ).fetchone()
+    if not row:
+        return None
+    cols = ["edition_date", "featured_ticker", "featured_source", "built_at", "content_json", "html_full",
+            "text_full", "subject", "claude_api_calls", "claude_api_cost"]
+    edition = dict(zip(cols, row))
+    try:
+        edition["sections"] = json.loads(edition["content_json"]) if edition["content_json"] else {}
+    except (TypeError, ValueError):
+        edition["sections"] = {}
+    return edition
+
+
+def get_last_digest_edition(conn):
+    """Most recent edition on record, any date -- for the admin settings panel's "last edition cost"
+    display. None if no edition has ever been built."""
+    row = conn.execute("SELECT edition_date FROM digest_editions ORDER BY edition_date DESC LIMIT 1").fetchone()
+    return get_digest_edition(conn, row[0]) if row else None
+
+
+# ============================================================================
+# "Send to Substack" (draft only) -- 2026-10-13, Part 2; rebuilt 2026-10-14 for exact section-for-section
+# fidelity with the email; hardened again 2026-10-14 (Preview-staleness fix) to require a FRESHLY rendered
+# html_full as an explicit argument rather than reading edition["html_full"] (the build-time-only stored
+# string) internally. SINGLE SOURCE: build_substack_markdown walks that freshly-rendered HTML -- the SAME
+# bytes a real send would produce right now -- via the _sm() markers build_digest_content drops into it (see
+# _sm's docstring), in the SAME order the email renders them. There is no second, hand-curated
+# section list for Substack to drift out of sync with (that drift is exactly how the old version here
+# dropped most sections and truncated the Overview to one sentence). PROSE markers become markdown text,
+# in full; VISUAL markers become a numbered image the caller renders from the marker's own HTML via a
+# headless browser (render_html_section_to_png) so it looks identical to the email; IMAGE markers become a
+# numbered image reusing a chart PNG the caller already built for the email (this file has no plotly
+# dependency, so it can't render charts itself). STOP markers (unsubscribe/manage-preferences/data-quality
+# footer) end collection entirely, per Part 2.2's one exception.
+# ============================================================================
+
+_SM_MARKER_RE = re.compile(r"<!--SM:(PROSE|VISUAL|IMAGE|STOP):([^:>]+)-->")
+
+
+def _parse_digest_markers(html_full):
+    """Slices the stored edition's html_full into ordered (kind, key, html) dicts at each _sm() boundary
+    marker -- the single source of truth behind both build_substack_markdown and its own test checklist
+    (so the checklist can never disagree with what was actually converted). Stops entirely at the first
+    STOP marker (subscriber-only footer) -- see _sm's docstring. Content before the first marker (the
+    masthead banner) is intentionally dropped; every real content section is always preceded by its own
+    marker."""
+    parts = _SM_MARKER_RE.split(html_full or "")
+    sections = []
+    for idx in range(1, len(parts), 3):
+        kind, key = parts[idx], parts[idx + 1]
+        if kind == "STOP":
+            break
+        chunk = parts[idx + 2] if idx + 2 < len(parts) else ""
+        sections.append({"kind": kind, "key": key, "html": chunk})
+    return sections
+
+
+def _html_fragment_to_markdown(html_fragment):
+    """Converts one of our own digest email HTML section fragments to markdown text, in full, never
+    truncated. NOT a general HTML-to-markdown library -- this only ever runs on OUR OWN generator's output
+    (build_digest_content's html_parts), whose tag vocabulary is small and fixed (headings, paragraphs,
+    lists, bold, links, line breaks, styled spans), so a sequential regex pipeline is reliable here in a
+    way it would not be for arbitrary third-party HTML. Links are converted first (news headlines'
+    `<a href>` -> markdown `[text](url)`, per "News headlines: keep as text with links"), styled color
+    spans are stripped down to their plain text (color was presentational only, not information)."""
+    s = html_fragment or ""
+    s = re.sub(r'<a\b[^>]*href=["\']([^"\']*)["\'][^>]*>(.*?)</a>', r"[\2](\1)", s, flags=re.I | re.S)
+    s = re.sub(r"<(b|strong)\b[^>]*>(.*?)</\1>", r"**\2**", s, flags=re.I | re.S)
+    s = re.sub(r"<h[1-6]\b[^>]*>(.*?)</h[1-6]>", lambda m: "\n### " + m.group(1).strip() + "\n", s, flags=re.I | re.S)
+    s = re.sub(r"<li\b[^>]*>(.*?)</li>", lambda m: "- " + m.group(1).strip() + "\n", s, flags=re.I | re.S)
+    s = re.sub(r"</p>", "\n\n", s, flags=re.I)
+    s = re.sub(r"<br\s*/?>", "\n", s, flags=re.I)
+    s = re.sub(r"<[^>]+>", "", s)  # every remaining tag: spans, ul/table wrappers, opening <p>/<div>, etc.
+    s = html.unescape(s)
+    lines, blank_run = [], 0
+    for ln in (l.strip() for l in s.splitlines()):
+        if ln == "":
+            blank_run += 1
+            if blank_run <= 1:
+                lines.append(ln)
+        else:
+            blank_run = 0
+            lines.append(ln)
+    return "\n".join(lines).strip()
+
+
+# Human-readable titles for the VISUAL/IMAGE image placeholders, in the same spirit as the old
+# DIGEST_SECTION_LABELS -- shown nowhere load-bearing (not used for matching), just a nicer caption than
+# the raw marker key when one is wanted. Falls back to the key itself (title-cased) if not listed.
+_SUBSTACK_IMAGE_TITLES = {
+    "key_stats": "Key Stats", "swing_outlook_cards": "2-Week Swing Outlook",
+    "institutional_analysis": "Institutional Analysis", "analyst_targets_cards": "Earnings & Analyst Targets",
+    "analyst_breakdown_chart": "Analyst Recommendation Breakdown", "day_prediction_targets": "Day Prediction Targets",
+    "watchlist_signals": "Watchlist Signals", "macro_events_week": "Macro Calendar — This Week & Next Week",
+}
+
+
+def build_substack_markdown(conn, edition, rendered_html_full):
+    """Pure data + markdown, no plotly/network dependency beyond one cheap, free (non-Claude) price-
+    snapshot read for the post's subtitle metadata -- NEVER rebuilds the edition, NEVER calls
+    generate_deep_analysis. Walks `rendered_html_full` (see module docstring above) for the actual body
+    content, so "same sections, same order, same content" as the email is structural, not maintained by
+    hand.
+
+    `rendered_html_full` is a REQUIRED, EXPLICIT argument -- NOT read from `edition["html_full"]` internally
+    (2026-10-14 fix) -- precisely so this can never silently walk a stale, build-time-only HTML string again
+    (confirmed live: that's exactly what the Preview button was doing before this same fix, and it's exactly
+    the bug this signature change makes structurally impossible to reintroduce here too). The caller MUST
+    pass a FRESH render -- render_edition_for_recipient(conn, edition, DEFAULT_DIGEST_SECTIONS, chart_cid=...)
+    ['html_body'] -- built from the edition's own content_json (sections/featured_stock) against the CURRENT
+    template code and CURRENT live data (macro events, prices, watchlist signals, ...), the same zero-API-
+    call path (digest_render_guard-protected) Preview/Send Test/the real send already use. `edition` itself
+    is still used for its OTHER fields (edition_date, featured_ticker, sections.featured_stock.news).
+
+    Returns {"title", "subtitle", "markdown", "image_slots": [{"key","kind","html"(VISUAL only)}, ...]}
+    (ordered exactly as the email renders them) -- image_slots replaces the old `table_specs`; the caller
+    (dashboard.py) turns each slot into PNG bytes (VISUAL: render_html_section_to_png(slot["html"]); IMAGE:
+    reuse the existing chart bytes it already built for the email, keyed by slot["key"] == that chart's
+    cid) before calling send_edition_to_substack / export_substack_zip, which replace each markdown
+    `{{TABLE:key}}` placeholder with the uploaded/zipped image in that same order."""
+    ticker = edition.get("featured_ticker")
+    edition_date = edition["edition_date"]
+    html_full = rendered_html_full or ""
+    # The email's own "Recent News" <li> markup has no <a href> (the email deliberately doesn't hyperlink
+    # headlines) -- so the generic HTML->markdown converter below finds nothing to link. "News headlines:
+    # keep as text with links" (2026-10-14) is satisfied here instead, from the SAME structured news data
+    # the email section itself was built from (edition["sections"]["featured_stock"]["news"], which now
+    # carries a "link" field -- see get_featured_stock_section), not by changing the email's HTML.
+    news_items = ((edition.get("sections") or {}).get("featured_stock") or {}).get("news") or []
+
+    title = f"Smart Money Weekly — {edition_date}" + (f": {ticker}" if ticker else "")
+    subtitle = ""
+    if ticker:
+        try:
+            snap = get_price_snapshot(ticker, conn)
+            overview = build_overview_sentence(snap)
+            # ONE sentence, deliberately -- this is the post's SUBTITLE METADATA only (Substack's own
+            # "subtitle" field under the title), never reused as body text. The body's own Overview comes
+            # from the "featured_overview" PROSE marker below, which carries the FULL overview text --
+            # fixed 2026-10-14: the old code reused this same truncated value as the body too.
+            subtitle = (overview or "").split(". ")[0].strip()
+            if subtitle and not subtitle.endswith("."):
+                subtitle += "."
+        except Exception as e:
+            digest_log.warning("[SUBSTACK] subtitle derivation failed for %s: %s", ticker, e)
+
+    lines = [f"# {title}", ""]
+    image_slots = []
+    for sec in _parse_digest_markers(html_full):
+        kind, key, frag = sec["kind"], sec["key"], sec["html"]
+        if kind == "PROSE":
+            if key == "recent_news" and news_items:
+                text_lines = ["### Recent News"]
+                for n in news_items:
+                    pub = f" — {n['publisher']}" if n.get("publisher") else ""
+                    text_lines.append(f"- [{n['title']}]({n['link']}){pub}" if n.get("link")
+                                       else f"- {n['title']}{pub}")
+                text = "\n".join(text_lines)
+            else:
+                text = _html_fragment_to_markdown(frag)
+            if text:
+                lines.append(text)
+                lines.append("")
+        else:  # VISUAL or IMAGE -- both become one numbered image, in document order
+            image_slots.append({"key": key, "kind": kind.lower(), "html": frag if kind == "VISUAL" else None})
+            lines.append(f"{{{{TABLE:{key}}}}}")
+            lines.append("")
+
+    markdown = "\n".join(lines).strip() + "\n"
+    return {"title": title, "subtitle": subtitle, "markdown": markdown, "image_slots": image_slots}
+
+
+def render_html_section_to_png(html_fragment, driver=None, width=600, device_scale_factor=2):
+    """Screenshots ONE digest-email HTML section fragment to a PNG via headless Chrome (Selenium -- already
+    an optional dependency of this file, same as the MarketBeat scrape's undetected-chromedriver; no new
+    package needed), at the email's own 600px body width and 2x device scale for Retina-sharp output -- so
+    a VISUAL marker's section (stat grid, card row, table, badges, calendar) looks pixel-identical to what
+    the email actually rendered, because it IS that exact HTML, not a re-implementation of its layout.
+
+    `driver`: pass an already-launched driver (new_headless_chrome_driver()) to reuse across every VISUAL
+    slot in one edition export/send instead of relaunching Chrome per section; a one-off call launches and
+    quits its own. Uses the Chrome DevTools Protocol (Emulation.setDeviceMetricsOverride +
+    Page.captureScreenshot) rather than plain window-resize screenshotting, since that's the only
+    deterministic way to get an exact CSS-pixel width with a real device-scale multiplier regardless of the
+    host machine's own display DPI."""
+    own_driver = driver is None
+    if own_driver:
+        driver = new_headless_chrome_driver()
+    tmp_path = None
+    try:
+        doc = (
+            "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+            "<style>html,body{margin:0;padding:16px;box-sizing:border-box;background:#ffffff;}"
+            "body{font-family:Georgia,'Times New Roman',serif;color:#1a1a1a;}</style></head>"
+            f"<body>{html_fragment}</body></html>"
+        )
+        fd, tmp_path = tempfile.mkstemp(suffix=".html")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(doc)
+        driver.execute_cdp_cmd("Emulation.setDeviceMetricsOverride", {
+            "width": width, "height": 200, "deviceScaleFactor": device_scale_factor, "mobile": False,
+        })
+        driver.get(f"file://{tmp_path}")
+        height = driver.execute_script(
+            "return Math.max(document.body.scrollHeight, document.documentElement.scrollHeight, "
+            "document.body.offsetHeight, document.documentElement.offsetHeight) || 1;"
+        )
+        height = max(1, int(height) + 1)
+        driver.execute_cdp_cmd("Emulation.setDeviceMetricsOverride", {
+            "width": width, "height": height, "deviceScaleFactor": device_scale_factor, "mobile": False,
+        })
+        png_b64 = driver.execute_cdp_cmd("Page.captureScreenshot", {
+            "format": "png", "captureBeyondViewport": True,
+            "clip": {"x": 0, "y": 0, "width": width, "height": height, "scale": 1},
+        })["data"]
+        return base64.b64decode(png_b64)
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        if own_driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+
+def new_headless_chrome_driver():
+    """Launches a plain headless Chrome via Selenium (Selenium Manager auto-resolves a matching
+    chromedriver -- selenium>=4.6, no manual version pinning needed). Deliberately NOT
+    undetected-chromedriver/the MarketBeat scrape's real-visible-window driver: this only ever renders our
+    OWN trusted local HTML files, so there is no bot-detection concern to work around, and headless is
+    faster/more reliable for that. Caller is responsible for .quit()."""
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--hide-scrollbars")
+    options.add_argument("--log-level=3")
+    return webdriver.Chrome(options=options)
+
+
+def render_substack_image_slots(image_slots, email_chart_images):
+    """Turns build_substack_markdown's ordered `image_slots` into an ordered {key: png_bytes} dict, reusing
+    ONE headless Chrome instance across every VISUAL slot (new_headless_chrome_driver(), quit in `finally`)
+    instead of relaunching per section. IMAGE slots are looked up in `email_chart_images` (the SAME cid ->
+    PNG bytes dict the caller already built to embed the actual email's charts -- build_featured_stock_
+    chart_bytes / build_analyst_chart_images / build_swing_chart_image live in charts.py, which this
+    plotly-free file can't import, hence the caller does that part); a slot missing from that dict is
+    skipped with a logged warning rather than silently producing a broken image reference. Insertion order
+    == document order, so the caller can number files 01_, 02_, ... directly off this dict."""
+    out = {}
+    driver = None
+    try:
+        for slot in image_slots:
+            key, kind = slot["key"], slot["kind"]
+            if kind == "visual":
+                if driver is None:
+                    driver = new_headless_chrome_driver()
+                out[key] = render_html_section_to_png(slot["html"], driver=driver)
+            else:  # "image" -- an existing chart PNG the email itself embeds
+                png = (email_chart_images or {}).get(key)
+                if png is None:
+                    digest_log.warning("[SUBSTACK] image slot %r has no chart bytes available -- skipped", key)
+                    continue
+                out[key] = png
+    finally:
+        if driver is not None:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+    return out
+
+
+def _parse_cookies_string_no_decode(cookies_string):
+    """Same semicolon-split/strip logic as python-substack 0.10.0's own `substack.Api._parse_cookies_string`,
+    MINUS its `unquote()` call on each value. That call silently decodes e.g. substack.sid's real wire value
+    ("s%3Aj%3A...") into "s:j:..." before storing it in the requests session's cookie jar -- `requests` then
+    sends that DECODED, unescaped value back out on the wire, which does not match what a real browser sends
+    (browsers keep the percent-encoding literal) and Substack's server rejects it with 401 "Please sign in"
+    even though the cookie itself is perfectly valid. Confirmed by reading python-substack's source
+    (2026-10-14 live diagnosis) -- not independently confirmed against a real Substack account from this dev
+    environment (no SUBSTACK_COOKIE available here), same disclosed-gap convention as the rest of this
+    integration. Never logs the cookie value."""
+    cookies = {}
+    for pair in cookies_string.split(";"):
+        pair = pair.strip()
+        if not pair or "=" not in pair:
+            continue
+        key, value = pair.split("=", 1)
+        cookies[key.strip()] = value.strip()
+    return cookies
+
+
+def _describe_substack_cookie(cookie_string):
+    """SAFE, value-free structural diagnostics on a SUBSTACK_COOKIE string -- 2026-10-14, added after the
+    unquote()-decode fix alone didn't resolve a live 401. Never returns or logs the actual cookie value,
+    only: which cookie NAMES were found (catches "only substack.sid was pasted, substack.lli is missing"),
+    and for substack.sid specifically, its length and which of a few known SHAPES its value matches
+    ("percent-encoded" = starts literally with "s%3A", the raw wire form a browser sends; "decoded" =
+    starts with "s:", meaning something -- possibly a password manager or manual edit -- already decoded
+    it before it reached SUBSTACK_COOKIE, so our own no-decode fix would NOT re-encode it back; "other" =
+    neither, worth a fresh copy; "missing" = no substack.sid cookie present at all)."""
+    names = [p.split("=", 1)[0].strip() for p in (cookie_string or "").split(";") if "=" in p]
+    sid_value = None
+    for p in (cookie_string or "").split(";"):
+        p = p.strip()
+        if p.startswith("substack.sid="):
+            sid_value = p.split("=", 1)[1].strip()
+            break
+    if sid_value is None:
+        sid_shape = "missing"
+    elif sid_value.startswith("s%3A"):
+        sid_shape = "percent-encoded (expected -- matches a real browser's wire value)"
+    elif sid_value.startswith("s:") or sid_value.startswith("s%253A"):
+        sid_shape = "already-decoded or double-encoded -- NOT the raw browser value; see note below"
+    else:
+        sid_shape = "unrecognized prefix -- doesn't look like a standard Substack session cookie"
+    return {"cookie_names": names, "sid_value_length": len(sid_value) if sid_value is not None else 0,
+            "sid_shape": sid_shape}
+
+
+def _substack_api(cookie=None, publication_url=None):
+    """Builds an authenticated substack.Api client from the configured cookie -- 2026-10-13 Part 2.4:
+    "Substack session cookie stored in the existing secrets/config, never in code or git" -- read from the
+    SUBSTACK_COOKIE environment variable (same convention as SMTP_HOST/ANTHROPIC_API_KEY/QUIVER_API_KEY
+    elsewhere in this file), never hardcoded. Raises RuntimeError with a clear, actionable message if
+    unconfigured -- the caller turns that into the UI's "Substack session expired — refresh cookie in
+    Settings" message and records it to substack_posts.
+
+    2026-10-14: temporarily patches substack.Api._parse_cookies_string (class-level, restored in `finally`
+    even if construction raises) to `_parse_cookies_string_no_decode` -- see that function's docstring for
+    why. This means SUBSTACK_COOKIE should hold the cookie string EXACTLY as copied from the browser
+    (substack.sid's value starting "s%3A...", percent-encoding intact), not re-encoded by hand."""
+    import substack  # local import: only needed when this feature is actually used, matching anthropic's
+                      # own "optional dependency" convention elsewhere in this file
+    cookie = cookie or os.environ.get("SUBSTACK_COOKIE")
+    publication_url = publication_url or os.environ.get("SUBSTACK_PUBLICATION_URL") or "https://monotrading.substack.com"
+    if not cookie:
+        raise RuntimeError(
+            "SUBSTACK_COOKIE is not set — Substack session expired or never configured. "
+            "Refresh the cookie in Settings (see the Substack history panel)."
+        )
+    _orig_parse = substack.Api._parse_cookies_string
+    substack.Api._parse_cookies_string = staticmethod(_parse_cookies_string_no_decode)
+    try:
+        return substack.Api(cookies_string=cookie, publication_url=publication_url)
+    finally:
+        substack.Api._parse_cookies_string = _orig_parse
+
+
+def test_substack_connection(cookie=None, publication_url=None):
+    """Read-only auth diagnostic (2026-10-14), separate from draft creation -- isolates WHICH stage a 401
+    is coming from, since substack.Api's own __init__ already makes its first authenticated call
+    internally (resolving the publication) before any draft-specific code ever runs:
+      - "not_configured": SUBSTACK_COOKIE isn't set at all.
+      - "construction": Api(...) itself raised -- the cookie is being rejected generally (profile fetch /
+        publication resolution), same root problem draft creation would also hit. This is what a 401 here
+        means: the session cookie itself isn't authenticating, full stop.
+      - "get_user_id": construction succeeded (so the cookie DOES authenticate) but the explicit
+        get_user_id() read call failed -- narrower, less likely given construction's own internal check.
+      - "drafts_read": the above passed but GET {publication}/drafts (same resource family as the POST
+        that creates a draft, still read-only) also 401s -- points at a drafts/publication-scope permission
+        gap rather than a totally dead cookie.
+      - "ok": every read-only check passed; a draft-creation 401 after this would mean the create endpoint
+        itself needs something extra (e.g. a CSRF-style token) the library isn't sending.
+    Returns a dict, never the cookie value. Makes 2-3 cheap GET calls when the cookie is present -- never
+    POSTs, never creates/touches a real draft."""
+    cookie = cookie or os.environ.get("SUBSTACK_COOKIE")
+    publication_url = publication_url or os.environ.get("SUBSTACK_PUBLICATION_URL") or "https://monotrading.substack.com"
+    if not cookie:
+        return {"ok": False, "stage": "not_configured", "error": "SUBSTACK_COOKIE is not set."}
+    cookie_shape = _describe_substack_cookie(cookie)
+    try:
+        api = _substack_api(cookie, publication_url)
+    except Exception as e:
+        return {"ok": False, "stage": "construction", "error": str(e),
+                "publication_url_configured": publication_url, **cookie_shape}
+
+    resolved = getattr(api, "publication_url", None)
+    try:
+        user_id = api.get_user_id()
+    except Exception as e:
+        return {"ok": False, "stage": "get_user_id", "error": str(e),
+                "resolved_publication_url": resolved, "publication_url_configured": publication_url, **cookie_shape}
+
+    try:
+        api.get_drafts(limit=1)
+    except Exception as e:
+        return {"ok": False, "stage": "drafts_read", "error": str(e), "user_id": user_id,
+                "resolved_publication_url": resolved, "publication_url_configured": publication_url, **cookie_shape}
+
+    return {"ok": True, "stage": "ok", "user_id": user_id, "resolved_publication_url": resolved,
+            "publication_url_configured": publication_url, **cookie_shape}
+
+
+def send_edition_to_substack(conn, edition, markdown_content, images, as_of_date=None):
+    """THE one place that talks to Substack -- creates a DRAFT ONLY, never publishes. `publish` is never
+    passed as True to create_draft_from_markdown anywhere in this function, by construction -- not just by
+    convention. `images` is {table_key_or_chart_name: png_bytes}, already rendered by the caller
+    (dashboard.py/charts.py — this file has no plotly dependency); each is uploaded via Api.get_image
+    (base64 data URI, no temp file needed) and its returned hosted URL replaces the matching
+    `{{TABLE:key}}` / `{{CHART:name}}` placeholder in markdown_content before the draft is created.
+
+    NOT independently verified against a real Substack account -- no SUBSTACK_COOKIE has been available in
+    this dev environment. The image-upload response parsing (`resp.get("url")`) and create_draft_from_
+    markdown's real success/error shape are both implemented per python-substack's own source and the
+    library's documented return types, not confirmed live -- same disclosed-gap discipline as this file's
+    QuiverQuant integration. Records the outcome (success or failure) to substack_posts either way."""
+    as_of_date = as_of_date or today_et()
+    date_str = as_of_date.isoformat() if hasattr(as_of_date, "isoformat") else as_of_date
+    created_at = datetime.utcnow().isoformat()
+
+    try:
+        api = _substack_api()
+        rendered_markdown = markdown_content
+        for key, png_bytes in (images or {}).items():
+            if png_bytes is None:
+                continue
+            data_uri = f"data:image/png;base64,{base64.b64encode(png_bytes).decode()}"
+            upload_resp = api.get_image(data_uri)
+            image_url = (upload_resp or {}).get("url") or (upload_resp or {}).get("src")
+            if not image_url:
+                raise RuntimeError(f"Substack image upload for {key!r} returned no URL (response: {upload_resp!r})")
+            rendered_markdown = rendered_markdown.replace(f"{{{{TABLE:{key}}}}}", f"![{key}]({image_url})")
+            rendered_markdown = rendered_markdown.replace(f"{{{{CHART:{key}}}}}", f"![{key}]({image_url})")
+
+        edition = get_digest_edition(conn, as_of_date) or {}
+        title = f"Smart Money Weekly — {date_str}" + (
+            f": {edition.get('featured_ticker')}" if edition.get("featured_ticker") else "")
+        draft = api.create_draft_from_markdown(
+            title=title, markdown=rendered_markdown, subtitle="", publish=False, send=False,
+        )
+        draft_id = (draft or {}).get("id")
+        draft_url = f"{os.environ.get('SUBSTACK_PUBLICATION_URL') or 'https://monotrading.substack.com'}/publish/post/{draft_id}" if draft_id else None
+        conn.execute(
+            "INSERT INTO substack_posts (edition_date, draft_id, draft_url, status, created_at, error) "
+            "VALUES (?,?,?,?,?,?)",
+            (date_str, str(draft_id) if draft_id else None, draft_url, "draft_created", created_at, None),
+        )
+        conn.commit()
+        digest_log.info("[SUBSTACK] Draft created for edition %s: id=%s", date_str, draft_id)
+        return {"ok": True, "draft_id": draft_id, "draft_url": draft_url}
+    except Exception as e:
+        err = str(e)
+        digest_log.error("[SUBSTACK] draft creation failed for edition %s: %s", date_str, err)
+        conn.execute(
+            "INSERT INTO substack_posts (edition_date, draft_id, draft_url, status, created_at, error) "
+            "VALUES (?,?,?,?,?,?)",
+            (date_str, None, None, "failed", created_at, err),
+        )
+        conn.commit()
+        return {"ok": False, "error": err}
+
+
+def get_substack_posts(conn, limit=20):
+    """Substack history for the admin settings panel -- most recent attempts first, success and failure
+    alike (an honest record, not just the wins)."""
+    rows = conn.execute(
+        "SELECT id, edition_date, draft_id, draft_url, status, created_at, error FROM substack_posts "
+        "ORDER BY created_at DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    cols = ["id", "edition_date", "draft_id", "draft_url", "status", "created_at", "error"]
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def get_last_substack_post(conn):
+    """Most recent Substack post attempt of ANY status -- "Last Substack post: N days ago" near the
+    button. None if nothing has ever been attempted."""
+    posts = get_substack_posts(conn, limit=1)
+    return posts[0] if posts else None
+
+
+def get_substack_post_for_edition(conn, edition_date):
+    """Whether THIS edition already has a successful draft -- drives the button's "Already sent to
+    Substack — open draft / send again" text and the duplicate-send confirmation."""
+    date_str = edition_date.isoformat() if hasattr(edition_date, "isoformat") else edition_date
+    row = conn.execute(
+        "SELECT id, draft_id, draft_url, status, created_at FROM substack_posts "
+        "WHERE edition_date=? AND status='draft_created' ORDER BY created_at DESC LIMIT 1",
+        (date_str,),
+    ).fetchone()
+    if not row:
+        return None
+    return dict(zip(["id", "draft_id", "draft_url", "status", "created_at"], row))
+
+
+def export_substack_zip(markdown_content, images):
+    """FALLBACK (Part 2.5), always available, independent of the python-substack package/API/cookie: a zip
+    with the converted post as markdown + every table/chart PNG, numbered in order, so a draft can be
+    pasted into Substack's editor by hand if the unofficial API breaks. Pure stdlib zipfile -- no plotly,
+    no network. Image placeholders in the markdown are rewritten to relative `images/NN_key.png` paths
+    matching the files actually in the zip."""
+    buf = io.BytesIO()
+    rendered_markdown = markdown_content
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for i, (key, png_bytes) in enumerate(((images or {}).items()), start=1):
+            if png_bytes is None:
+                continue
+            filename = f"images/{i:02d}_{key}.png"
+            zf.writestr(filename, png_bytes)
+            rendered_markdown = rendered_markdown.replace(f"{{{{TABLE:{key}}}}}", f"![{key}]({filename})")
+            rendered_markdown = rendered_markdown.replace(f"{{{{CHART:{key}}}}}", f"![{key}]({filename})")
+        zf.writestr("post.md", rendered_markdown)
+    return buf.getvalue()
+
+
+def build_digest_edition(conn, edition_date=None, force=False, consume_override=False):
+    """THE one place a Claude deep-analysis call happens for a digest edition. Builds the FULL digest --
+    every section (DEFAULT_DIGEST_SECTIONS), regardless of any subscriber's preferences -- for
+    `edition_date` (today ET by default), and persists it into digest_editions. Returns the EXISTING row
+    untouched if one already exists for this date and force=False -- every caller except the admin's
+    explicit "Rebuild today's edition" button goes through here with force=False, so nothing else can ever
+    trigger a second build (and therefore a second API call) for the same date.
+
+    `consume_override` (2026-10-14): when True and this build actually picked a one-time manual featured
+    override, that override is cleared right here, immediately after this build -- NOT deferred to a later
+    successful scheduled send the way send_daily_digest_email's own post-send consumption still works for
+    the normal (non-rebuild) path. Only the admin's explicit "Rebuild today's edition" button passes True:
+    a rebuild is, by definition, the admin deliberately re-picking right now, so "just the next digest"
+    must mean *this* digest, not whatever digest happens to be the next one actually sent after it (which,
+    for a rebuild issued after today's send already went out, could otherwise be tomorrow's -- silently
+    re-featuring the same one-time pick a second day in a row). Preview/Send Test/the normal first build of
+    the day keep consume_override=False, unchanged: those still only burn the pick via the existing
+    send-time consumption, so a quick preview or test send never spends it before a real send happens.
+
+    Raises RuntimeError if no active admin account exists -- should never happen in practice
+    (BOOTSTRAP_ADMIN_EMAIL bootstraps exactly one on first login), but this must fail loudly rather than
+    silently build an edition from nobody's watchlist."""
+    edition_date = edition_date or today_et()
+    date_str = edition_date.isoformat()
+
+    if not force:
+        existing = get_digest_edition(conn, edition_date)
+        if existing:
+            return existing
+
+    admin_email = _get_edition_admin_email(conn)
+    if not admin_email:
+        raise RuntimeError("build_digest_edition: no active admin account exists to build the edition from.")
+
+    config = get_email_config(conn, admin_email)
+    since_iso = config["last_digest_sent_at"] or (datetime.utcnow() - timedelta(hours=24)).isoformat()
+
+    snaps = SnapshotCache(conn)
+    featured_ticker, featured_source = select_featured_stock(conn, admin_email, snapshots=snaps)
+    if consume_override and featured_source == "manual" and featured_ticker:
+        ov = get_featured_override(conn, admin_email)
+        if ov and ov["mode"] == "once" and ov["ticker"] == featured_ticker:
+            clear_featured_override(conn, admin_email)
+            digest_log.info("[DIGEST] One-time featured override %s consumed by rebuild", featured_ticker)
+    claude_calls, claude_cost = 0, 0.0
+    featured_stock = None
+    if featured_ticker:
+        # Unchanged cache check (AI_BRIEF_CACHE_HOURS) -- this is the ONLY place in the whole digest
+        # pipeline that may call generate_deep_analysis. cached_brief is checked BEFORE the call so we can
+        # tell a genuine fresh generation (real cost) apart from a cache hit (free) for the log line below.
+        cached_brief = get_cached_ai_brief(conn, featured_ticker, max_age_hours=AI_BRIEF_CACHE_HOURS)
+        featured_stock = get_featured_stock_section(
+            featured_ticker, conn, snapshot=snaps.get(featured_ticker), source=featured_source,
+        )
+        fresh_usage = (featured_stock.get("brief") or {}).get("_usage")
+        if cached_brief is None and fresh_usage:
+            claude_calls, claude_cost = 1, fresh_usage["cost_usd"]
+
+    content = build_digest_content(
+        conn, admin_email, DEFAULT_DIGEST_SECTIONS, since_iso, as_of_date=edition_date,
+        featured_stock=featured_stock, chart_cid=None, snapshots=snaps,
+    )
+
+    built_at = datetime.utcnow().isoformat()
+    conn.execute(
+        """INSERT INTO digest_editions
+               (edition_date, featured_ticker, featured_source, built_at, content_json, html_full,
+                text_full, subject, claude_api_calls, claude_api_cost)
+           VALUES (?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(edition_date) DO UPDATE SET
+               featured_ticker=excluded.featured_ticker, featured_source=excluded.featured_source,
+               built_at=excluded.built_at, content_json=excluded.content_json, html_full=excluded.html_full,
+               text_full=excluded.text_full, subject=excluded.subject,
+               claude_api_calls=excluded.claude_api_calls, claude_api_cost=excluded.claude_api_cost""",
+        (date_str, featured_ticker, featured_source, built_at, json.dumps(content["sections"], default=str),
+         content["html_body"], content["text_body"], content["subject"], claude_calls, claude_cost),
+    )
+    conn.commit()
+    digest_log.info(
+        "[DIGEST] Edition %s built: %d Claude call(s), $%.4f — featured %s",
+        date_str, claude_calls, claude_cost, featured_ticker or "(none)",
+    )
+    print(f"[DIGEST] Edition {date_str} built: {claude_calls} Claude call(s), ${claude_cost:.4f} "
+          f"— featured {featured_ticker or '(none)'}")
+    return get_digest_edition(conn, edition_date)
+
+
+def get_or_build_todays_edition(conn):
+    """The read-through path every non-rebuild caller uses (scheduled send, Preview, Send Test, Send to
+    Substack): returns today's edition, building it (at most one real Claude call) only if it doesn't
+    exist yet. This is what makes "every caller shares one edition" actually true -- nobody except the
+    admin's explicit Rebuild button ever calls build_digest_edition(force=True)."""
+    edition = get_digest_edition(conn)
+    if edition:
+        return edition
+    return build_digest_edition(conn)
+
+
+def render_edition_for_recipient(conn, edition, sections_included, unsubscribe_url=None, manage_url=None,
+                                  snapshots=None, chart_cid=None, incomplete_reasons=None):
+    """Zero-API-call re-render of an ALREADY-BUILT edition for one recipient's own section preferences --
+    hides whichever sections they turned off, personalizes the unsubscribe/manage-preferences links.
+    Wrapped in digest_render_guard(): generate_deep_analysis raises immediately if this somehow reaches it
+    instead of silently billing a second call. Re-runs build_digest_content's cheap, local
+    data-gathering + HTML-templating (DB reads + price snapshots only, never the network for anything
+    billed) with the SAME featured_stock dict already stored on the edition, which is what structurally
+    keeps a re-render from ever triggering a new AI Briefing."""
+    admin_email = _get_edition_admin_email(conn)
+    as_of_date = date.fromisoformat(edition["edition_date"])
+    sections = edition.get("sections") or {}
+    featured_stock = sections.get("featured_stock")
+    config = get_email_config(conn, admin_email) if admin_email else {}
+    since_iso = (config or {}).get("last_digest_sent_at") or (datetime.utcnow() - timedelta(hours=24)).isoformat()
+
+    with digest_render_guard():
+        content = build_digest_content(
+            conn, admin_email, sections_included, since_iso, as_of_date=as_of_date,
+            incomplete_reasons=incomplete_reasons, featured_stock=featured_stock, chart_cid=chart_cid,
+            snapshots=snapshots,
+        )
+
+    html_body, text_body = content["html_body"], content["text_body"]
+    if unsubscribe_url:
+        html_body = html_body.replace(DIGEST_UNSUBSCRIBE_PLACEHOLDER, unsubscribe_url)
+        text_body = text_body.replace(DIGEST_UNSUBSCRIBE_PLACEHOLDER, unsubscribe_url)
+    if manage_url:
+        html_body = html_body.replace(DIGEST_MANAGE_PLACEHOLDER, manage_url)
+        text_body = text_body.replace(DIGEST_MANAGE_PLACEHOLDER, manage_url)
+    return {"subject": content["subject"], "html_body": html_body, "text_body": text_body}
 
 
 def get_unsubscribe_url(conn, token):
@@ -16286,6 +20231,17 @@ def get_unsubscribe_url(conn, token):
     if base_url:
         return f"{base_url.rstrip('/')}/?unsubscribe={token}"
     return f"mailto:{get_effective_from_email(conn)}?subject=Unsubscribe"
+
+
+def get_manage_preferences_url(conn, token):
+    """2026-10-13, Part 1.3: "tokenized the same way as the unsubscribe link" -- same token, same
+    APP_PUBLIC_URL-or-mailto-fallback pattern as get_unsubscribe_url, just a different query param
+    (?manage=<token>) so dashboard.py's query-param handler can tell the two links apart. No login --
+    anyone with the link (only ever emailed to that one subscriber) can use it."""
+    base_url = os.environ.get("APP_PUBLIC_URL")
+    if base_url:
+        return f"{base_url.rstrip('/')}/?manage={token}"
+    return f"mailto:{get_effective_from_email(conn)}?subject=Manage%20newsletter%20preferences"
 
 
 def build_list_unsubscribe_header(conn, token):
@@ -16313,22 +20269,24 @@ def build_list_unsubscribe_header(conn, token):
 EMAIL_SEND_DELAY_SECONDS = 0.3
 
 
-def send_daily_digest_email(conn, recipient_email=None, force=False, incomplete_reasons=None,
-                             featured_stock=None, chart_cid=None, inline_images=None):
-    """Sends the actual email -- the one function that touches SMTP.
-    Content comes entirely from build_digest_content (the exact same
-    function "Preview Today's Digest" calls, so the two can never
-    disagree) -- called ONCE per send, not once per recipient, since the
-    AI Briefing/chart work it depends on is shared across everyone this
-    digest goes out to. This function's own job is resolving config, the
-    same-day duplicate guard, personalizing + sending one message per
-    recipient, and recording the outcome -- never re-implementing content
-    generation. Its CORE sending mechanics (SMTP config check, same-day
-    guard, STARTTLS/login/sendmail, success/failure bookkeeping) are
-    unchanged from before this newsletter rebuild -- only extended with
-    real subscriber iteration (Part 4) and per-recipient unsubscribe
-    personalization, on top of the featured_stock/chart_cid/inline_images
-    params already added in the SES cutover.
+def send_daily_digest_email(conn, user_email, recipient_email=None, force=False, incomplete_reasons=None,
+                             edition=None, chart_cid=None, inline_images=None, snapshots=None,
+                             consume_override=False, send_type="scheduled", now_et_value=None):
+    """Sends the single global digest edition -- the one function that
+    touches SMTP. `user_email` is the admin account (schedule/same-day
+    guard/send-history bookkeeping all key off it); the CONTENT comes from
+    `edition` (get_or_build_todays_edition()'s row if not supplied), a
+    single shared publication, not per-user content (2026-10-13 rebuild).
+
+    `edition` is built ONCE (build_digest_edition, at most one real Claude
+    call) regardless of how many recipients this reaches. This function's
+    job is resolving the admin's schedule config, the same-day duplicate
+    guard, RENDERING + sending one message per recipient (render_edition_
+    for_recipient -- each recipient's own sections_included, zero API
+    calls, wrapped in digest_render_guard), and recording the outcome --
+    never building content itself. Its CORE sending mechanics (SMTP config
+    check, same-day guard, STARTTLS/login/sendmail, success/failure
+    bookkeeping) are unchanged from before this rebuild.
 
     `recipient_email=None` (the normal automated path) iterates every row
     from get_active_subscribers() -- the real subscriber list, not a
@@ -16339,8 +20297,9 @@ def send_daily_digest_email(conn, recipient_email=None, force=False, incomplete_
     unsubscribe link/token rather than a broken one. `force=True` bypasses
     BOTH the enabled toggle and the same-day last_sent_date guard, but
     still genuinely sends over real SMTP -- it is not a dry run.
-    `incomplete_reasons` gets embedded directly into the email body via
-    build_digest_content, not just returned as metadata.
+    `incomplete_reasons` gets embedded directly into each recipient's
+    rendered body via render_edition_for_recipient -> build_digest_content,
+    not just returned as metadata.
 
     Overall result is "sent": True iff AT LEAST ONE recipient succeeded;
     a per-recipient hard failure (Part 4.4) is logged and bounced against
@@ -16353,13 +20312,30 @@ def send_daily_digest_email(conn, recipient_email=None, force=False, incomplete_
 
     smtplib/STARTTLS on SMTP_PORT (587 is the simplest path for a
     personal Gmail account with an App Password, or an AWS SES SMTP
-    credential -- both reject a send without STARTTLS first)."""
-    config = get_email_config(conn)
+    credential -- both reject a send without STARTTLS first).
+
+    `send_type`: "scheduled" (the default -- the real daily/weekly send, whether triggered by the in-app
+    catch-up or the headless launchd job) or "test" ("Send Test Email Now"). This is the ONE thing that
+    decides which bookkeeping columns get written on completion -- last_sent_date/last_digest_sent_at/
+    last_send_status/last_send_error for "scheduled", the parallel last_test_* columns for "test" -- so a
+    test send can NEVER be mistaken for the day's real send (and vice versa), and digest_email_log.send_type
+    records the same distinction for the audit trail. `now_et_value`: the ET "now" this send is FOR, passed
+    by the headless script so the calendar-date bookkeeping it writes matches the exact instant its own
+    should_send_daily_digest_now() check was made against, not a freshly re-read clock a few seconds later
+    that could in principle straddle midnight ET."""
+    if send_type not in ("scheduled", "test"):
+        raise ValueError("send_type must be 'scheduled' or 'test'")
+    owner = _require_user_email(user_email)
+    config = get_email_config(conn, owner)
+    now_et_value = now_et_value if now_et_value is not None else now_et()
+    today_et_iso = now_et_value.date().isoformat()
 
     if recipient_email:
-        recipients = [{"email": recipient_email, "unsubscribe_token": add_email_subscriber(conn, recipient_email)}]
+        recipients = [{"email": recipient_email,
+                       "unsubscribe_token": add_email_subscriber(conn, owner, recipient_email),
+                       "sections_included": None}]
     else:
-        recipients = get_active_subscribers(conn)
+        recipients = get_active_subscribers(conn, owner)
 
     smtp_host = os.environ.get("SMTP_HOST")
     smtp_port = os.environ.get("SMTP_PORT")
@@ -16371,15 +20347,11 @@ def send_daily_digest_email(conn, recipient_email=None, force=False, incomplete_
               "WATCHLIST SIGNALS tab is unaffected either way.")
         return {"sent": False, "reason": "smtp_not_configured" if not recipients else "no_active_subscribers"}
 
-    today = date.today().isoformat()
-    if not force and config["last_sent_date"] == today:
+    if not force and send_type == "scheduled" and config["last_sent_date"] == today_et_iso:
         return {"sent": False, "reason": "already_sent_today"}
 
-    since_iso = config["last_digest_sent_at"] or (datetime.utcnow() - timedelta(hours=24)).isoformat()
-    content = build_digest_content(
-        conn, config["sections_included"], since_iso, incomplete_reasons=incomplete_reasons,
-        featured_stock=featured_stock, chart_cid=chart_cid,
-    )
+    edition = edition or get_or_build_todays_edition(conn)
+    featured_stock = (edition.get("sections") or {}).get("featured_stock")
 
     # Part 2 fix: the sender identity is EMAIL_FROM/email_config.from_email
     # (an address SES has actually verified -- e.g. the monotrading.io
@@ -16390,6 +20362,7 @@ def send_daily_digest_email(conn, recipient_email=None, force=False, incomplete_
     # header AND the SMTP envelope sender below -- SES checks the
     # envelope MAIL FROM (bounce address) too, not just the header.
     from_email = get_effective_from_email(conn)
+    from_name = get_effective_from_name(conn)
 
     sent_ok, failed = [], []
     try:
@@ -16406,15 +20379,22 @@ def send_daily_digest_email(conn, recipient_email=None, force=False, incomplete_
                     time.sleep(EMAIL_SEND_DELAY_SECONDS)
                 email, token = sub["email"], sub["unsubscribe_token"]
                 unsubscribe_url = get_unsubscribe_url(conn, token)
-                # Personalized ONLY substitution -- the (potentially large,
-                # AI-briefing-heavy) content itself is never rebuilt per
-                # recipient, just this one placeholder swapped per address.
-                text_body = content["text_body"].replace(DIGEST_UNSUBSCRIBE_PLACEHOLDER, unsubscribe_url)
-                html_body = content["html_body"].replace(DIGEST_UNSUBSCRIBE_PLACEHOLDER, unsubscribe_url)
+                manage_url = get_manage_preferences_url(conn, token)
+                # Per-recipient RENDER (2026-10-13) -- each subscriber's own sections_included, zero API
+                # calls (the edition's already-built featured_stock is what's passed through; see
+                # render_edition_for_recipient's own docstring). This replaces the old "content built once,
+                # only the unsubscribe placeholder swapped" substitution -- now both links AND which
+                # sections appear differ per recipient.
+                rendered = render_edition_for_recipient(
+                    conn, edition, get_subscriber_sections_included(sub), unsubscribe_url=unsubscribe_url,
+                    manage_url=manage_url, snapshots=snapshots, chart_cid=chart_cid,
+                    incomplete_reasons=incomplete_reasons,
+                )
+                text_body, html_body = rendered["text_body"], rendered["html_body"]
 
                 msg = EmailMIMEMultipart("related")
-                msg["Subject"] = content["subject"]
-                msg["From"] = from_email
+                msg["Subject"] = rendered["subject"]
+                msg["From"] = formataddr((from_name, from_email))
                 msg["To"] = email
                 # Part 4.3 -- RFC 8058-style headers (see build_list_
                 # unsubscribe_header's own honest caveat on GET vs. POST).
@@ -16435,14 +20415,17 @@ def send_daily_digest_email(conn, recipient_email=None, force=False, incomplete_
                     sent_ok.append(email)
                 except Exception as e:
                     print(f"[send_daily_digest_email] send to {email} failed: {e}")
-                    record_send_bounce(conn, email, str(e))
+                    record_send_bounce(conn, owner, email, str(e))
                     failed.append((email, str(e)))
     except Exception as e:
         # A connection/auth-level failure (never even got to send a
         # single message) -- distinct from a per-recipient bounce above,
         # so this is NOT attributed to any one subscriber.
-        print(f"[send_daily_digest_email] SMTP connection/auth failed: {e}")
-        save_email_config(conn, last_send_status="failed", last_send_error=str(e))
+        print(f"[send_daily_digest_email] SMTP connection/auth failed ({owner}): {e}")
+        if send_type == "scheduled":
+            save_email_config(conn, owner, last_send_status="failed", last_send_error=str(e))
+        else:
+            save_email_config(conn, owner, last_test_send_status="failed", last_test_send_error=str(e))
         return {"sent": False, "reason": f"send_error: {e}"}
 
     # Part 3: a single, always-populated batch-result sentence -- e.g.
@@ -16460,28 +20443,48 @@ def send_daily_digest_email(conn, recipient_email=None, force=False, incomplete_
     if not sent_ok:
         # Do NOT update last_sent_date on total failure (Part 5) -- a
         # genuine retry later the same day must remain possible.
-        save_email_config(conn, last_send_status="failed", last_send_error=batch_note)
+        if send_type == "scheduled":
+            save_email_config(conn, owner, last_send_status="failed", last_send_error=batch_note)
+        else:
+            save_email_config(conn, owner, last_test_send_status="failed", last_test_send_error=batch_note)
         return {"sent": False, "reason": batch_note}
 
-    sent_at = datetime.utcnow().isoformat()
-    current_signals = content["sections"].get("_current_signals_snapshot")
-    watchlist_rows = content["sections"].get("watchlist_signals") or []
+    # tz-aware, UTC WITH explicit offset (Part 4: "store sent timestamps as timezone-aware") -- never the old
+    # naive datetime.utcnow().isoformat(), which carried no offset at all.
+    sent_at = datetime.now(timezone.utc).isoformat()
+    # From the FULL edition (every section, admin's own data), not any one recipient's filtered render --
+    # this bookkeeping tracks "what changed since last digest" for the edition as a whole.
+    edition_sections = edition.get("sections") or {}
+    current_signals = edition_sections.get("_current_signals_snapshot")
+    watchlist_rows = edition_sections.get("watchlist_signals") or []
     conn.execute(
         """INSERT INTO digest_email_log
-               (sent_at, recipient, entry_zone_count, rating_change_count, signals_snapshot_json,
-                featured_ticker)
-           VALUES (?,?,?,?,?,?)""",
-        (sent_at, ", ".join(sent_ok), sum(1 for r in watchlist_rows if r["zone_changed_today"]),
+               (user_email, send_type, sent_at, recipient, entry_zone_count, rating_change_count,
+                signals_snapshot_json, featured_ticker)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        (owner, send_type, sent_at, ", ".join(sent_ok), sum(1 for r in watchlist_rows if r["zone_changed_today"]),
          sum(1 for r in watchlist_rows if r["signal_changed_today"]),
          json.dumps(current_signals) if current_signals is not None else None,
          (featured_stock or {}).get("ticker")),
     )
     conn.commit()
-    save_email_config(
-        conn, last_sent_date=today, last_digest_sent_at=sent_at, last_send_status="success",
-        last_send_error=batch_note,
-    )
-    return {"sent": True, "sent_at": sent_at, "subject": content["subject"], "recipients_sent": sent_ok,
+    # A one-time manual featured pick is spent only by a genuinely SCHEDULED send that succeeded (consume_override
+    # is False for the "Send Test Email Now" button, so testing never burns tomorrow's pick), and only at this
+    # point -- not at selection time -- so a failed send leaves the pick in place.
+    if consume_override and featured_stock and featured_stock.get("source") == "manual":
+        ov = get_featured_override(conn, owner)
+        if ov and ov["mode"] == "once" and ov["ticker"] == featured_stock.get("ticker"):
+            clear_featured_override(conn, owner)
+            digest_log.info("[DIGEST] One-time featured override %s cleared after successful send", ov["ticker"])
+    if send_type == "scheduled":
+        save_email_config(
+            conn, owner, last_sent_date=today_et_iso, last_digest_sent_at=sent_at, last_send_status="success",
+            last_send_error=batch_note,
+        )
+    else:
+        save_email_config(conn, owner, last_test_sent_at=sent_at, last_test_send_status="success",
+                          last_test_send_error=batch_note)
+    return {"sent": True, "sent_at": sent_at, "subject": edition.get("subject"), "recipients_sent": sent_ok,
             "recipients_failed": [e for e, _ in failed]}
 
 
@@ -16492,7 +20495,7 @@ def send_daily_digest_email(conn, recipient_email=None, force=False, incomplete_
 DAILY_DIGEST_READINESS_GRACE_MINUTES = 90
 
 
-def should_send_daily_digest_now(conn):
+def should_send_daily_digest_now(conn, user_email, now_et=None):
     """Part 4 gating -- PURE decision logic, no sending. Kept deliberately
     separate from send_daily_digest_email (which only ever sends when
     explicitly told to) because the actual send now needs dashboard.py's
@@ -16530,16 +20533,25 @@ def should_send_daily_digest_now(conn):
     opens it -- there is no guarantee of an on-time morning send. This is
     surfaced verbatim in SETTINGS' Email Digest section copy, not just
     here."""
-    config = get_email_config(conn)
+    config = get_email_config(conn, user_email)
     if not config["enabled"] or config["frequency"] == "off":
         return {"ready": False, "reason": "disabled", "incomplete_reasons": None}
 
-    now_et = pd.Timestamp.now(tz="America/New_York")
+    now_et = now_et if now_et is not None else pd.Timestamp.now(tz="America/New_York")  # param: tests only
     today = now_et.date()
     if config["last_sent_date"] == today.isoformat():
         return {"ready": False, "reason": "already_sent_today", "incomplete_reasons": None}
-    if config["frequency"] == "weekdays_only" and today.weekday() >= 5:
+    # No scheduled email is ever sent on a Saturday or Sunday, for any frequency.
+    if today.weekday() >= 5:
         return {"ready": False, "reason": "weekend_skipped", "incomplete_reasons": None}
+    if config["frequency"] == "weekly":
+        # Due on the chosen weekday, and (catch-up) on any later weekday that same week if the app wasn't
+        # open on the day itself -- but only once per ISO week.
+        if today.weekday() < config["weekly_day"]:
+            return {"ready": False, "reason": "not_weekly_day", "incomplete_reasons": None}
+        last = config["last_sent_date"]
+        if last and pd.Timestamp(last).isocalendar()[:2] == pd.Timestamp(today).isocalendar()[:2]:
+            return {"ready": False, "reason": "already_sent_this_week", "incomplete_reasons": None}
 
     try:
         send_hour, send_minute = (int(x) for x in config["send_time_et"].split(":"))
@@ -16550,7 +20562,7 @@ def should_send_daily_digest_now(conn):
         return {"ready": False, "reason": "before_send_time", "incomplete_reasons": None}
 
     cutoff = send_time + timedelta(minutes=DAILY_DIGEST_READINESS_GRACE_MINUTES)
-    ready, reasons = is_daily_digest_ready(conn)
+    ready, reasons = is_daily_digest_ready(conn, user_email)
     if not ready and now_et < cutoff:
         return {"ready": False, "reason": "waiting_for_readiness", "incomplete_reasons": reasons}
 
@@ -16689,5 +20701,1047 @@ def get_fed_target_range_text(conn):
     return f"Fed funds target range is currently {lower:.2f}%-{upper:.2f}% (as of {as_of})"
 
 
+
+# --------------------------------------------------------------------------
+# VOLATILITY DISLOCATIONS SCREENER -- Stage 1: two-tier liquid-options
+# universe. Nothing here touches Runners, Day Predictions, Watchlist
+# Signals, the digest, or any other existing feature -- it's a wholly new,
+# additive table (`universe`) and a small set of new functions. GLOBAL/
+# shared data (like price_history/options_flow), not per-user.
+#
+# Candidates come from index_constituents.json (S&P 500 + Nasdaq 100,
+# deduped -- see scripts/build_index_constituents.py; Russell 1000 was
+# investigated and could not be fetched from a free scriptable source,
+# see that script's own docstring), never a live exchange-wide scrape.
+# --------------------------------------------------------------------------
+
+INDEX_CONSTITUENTS_PATH = "index_constituents.json"
+
+UNIVERSE_TIER1_MIN_PRICE = 10.0
+UNIVERSE_TIER1_MIN_MARKET_CAP = 1e9
+UNIVERSE_TIER1_MIN_DOLLAR_VOL_20D = 100e6
+UNIVERSE_TIER1_PERSISTENCE_SESSIONS = 60
+UNIVERSE_TIER1_PERSISTENCE_PCT = 0.80
+UNIVERSE_PROMOTION_SESSIONS = 60
+UNIVERSE_PROMOTION_MIN_SPIKE_SESSIONS = 45
+
+# Hysteresis (fix #3): a NEW candidate must clear the tighter ENTER bars; an EXISTING core member only needs
+# to clear the looser STAY bars, and even then only leaves after failing STAY at two consecutive monthly
+# rebuilds (stay_fail_streak reaching 2) -- stops a name that's marginally hovering around a threshold
+# (the KO case) from flapping in and out of core every month.
+UNIVERSE_ENTER_MAX_SPREAD_PCT = 8.0
+UNIVERSE_ENTER_MIN_ATM_OI = 500
+UNIVERSE_STAY_MAX_SPREAD_PCT = 12.0
+UNIVERSE_STAY_MIN_ATM_OI = 300
+UNIVERSE_STAY_FAIL_LIMIT = 2
+
+UNIVERSE_TIER2_MIN_PRICE = 5.0
+UNIVERSE_TIER2_MIN_MARKET_CAP = 1e9
+UNIVERSE_TIER2_VOLUME_MULTIPLE = 3.0
+UNIVERSE_TIER2_MIN_DOLLAR_VOL_ABS = 50e6
+UNIVERSE_TIER2_CAP = 100
+
+UNIVERSE_MAX_ATM_SPREAD_PCT = 8.0   # Stage 2's scan skip rule (unrelated to Tier 1's enter/stay spread bars)
+UNIVERSE_WEEKLIES_MAX_DAYS_OUT = 9  # nearest NON-monthly expiry within this many days (excluding 0DTE) => has_weekly
+UNIVERSE_MONTHLY_MIN_DAYS_OUT = 14  # Part 2: OI measured on the nearest MONTHLY expiry >=14 days out
+
+# Provisional gate (2026-09-25 follow-up, pending Monday 2026-09-28's quote-timing decision.json):
+# 'provisional' -- Tier 1/2 membership gates on OI + dollar volume only; ATM spread is still measured and
+#   stored on every universe/scan row, but does NOT filter membership OR Stage 2's data-quality skip rule.
+# 'spread' -- the original behaviour: spread is a real gate again (Tier 1 enter/stay bars, Tier 2's flat
+#   8% bar, and Stage 2's >8%-skip rule), once Monday's decision says yfinance's bid/ask is trustworthy at
+#   the chosen run time. Switching this back does NOT change any floor VALUE -- same 8%/12% numbers either
+#   way, just whether they're enforced.
+UNIVERSE_GATE_MODE = "provisional"
+
+# Stage 2 -- nightly implied-move scan.
+# BOUNDED windows (2026-09-25 second follow-up): a bare min_days_out with no ceiling let
+# _atm_option_snapshot's "nearest expiry >= N days" rule walk arbitrarily far out on a ticker with sparse
+# listed expiries -- confirmed live: TECH's "Month" was landing on a 2027-01-15 expiry, ~113 days out, on
+# a ticker whose next listed expiry past 30 days happened to be that far away. A ticker with NO expiry in
+# the window now gets NO value for that period (skipped, per _atm_option_snapshot's existing None-return
+# behavior) rather than a misleadingly-labeled far-dated one.
+VOLATILITY_SCAN_WEEK_MIN_DAYS_OUT = 5     # Week period: nearest expiry in [5, 10] calendar days
+VOLATILITY_SCAN_WEEK_MAX_DAYS_OUT = 10
+VOLATILITY_SCAN_MONTH_MIN_DAYS_OUT = 25   # Month period: nearest expiry in [25, 45] calendar days --
+VOLATILITY_SCAN_MONTH_MAX_DAYS_OUT = 45   # computed for EVERY universe name by default (2026-09-25 first
+                                           # follow-up: no longer behind a flag). Week only where has_weekly=True.
+VOLATILITY_MOVE_MEDIAN_HISTORY_DAYS = 60   # move_vs_median_60d needs this many prior scan rows, else NULL
+VOLATILITY_OPTVOL_AVG_HISTORY_DAYS = 20    # option_volume_vs_20d_avg needs this many prior scan rows, else NULL
+VOLATILITY_MOVE_DISLOCATION_FLAG = 1.5     # Stage 3 flag: move_vs_median_60d >= this
+VOLATILITY_UNUSUAL_OPTVOL_FLAG = 3.0       # Stage 3 flag: option_volume_vs_20d_avg >= this
+
+
+def load_index_constituents(path=INDEX_CONSTITUENTS_PATH):
+    """The Stage 1 candidate pool -- a plain, hand-editable JSON file (see
+    scripts/build_index_constituents.py), never a live scrape at rebuild
+    time. Returns [] (not a fabricated fallback list) if the file is
+    missing/unreadable, so a rebuild against a missing file produces an
+    honest empty universe rather than silently screening nothing anyone
+    asked for."""
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        tickers = data.get("tickers") if isinstance(data, dict) else data
+        if isinstance(tickers, list):
+            return sorted({str(t).strip().upper() for t in tickers if str(t).strip()})
+    except (FileNotFoundError, json.JSONDecodeError, ValueError, AttributeError):
+        pass
+    return []
+
+
+def _market_cap_bucket(market_cap):
+    if market_cap is None:
+        return None
+    if market_cap >= 10e9:
+        return "large"
+    if market_cap >= 2e9:
+        return "mid"
+    return "small"
+
+
+def _yf_call_with_backoff(fn, max_retries=4, base_delay=1.0, what=""):
+    """Shared rate-limit/backoff wrapper for the yfinance option-chain calls
+    both Stage 1 (weeklies/OI/spread) and Stage 2 (implied move) make --
+    several hundred chain fetches WILL get throttled (Stage 2's own
+    explicit warning; Stage 1 hits the identical real limit for the same
+    reason, so this is shared rather than written twice). Exponential
+    backoff with jitter; re-raises the last exception after max_retries so
+    the caller's own try/except can log it as a genuine failure rather
+    than retrying forever."""
+    last_exc = None
+    for attempt in range(max_retries):
+        try:
+            return fn()
+        except Exception as e:
+            last_exc = e
+            msg = str(e).lower()
+            is_rate_limit = "429" in msg or "rate" in msg or "too many requests" in msg
+            if attempt == max_retries - 1:
+                break
+            delay = base_delay * (2 ** attempt) * (1.5 if is_rate_limit else 1.0) + random.uniform(0, 0.5)
+            time.sleep(delay)
+    raise last_exc
+
+
+def _is_third_friday(d):
+    """True if `d` (a date) is the 3rd Friday of its month -- the standard monthly-options expiry date."""
+    if d.weekday() != 4:  # Friday
+        return False
+    return 15 <= d.day <= 21
+
+
+def _has_weekly_options(expirations, today=None, max_days_out=None):
+    """Informational only (Part 1) -- NEVER a Tier 1 gate. True if there's a NON-monthly expiry within
+    `max_days_out` days (excluding today/0DTE) -- i.e. a real weekly cadence exists, not just the standard
+    monthly cycle every ticker with listed options has. Decides which period(s) Stage 2 computes for this
+    ticker (Week needs it; Month doesn't)."""
+    today = today or date.today()
+    max_days_out = max_days_out if max_days_out is not None else UNIVERSE_WEEKLIES_MAX_DAYS_OUT
+    for exp in expirations:
+        try:
+            exp_date = datetime.strptime(exp, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        days_out = (exp_date - today).days
+        if 1 <= days_out <= max_days_out and not _is_third_friday(exp_date):
+            return True
+    return False
+
+
+def _atm_option_snapshot(ticker, current_price, min_days_out=0, max_days_out=None, prefer_monthly=False):
+    """The ONE lightweight ATM-chain reader Stage 1 (OI/spread checks) and
+    Stage 2 (implied move) both call -- picks a target expiry, reads just
+    that expiry's ATM call+put row (same ATM-strike-selection logic
+    already used by fetch_earnings_signal -- ported, not reinvented), and
+    returns a plain dict. None if there's no usable chain at all.
+
+    Expiry selection: with `prefer_monthly=False` (Stage 2's Week period,
+    and Stage 1's spread check), the nearest expiry with `min_days_out <=
+    days_out <= max_days_out` (in listed order, which yfinance returns
+    chronologically). With `prefer_monthly=True` (Stage 1's OI check, per
+    Part 2: "measure ATM OI on the nearest MONTHLY expiry >=14 days out,
+    not the next-week contract"), the nearest THIRD-FRIDAY expiry meeting
+    the same day-count window -- falling back to the plain nearest-expiry
+    rule if this ticker has no expiry that lands on a 3rd Friday within
+    the window (some tickers' listed cycles don't align to it), so a
+    genuinely liquid name isn't dropped over a calendar-alignment quirk.
+
+    Returns: {expiry (str), days_out (int), atm_strike, atm_bid, atm_ask,
+    atm_mid, atm_spread_pct, atm_oi (call+put open interest), atm_avg_iv_pct,
+    option_volume_total (whole chain's volume at that expiry, calls+puts)}.
+    `atm_spread_pct` / `atm_avg_iv_pct` are None if the mid is 0 or the
+    quote is missing -- never a fabricated 0."""
+    tk = yf.Ticker(ticker)
+    try:
+        expirations = list(tk.options)
+    except Exception:
+        return None
+    if not expirations:
+        return None
+
+    today = date.today()
+
+    def _in_window(exp):
+        try:
+            exp_date = datetime.strptime(exp, "%Y-%m-%d").date()
+        except ValueError:
+            return None
+        days_out = (exp_date - today).days
+        if days_out < min_days_out:
+            return None
+        if max_days_out is not None and days_out > max_days_out:
+            return None
+        return exp_date
+
+    target_exp, target_date = None, None
+    if prefer_monthly:
+        for exp in expirations:
+            exp_date = _in_window(exp)
+            if exp_date is not None and _is_third_friday(exp_date):
+                target_exp, target_date = exp, exp_date
+                break
+    if target_exp is None:  # plain nearest-expiry rule (also the monthly fallback)
+        for exp in expirations:
+            exp_date = _in_window(exp)
+            if exp_date is not None:
+                target_exp, target_date = exp, exp_date
+                break
+    if target_exp is None:
+        return None
+
+    chain = _yf_call_with_backoff(lambda: tk.option_chain(target_exp), what=f"{ticker} {target_exp} chain")
+    calls, puts = chain.calls, chain.puts
+    if calls.empty or puts.empty or current_price is None:
+        return None
+
+    atm_strike = float(min(calls["strike"], key=lambda x: abs(x - current_price)))
+    atm_call = calls[calls["strike"] == atm_strike]
+    atm_put = puts[puts["strike"] == atm_strike]
+    if atm_call.empty or atm_put.empty:
+        return None
+
+    call_bid, call_ask = _safe_num(atm_call["bid"].iloc[0]), _safe_num(atm_call["ask"].iloc[0])
+    put_bid, put_ask = _safe_num(atm_put["bid"].iloc[0]), _safe_num(atm_put["ask"].iloc[0])
+    straddle_bid, straddle_ask = call_bid + put_bid, call_ask + put_ask
+    mid = (straddle_bid + straddle_ask) / 2.0
+    spread_pct = ((straddle_ask - straddle_bid) / mid * 100.0) if mid > 0 else None
+
+    call_iv, put_iv = _safe_num(atm_call["impliedVolatility"].iloc[0]), _safe_num(atm_put["impliedVolatility"].iloc[0])
+    avg_iv_pct = ((call_iv + put_iv) / 2.0) * 100.0 if (call_iv or put_iv) else None
+
+    call_oi, put_oi = int(_safe_num(atm_call["openInterest"].iloc[0])), int(_safe_num(atm_put["openInterest"].iloc[0]))
+    option_volume_total = int(_safe_num(calls["volume"].sum()) + _safe_num(puts["volume"].sum()))
+
+    return {
+        "expiry": target_exp, "days_out": (target_date - today).days, "atm_strike": atm_strike,
+        "atm_bid": straddle_bid, "atm_ask": straddle_ask, "atm_mid": mid if mid > 0 else None,
+        "atm_spread_pct": spread_pct, "atm_oi": call_oi + put_oi, "atm_avg_iv_pct": avg_iv_pct,
+        "option_volume_total": option_volume_total,
+    }
+
+
+def _bulk_price_volume_screen(tickers, period="4mo"):
+    """ONE yf.download() call for every candidate's daily OHLCV -- the
+    efficient bulk path (vs. ~500 individual .history() calls) for Stage
+    1's price/dollar-volume/persistence screen, ALSO reused by Stage 2's
+    scan for the reference (previous) close and realized_vol_20d, so
+    that's not a second bulk download. Returns
+    {ticker: {"price", "dollar_vol_20d", "pct_sessions_above_floor",
+    "today_dollar_vol", "median_dollar_vol_60d", "realized_vol_20d"}} --
+    a ticker missing or with too little history is simply absent from the
+    result (never a zero-filled placeholder). realized_vol_20d is
+    annualized %, None if fewer than 21 daily closes (needs 20 returns).
+    "Backfill realized_vol_20d from price history immediately -- it's
+    free" (Stage 2 spec) -- this bulk download already has the closes
+    Stage 1 needs anyway, so computing it here costs nothing extra."""
+    if not tickers:
+        return {}
+    raw = yf.download(tickers, period=period, group_by="ticker", threads=True, progress=False, auto_adjust=False)
+    out = {}
+    for t in tickers:
+        # yf.download() ALWAYS returns MultiIndex-grouped columns when given a list -- even a length-1 one
+        # (confirmed live: only a bare string ticker, never a list, gets flat columns) -- so raw[t] is the
+        # right access for every list size, not just len(tickers) > 1.
+        try:
+            df = raw[t]
+        except (KeyError, TypeError):
+            continue
+        df = df.dropna(subset=["Close", "Volume"])
+        if len(df) < 21:
+            continue
+        dollar_vol = df["Close"] * df["Volume"]
+        window60 = dollar_vol.tail(UNIVERSE_TIER1_PERSISTENCE_SESSIONS)
+        log_returns = np.log(df["Close"] / df["Close"].shift(1)).dropna().tail(20)
+        realized_vol_20d = float(log_returns.std() * math.sqrt(252) * 100.0) if len(log_returns) >= 20 else None
+        out[t] = {
+            "price": float(df["Close"].iloc[-1]),
+            "dollar_vol_20d": float(dollar_vol.tail(20).mean()),
+            "pct_sessions_above_floor": float((window60 >= UNIVERSE_TIER1_MIN_DOLLAR_VOL_20D).mean()),
+            "today_dollar_vol": float(dollar_vol.iloc[-1]),
+            "median_dollar_vol_60d": float(window60.median()),
+            "realized_vol_20d": realized_vol_20d,
+        }
+    return out
+
+
+UNIVERSE_MOST_ACTIVES_PAGE_SIZE = 250
+
+
+def fetch_most_actives_tickers(limit=350):
+    """Part 5: Tier 2's candidate pool is NOT limited to index_constituents.json -- a genuine spike is
+    often in a name outside the S&P 500/Nasdaq 100 entirely, which is exactly what this daily source is
+    for. yfinance's 'most_actives' predefined screener (yf.screen) is a REAL, working, free, no-key source
+    (confirmed live) -- paginated via `offset` to pull up to `limit` names. Filtered to quoteType=='EQUITY'
+    so ETFs/indices/crypto quotes yfinance's screener also returns don't leak into a stock universe. Returns
+    [] (never a fabricated list) if the screener call fails -- the caller falls back to the index list
+    alone, and this is logged so the failure is visible, per Part 5's instruction to report rather than
+    substitute when no free scriptable source works."""
+    tickers, offset = [], 0
+    try:
+        while len(tickers) < limit:
+            page = _yf_call_with_backoff(
+                lambda offset=offset: yf.screen("most_actives", offset=offset, count=UNIVERSE_MOST_ACTIVES_PAGE_SIZE),
+                what=f"most_actives offset={offset}",
+            )
+            quotes = (page or {}).get("quotes") or []
+            if not quotes:
+                break
+            tickers.extend(q["symbol"].strip().upper() for q in quotes if q.get("quoteType") == "EQUITY" and q.get("symbol"))
+            total = (page or {}).get("total") or 0
+            offset += UNIVERSE_MOST_ACTIVES_PAGE_SIZE
+            if offset >= total:
+                break
+    except Exception as e:
+        digest_log.warning("[universe] most_actives screener failed (%s) -- Tier 2 will use the index list only.", e)
+        return []
+    return sorted(set(tickers[:limit]))
+
+
+def _distinct_universe_dates(conn, limit=60):
+    rows = conn.execute("SELECT DISTINCT as_of_date FROM universe ORDER BY as_of_date DESC LIMIT ?", (limit,))
+    return [r[0] for r in rows.fetchall()]
+
+
+def _tier1_prior_core(conn, as_of):
+    """{ticker: stay_fail_streak} from the most recent 'core' as_of_date strictly before `as_of` -- i.e. last
+    month's core membership, for the hysteresis check (Part 3)."""
+    prior_date = conn.execute(
+        "SELECT MAX(as_of_date) FROM universe WHERE tier='core' AND as_of_date < ?", (as_of,)
+    ).fetchone()[0]
+    if not prior_date:
+        return {}
+    rows = conn.execute(
+        "SELECT ticker, COALESCE(stay_fail_streak, 0) FROM universe WHERE tier='core' AND as_of_date=?",
+        (prior_date,),
+    ).fetchall()
+    return {t: s for t, s in rows}
+
+
+def rebuild_universe_tier1(conn, as_of_date=None, run_type="scheduled", progress_callback=None):
+    """Stage 1, Tier 1 -- structural liquidity, rebuilt monthly. Screens
+    every candidate in index_constituents.json against the base filter
+    chain (price, market cap, 20d avg dollar volume, the 60-session
+    PERSISTENCE test -- the actual point, a raw average lets spike names
+    through), then applies HYSTERESIS on ATM spread/OI (Part 3): a new
+    candidate needs the tighter ENTER bars (spread<=8%, OI>=500); an
+    EXISTING core member only needs the looser STAY bars (spread<=12%,
+    OI>=300), and only leaves after failing STAY at two consecutive
+    monthly rebuilds -- stops a name hovering near a threshold from
+    flapping in and out every month. ATM OI is measured on the nearest
+    MONTHLY expiry >=14 days out (Part 2), not the next-week contract,
+    which structurally hasn't built up OI yet; spread remains the primary
+    quality gate, OI a secondary proxy, UNLESS UNIVERSE_GATE_MODE ==
+    'provisional' (2026-09-25 follow-up, pending Monday's quote-timing
+    decision.json), in which case spread is still measured and stored on
+    every row but does NOT affect enter/stay pass/fail -- only OI and the
+    (unchanged) base dollar-volume filters do. `has_weekly` is stored as
+    information only (Part 1) -- it decides which period(s) Stage 2
+    computes for a ticker, never Tier 1 membership. Also promotes any
+    Tier 2 'spike' ticker that qualified on >=45 of its last 60 scanned
+    sessions (a genuine re-rating, not a spike; must still clear the
+    ENTER bars, being a first-time core entrant). Logs counts and which
+    filter dropped the most candidates via universe_rebuild_log.
+    Re-running the same as_of_date updates rows in place, never
+    duplicates.
+
+    `run_type` ('scheduled' | 'on_demand') and the current UNIVERSE_GATE_MODE
+    are stamped onto every row written -- purely additive/informational,
+    doesn't affect which tickers pass. `progress_callback(done, total)`,
+    if given, is called once per survivor evaluated (for the on-demand
+    tab's live progress display; no existing caller passes it, so nothing
+    changes for them)."""
+    started = time.monotonic()
+    as_of = (as_of_date or today_et()).isoformat()
+    candidates = load_index_constituents()
+    drops = {"price": 0, "market_cap": 0, "dollar_vol_20d": 0, "persistence": 0,
+             "atm_oi": 0, "atm_spread": 0, "no_data": 0}
+
+    price_data = _bulk_price_volume_screen(candidates)
+    survivors = []
+    for t in candidates:
+        d = price_data.get(t)
+        if d is None:
+            drops["no_data"] += 1
+            continue
+        if d["price"] < UNIVERSE_TIER1_MIN_PRICE:
+            drops["price"] += 1
+            continue
+        if d["dollar_vol_20d"] < UNIVERSE_TIER1_MIN_DOLLAR_VOL_20D:
+            drops["dollar_vol_20d"] += 1
+            continue
+        if d["pct_sessions_above_floor"] < UNIVERSE_TIER1_PERSISTENCE_PCT:
+            drops["persistence"] += 1
+            continue
+        survivors.append(t)
+
+    prior_core = _tier1_prior_core(conn, as_of)
+
+    def _evaluate_and_append(t, d, market_cap, rows_to_write):
+        """Returns True (row appended) / False (dropped, `drops` updated). Shared by the main
+        survivor loop and the promotion pass so the enter/stay logic is written exactly once."""
+        try:
+            expirations = list(yf.Ticker(t).options)
+        except Exception:
+            expirations = []
+        has_weekly = int(_has_weekly_options(expirations, max_days_out=UNIVERSE_WEEKLIES_MAX_DAYS_OUT))
+        try:
+            snap = _atm_option_snapshot(t, d["price"], min_days_out=UNIVERSE_MONTHLY_MIN_DAYS_OUT,
+                                        prefer_monthly=True)
+        except Exception:
+            snap = None
+        spread = snap.get("atm_spread_pct") if snap else None  # measured/stored regardless of gate_mode
+        oi = (snap.get("atm_oi") or 0) if snap else 0
+        provisional = UNIVERSE_GATE_MODE == "provisional"
+
+        prior_streak = prior_core.get(t)
+        if prior_streak is not None:
+            # Existing core member: looser STAY bars, with grace before removal.
+            passes = oi >= UNIVERSE_STAY_MIN_ATM_OI if provisional else (
+                spread is not None and spread <= UNIVERSE_STAY_MAX_SPREAD_PCT and oi >= UNIVERSE_STAY_MIN_ATM_OI)
+            new_streak = 0 if passes else prior_streak + 1
+            if not passes and new_streak >= UNIVERSE_STAY_FAIL_LIMIT:
+                reason = "atm_oi" if provisional else (
+                    "atm_spread" if (spread is None or spread > UNIVERSE_STAY_MAX_SPREAD_PCT) else "atm_oi")
+                drops[reason] += 1
+                return False
+            # passes, OR failed but still within its one-month grace -- stays in core either way.
+        else:
+            # First-time entrant (incl. promotions): tighter ENTER bars, no grace.
+            passes = oi >= UNIVERSE_ENTER_MIN_ATM_OI if provisional else (
+                spread is not None and spread <= UNIVERSE_ENTER_MAX_SPREAD_PCT and oi >= UNIVERSE_ENTER_MIN_ATM_OI)
+            if not passes:
+                reason = "atm_oi" if provisional else (
+                    "atm_spread" if (spread is None or spread > UNIVERSE_ENTER_MAX_SPREAD_PCT) else "atm_oi")
+                drops[reason] += 1
+                return False
+            new_streak = 0
+
+        rows_to_write.append((
+            as_of, t, "core", d["price"], market_cap, _market_cap_bucket(market_cap), d.get("dollar_vol_20d"),
+            d.get("pct_sessions_above_floor"), oi or None, spread, None, has_weekly, new_streak,
+            UNIVERSE_GATE_MODE, run_type,
+        ))
+        return True
+
+    rows_to_write = []
+    failed = 0
+    for i, t in enumerate(survivors):
+        d = price_data[t]
+        try:
+            info = _yf_call_with_backoff(lambda t=t: yf.Ticker(t).get_info() or {}, what=f"{t} info")
+        except Exception:
+            failed += 1
+            if progress_callback:
+                progress_callback(i + 1, len(survivors))
+            continue
+        market_cap = _safe_num(info.get("marketCap"), default=None)
+        if market_cap is None or market_cap < UNIVERSE_TIER1_MIN_MARKET_CAP:
+            drops["market_cap"] += 1
+            if progress_callback:
+                progress_callback(i + 1, len(survivors))
+            continue
+        _evaluate_and_append(t, d, market_cap, rows_to_write)
+        if progress_callback:
+            progress_callback(i + 1, len(survivors))
+        time.sleep(0.3)  # rate limit yfinance -- same pacing convention as full_refresh's own per-ticker loop
+
+    # Promotion: a Tier 2 name that qualified as 'spike' on >=45 of its last 60 scanned sessions gets a seat
+    # at the table too, even if it didn't independently survive the base filters this exact month (it's
+    # PROVEN persistent liquidity by a different, already-observed route). Always a first-time entrant here
+    # (by definition it wasn't core before), so it still needs the ENTER bars, not STAY.
+    already_written = {r[1] for r in rows_to_write}
+    recent_dates = _distinct_universe_dates(conn, limit=UNIVERSE_PROMOTION_SESSIONS)
+    if recent_dates:
+        placeholders = ",".join("?" * len(recent_dates))
+        spike_counts = conn.execute(
+            f"""SELECT ticker, COUNT(*) FROM universe
+                WHERE tier='spike' AND as_of_date IN ({placeholders}) GROUP BY ticker""",
+            recent_dates,
+        ).fetchall()
+        for ticker, n in spike_counts:
+            if n < UNIVERSE_PROMOTION_MIN_SPIKE_SESSIONS or ticker in already_written:
+                continue
+            d = price_data.get(ticker)
+            if d is None:
+                continue
+            try:
+                info = _yf_call_with_backoff(lambda ticker=ticker: yf.Ticker(ticker).get_info() or {})
+                market_cap = _safe_num(info.get("marketCap"), default=None)
+            except Exception:
+                continue
+            if market_cap is None:
+                continue
+            if _evaluate_and_append(ticker, d, market_cap, rows_to_write):
+                already_written.add(ticker)
+
+    conn.executemany(
+        """INSERT INTO universe (as_of_date, ticker, tier, price, market_cap, market_cap_bucket,
+               dollar_vol_20d, pct_sessions_above_floor, atm_oi, atm_spread_pct, days_in_spike,
+               has_weekly, stay_fail_streak, gate_mode, run_type)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(as_of_date, ticker) DO UPDATE SET
+               tier=excluded.tier, price=excluded.price, market_cap=excluded.market_cap,
+               market_cap_bucket=excluded.market_cap_bucket, dollar_vol_20d=excluded.dollar_vol_20d,
+               pct_sessions_above_floor=excluded.pct_sessions_above_floor, atm_oi=excluded.atm_oi,
+               atm_spread_pct=excluded.atm_spread_pct, days_in_spike=excluded.days_in_spike,
+               has_weekly=excluded.has_weekly, stay_fail_streak=excluded.stay_fail_streak,
+               gate_mode=excluded.gate_mode, run_type=excluded.run_type""",
+        rows_to_write,
+    )
+    conn.commit()
+
+    top_filter = max(drops, key=drops.get) if any(drops.values()) else None
+    core_count = len(rows_to_write)
+    duration = time.monotonic() - started
+    conn.execute(
+        """INSERT INTO universe_rebuild_log (run_type, as_of_date, started_at, duration_seconds,
+               candidates_considered, attempted, stored, skipped, failed, top_filter_drop, filter_drops_json,
+               notes)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+        # This log's own run_type column identifies the rebuild KIND ('tier1_monthly'), a different concept
+        # from universe.run_type ('scheduled'/'on_demand') -- the latter goes in `notes` here instead so
+        # it's still visible in this log without overloading this column's existing meaning.
+        ("tier1_monthly", as_of, datetime.now(timezone.utc).isoformat(), duration, len(candidates),
+         len(candidates), core_count, sum(drops.values()), failed, top_filter, json.dumps(drops),
+         f"run_type={run_type} gate_mode={UNIVERSE_GATE_MODE}"),
+    )
+    conn.commit()
+    print(f"[universe] Tier 1 rebuild ({as_of}, {run_type}, gate_mode={UNIVERSE_GATE_MODE}): {core_count} core "
+          f"names from {len(candidates)} candidates in {duration:.0f}s. Top filter drop: {top_filter} "
+          f"({drops.get(top_filter, 0)}). Drops: {drops}")
+    return {"core_count": core_count, "drops": drops, "top_filter_drop": top_filter, "duration_seconds": duration}
+
+
+def rebuild_universe_tier2(conn, as_of_date=None, run_type="scheduled", progress_callback=None):
+    """Stage 1, Tier 2 -- today's entrants, recomputed nightly, capped at
+    100. Candidate pool is the UNION of index_constituents.json AND
+    yfinance's live 'most_actives' screener (Part 5) -- a genuine spike is
+    often in a name outside the index list entirely, which the screener
+    catches day by day. Any candidate NOT in the LATEST Tier 1 rebuild
+    where today's dollar volume is a genuine multiple of its own 60-day
+    median AND an absolute floor is cleared, with weekly options
+    available (still a real Tier 2 gate -- Part 1 only removed it from
+    Tier 1; unaffected by UNIVERSE_GATE_MODE, since it's a calendar check,
+    not spread/OI) and, when UNIVERSE_GATE_MODE=='spread', ATM spread<=8%
+    (measured/stored regardless of mode; Tier 2 never had an independent
+    OI floor to fall back to in 'provisional' mode, so provisional Tier 2
+    membership is effectively price+market-cap+volume-multiple+weeklies
+    only -- the dollar-volume-based gates the 2026-09-25 follow-up asked
+    to keep). days_in_spike counts consecutive qualifying sessions
+    (checked against yesterday's own universe row for this ticker).
+    Re-running the same as_of_date upserts, never duplicates."""
+    started = time.monotonic()
+    as_of = (as_of_date or today_et()).isoformat()
+    index_candidates = load_index_constituents()
+    most_actives = fetch_most_actives_tickers()
+    candidates = sorted(set(index_candidates) | set(most_actives))
+
+    latest_tier1_date = conn.execute(
+        "SELECT MAX(as_of_date) FROM universe WHERE tier='core'"
+    ).fetchone()[0]
+    tier1_tickers = set()
+    if latest_tier1_date:
+        tier1_tickers = {r[0] for r in conn.execute(
+            "SELECT ticker FROM universe WHERE tier='core' AND as_of_date=?", (latest_tier1_date,)
+        ).fetchall()}
+    spike_candidates = [t for t in candidates if t not in tier1_tickers]
+    print(f"[universe] Tier 2 candidate pool: {len(index_candidates)} index + {len(most_actives)} most-actives "
+          f"= {len(candidates)} union, {len(spike_candidates)} after excluding current Tier 1 core.")
+
+    drops = {"price": 0, "market_cap": 0, "volume_multiple": 0, "dollar_vol_abs": 0, "weeklies": 0,
+             "atm_spread": 0, "no_data": 0}
+    price_data = _bulk_price_volume_screen(spike_candidates, period="4mo")
+    passed = []
+    for t in spike_candidates:
+        d = price_data.get(t)
+        if d is None:
+            drops["no_data"] += 1
+            continue
+        if d["price"] < UNIVERSE_TIER2_MIN_PRICE:
+            drops["price"] += 1
+            continue
+        if not d["median_dollar_vol_60d"] or d["today_dollar_vol"] < d["median_dollar_vol_60d"] * UNIVERSE_TIER2_VOLUME_MULTIPLE:
+            drops["volume_multiple"] += 1
+            continue
+        if d["today_dollar_vol"] < UNIVERSE_TIER2_MIN_DOLLAR_VOL_ABS:
+            drops["dollar_vol_abs"] += 1
+            continue
+        multiple = d["today_dollar_vol"] / d["median_dollar_vol_60d"]
+        passed.append((t, d, multiple))
+
+    # Rank candidates that cleared the volume/price bars by HOW dislocated they are (multiple of their own
+    # median) purely to decide who gets one of the 100 slots when more than 100 qualify -- not a ranking
+    # signal stored anywhere or shown to the user; days_in_spike/implied-move sorting is what Stage 3 uses.
+    passed.sort(key=lambda x: x[2], reverse=True)
+
+    yesterday_spike_streak = {}
+    if passed:
+        prior_date = conn.execute(
+            "SELECT MAX(as_of_date) FROM universe WHERE tier='spike' AND as_of_date < ?", (as_of,)
+        ).fetchone()[0]
+        if prior_date:
+            rows = conn.execute(
+                "SELECT ticker, days_in_spike FROM universe WHERE tier='spike' AND as_of_date=?", (prior_date,)
+            ).fetchall()
+            yesterday_spike_streak = {t: (n or 0) for t, n in rows}
+
+    rows_to_write, failed = [], 0
+    for i, (t, d, _multiple) in enumerate(passed):
+        if len(rows_to_write) >= UNIVERSE_TIER2_CAP:
+            break
+        try:
+            info = _yf_call_with_backoff(lambda t=t: yf.Ticker(t).get_info() or {})
+        except Exception:
+            failed += 1
+            if progress_callback:
+                progress_callback(i + 1, len(passed))
+            continue
+        market_cap = _safe_num(info.get("marketCap"), default=None)
+        if market_cap is None or market_cap < UNIVERSE_TIER2_MIN_MARKET_CAP:
+            drops["market_cap"] += 1
+            if progress_callback:
+                progress_callback(i + 1, len(passed))
+            continue
+        try:
+            snap = _atm_option_snapshot(t, d["price"], min_days_out=1, max_days_out=UNIVERSE_WEEKLIES_MAX_DAYS_OUT)
+        except Exception:
+            snap = None
+        if snap is None:
+            drops["weeklies"] += 1
+            if progress_callback:
+                progress_callback(i + 1, len(passed))
+            continue
+        spread = snap.get("atm_spread_pct")  # measured/stored regardless of gate_mode
+        if UNIVERSE_GATE_MODE != "provisional" and (spread is None or spread > UNIVERSE_MAX_ATM_SPREAD_PCT):
+            drops["atm_spread"] += 1
+            if progress_callback:
+                progress_callback(i + 1, len(passed))
+            continue
+        days_in_spike = yesterday_spike_streak.get(t, 0) + 1
+        rows_to_write.append((
+            as_of, t, "spike", d["price"], market_cap, _market_cap_bucket(market_cap), d["dollar_vol_20d"],
+            None, snap.get("atm_oi"), spread, days_in_spike, 1, None, UNIVERSE_GATE_MODE, run_type,
+        ))
+        if progress_callback:
+            progress_callback(i + 1, len(passed))
+        time.sleep(0.3)
+
+    conn.executemany(
+        """INSERT INTO universe (as_of_date, ticker, tier, price, market_cap, market_cap_bucket,
+               dollar_vol_20d, pct_sessions_above_floor, atm_oi, atm_spread_pct, days_in_spike,
+               has_weekly, stay_fail_streak, gate_mode, run_type)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(as_of_date, ticker) DO UPDATE SET
+               tier=excluded.tier, price=excluded.price, market_cap=excluded.market_cap,
+               market_cap_bucket=excluded.market_cap_bucket, dollar_vol_20d=excluded.dollar_vol_20d,
+               atm_oi=excluded.atm_oi, atm_spread_pct=excluded.atm_spread_pct,
+               days_in_spike=excluded.days_in_spike, has_weekly=excluded.has_weekly,
+               stay_fail_streak=excluded.stay_fail_streak, gate_mode=excluded.gate_mode,
+               run_type=excluded.run_type""",
+        rows_to_write,
+    )
+    conn.commit()
+
+    top_filter = max(drops, key=drops.get) if any(drops.values()) else None
+    spike_count = len(rows_to_write)
+    duration = time.monotonic() - started
+    conn.execute(
+        """INSERT INTO universe_rebuild_log (run_type, as_of_date, started_at, duration_seconds,
+               candidates_considered, attempted, stored, skipped, failed, top_filter_drop, filter_drops_json,
+               notes)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+        ("tier2_nightly", as_of, datetime.now(timezone.utc).isoformat(), duration, len(spike_candidates),
+         len(spike_candidates), spike_count, sum(drops.values()), failed, top_filter, json.dumps(drops),
+         f"run_type={run_type} gate_mode={UNIVERSE_GATE_MODE}"),
+    )
+    conn.commit()
+    print(f"[universe] Tier 2 rebuild ({as_of}, {run_type}, gate_mode={UNIVERSE_GATE_MODE}): {spike_count} spike "
+          f"names from {len(spike_candidates)} candidates in {duration:.0f}s. Top filter drop: {top_filter}. "
+          f"Drops: {drops}")
+    if spike_count > 100:
+        print(f"[universe] Tier 2 spike count ({spike_count}) exceeds the 100 cap unexpectedly -- investigate.")
+    return {"spike_count": spike_count, "drops": drops, "top_filter_drop": top_filter, "duration_seconds": duration}
+
+
+def get_universe(conn, as_of_date=None, tier=None):
+    """Read path for the Volatility Dislocations tab (Stage 3) and for
+    Stage 2's nightly scan (which tickers to scan). Defaults to the MOST
+    RECENT as_of_date on record for each tier independently (Tier 1 is
+    monthly, Tier 2 nightly, so "today's Tier 1" is usually a stale-but-
+    correct older date, not today's date -- this is intentional, not a
+    bug)."""
+    if as_of_date is not None:
+        dates = {as_of_date}
+    else:
+        dates = set()
+        for t in (("core", "spike") if tier is None else (tier,)):
+            row = conn.execute("SELECT MAX(as_of_date) FROM universe WHERE tier=?", (t,)).fetchone()
+            if row and row[0]:
+                dates.add(row[0])
+    if not dates:
+        return []
+    placeholders = ",".join("?" * len(dates))
+    cols = ["as_of_date", "ticker", "tier", "price", "market_cap", "market_cap_bucket", "dollar_vol_20d",
+            "pct_sessions_above_floor", "atm_oi", "atm_spread_pct", "days_in_spike", "has_weekly",
+            "stay_fail_streak", "gate_mode", "run_type"]
+    # EXPLICIT column list, not SELECT * -- discovered live (2026-09-25) that SELECT * silently breaks the
+    # positional zip(cols, row) below the moment a table's PHYSICAL column order (which migrations append
+    # to at the END, in whatever order those migrations happened to run) drifts from this list's assumed
+    # order. That drift already happened once for real: has_weekly/stay_fail_streak were migrated in AFTER
+    # gate_mode/run_type, so SELECT *'s real order put gate_mode/run_type BEFORE has_weekly/stay_fail_streak
+    # -- every zip()'d dict came out silently mislabeled (has_weekly read the old unused
+    # weeklies_available column, stay_fail_streak's value fell off the end of zip() entirely), and
+    # `if urow.get("has_weekly")` in run_volatility_scan was always falsy as a result -- 0 Week rows ever
+    # got attempted despite 121/209 real core tickers having a genuine weekly chain. An explicit column
+    # list makes this immune to migration order permanently.
+    sql = f"SELECT {', '.join(cols)} FROM universe WHERE as_of_date IN ({placeholders})"
+    params = list(dates)
+    if tier is not None:
+        sql += " AND tier=?"
+        params.append(tier)
+    rows = conn.execute(sql, params).fetchall()
+    return [dict(zip(cols, r)) for r in rows]
+
+
+# ============================================================================
+# VOLATILITY DISLOCATIONS SCREENER -- STAGE 2 (nightly implied-move scan)
+# ============================================================================
+
+def _scan_history_values(conn, ticker, period, column, before_date, limit):
+    """Up to `limit` most recent PRIOR values of `column` from `scan` for this ticker+period, strictly
+    before `before_date`. Shared by move_vs_median_60d (60 days, implied_move_pct) and
+    option_volume_vs_20d_avg (20 days, option_volume_total) -- both need "NULL until N days of real history
+    exist," never a number computed from a partial window."""
+    rows = conn.execute(
+        f"""SELECT {column} FROM scan WHERE ticker=? AND period=? AND scan_date<? AND {column} IS NOT NULL
+            ORDER BY scan_date DESC LIMIT ?""",
+        (ticker, period, before_date, limit),
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
+def run_volatility_scan(conn, as_of_date=None, run_type="scheduled", progress_callback=None):
+    """Stage 2 -- the nightly implied-move scan over Stage 1's universe
+    (latest core + latest spike). One row per (ticker, period): 'month'
+    for EVERY universe name (2026-09-25 follow-up: no longer behind a
+    flag), 'week' only where has_weekly=1.
+
+    Reuses calculate_expected_move_iv (extended to accept a target expiry
+    -- no new options math) with the ATM avg IV from that SAME period's
+    own _atm_option_snapshot chain read -- the "straddle-implied-move"
+    function the spec says to reuse. Reference price is the PREVIOUS
+    close from the same bulk price/volume download Stage 1 uses (never a
+    live/last price), so bands don't drift intraday. realized_vol_20d is
+    backfilled from that same download; iv_rv_ratio compares the implied
+    move to a realized move over the SAME horizon (realized_vol_20d,
+    annualized, scaled by the identical sqrt(days/365) already used for
+    the implied side -- not new math, the same scaling reapplied).
+
+    Skip-and-never-store (not zero, not a placeholder): no valid expiry,
+    no ATM IV, missing reference close, or implied_move_pct<=0. When
+    UNIVERSE_GATE_MODE=='spread', ATM spread>8% is ALSO a skip reason;
+    in 'provisional' mode (the current default, pending Monday's
+    decision.json) spread is still measured and stored but does not
+    skip, matching Stage 1's membership gate change.
+
+    earnings_date/short_float are read from whatever's already cached
+    (earnings_signal / fundamentals_info) -- NEVER force-fetched here,
+    to not double Stage 2's already-heavy option-chain fetch cost per the
+    spec's own "this is the part that breaks" warning. dollar_volume is
+    copied from the universe row (already computed in Stage 1).
+
+    Logs one universe_rebuild_log row per period ('scan_week'/
+    'scan_month'). Re-running the same as_of_date upserts, never
+    duplicates. `progress_callback(done, total)`, if given, fires once
+    per TICKER (both periods together) for the on-demand tab's live
+    progress -- no existing caller passes it."""
+    started_all = time.monotonic()
+    as_of = (as_of_date or today_et()).isoformat()
+    universe_rows = get_universe(conn)  # latest core + latest spike, each tier's own most recent as_of_date
+    if not universe_rows:
+        print(f"[scan] no universe rows to scan for {as_of} -- run Stage 1 first.")
+        return {"stored": 0, "skipped": 0, "failed": 0, "week": {}, "month": {}, "duration_seconds": 0.0}
+
+    tickers = [r["ticker"] for r in universe_rows]
+    by_ticker = {r["ticker"]: r for r in universe_rows}
+    price_data = _bulk_price_volume_screen(tickers, period="4mo")
+
+    provisional = UNIVERSE_GATE_MODE == "provisional"
+    captured_at = now_et().isoformat()  # the Stage 3 "intraday vs post-close" banner reads this
+    log_stats = {"week": {"attempted": 0, "stored": 0, "skipped": 0, "failed": 0},
+                 "month": {"attempted": 0, "stored": 0, "skipped": 0, "failed": 0}}
+    rows_to_write = []
+
+    for i, t in enumerate(tickers):
+        urow = by_ticker[t]
+        d = price_data.get(t)
+        reference_close = d["price"] if d else None
+        realized_vol_20d = d.get("realized_vol_20d") if d else None
+
+        periods = ["month"]
+        if urow.get("has_weekly"):
+            periods.append("week")
+
+        for period in periods:
+            log_stats[period]["attempted"] += 1
+            if period == "week":
+                min_days_out, max_days_out = VOLATILITY_SCAN_WEEK_MIN_DAYS_OUT, VOLATILITY_SCAN_WEEK_MAX_DAYS_OUT
+            else:
+                min_days_out, max_days_out = VOLATILITY_SCAN_MONTH_MIN_DAYS_OUT, VOLATILITY_SCAN_MONTH_MAX_DAYS_OUT
+            if reference_close is None:
+                log_stats[period]["skipped"] += 1
+                continue
+            try:
+                # BOUNDED window (2026-09-25 fix): no max_days_out let this walk arbitrarily far out on a
+                # ticker with sparse listed expiries (TECH landed on a ~113-day "Month" expiry, live). A
+                # ticker with nothing in [min_days_out, max_days_out] now gets no value for this period at
+                # all (snap is None below), never a far-dated fallback mislabeled as this period.
+                snap = _atm_option_snapshot(t, reference_close, min_days_out=min_days_out,
+                                            max_days_out=max_days_out, prefer_monthly=False)
+            except Exception:
+                log_stats[period]["failed"] += 1
+                continue
+            if snap is None or snap.get("atm_avg_iv_pct") is None:
+                log_stats[period]["skipped"] += 1
+                continue
+            spread = snap.get("atm_spread_pct")
+            if not provisional and (spread is None or spread > UNIVERSE_MAX_ATM_SPREAD_PCT):
+                log_stats[period]["skipped"] += 1
+                continue
+
+            days_to_expiry = snap["days_out"]
+            atm_iv_pct = snap["atm_avg_iv_pct"]
+            implied_move_abs = calculate_expected_move_iv(reference_close, atm_iv_pct, expiry=snap["expiry"])
+            implied_move_pct = safe_div(implied_move_abs, reference_close)
+            implied_move_pct = implied_move_pct * 100 if implied_move_pct is not None else None
+            if implied_move_pct is None or implied_move_pct <= 0:
+                log_stats[period]["skipped"] += 1
+                continue
+
+            iv_rv_ratio = None
+            realized_move_pct = None
+            if realized_vol_20d:
+                # SAME sqrt(days/365) scaling as the implied side (calculate_expected_move_iv) -- not new
+                # math, RV substituted for IV in the identical formula -- so the two are directly
+                # comparable, and this is the value the Stage 3 chart overlays as the second, thinner band.
+                realized_move_pct = realized_vol_20d * math.sqrt(days_to_expiry / 365)
+                iv_rv_ratio = safe_div(implied_move_pct, realized_move_pct)
+
+            prior_moves = _scan_history_values(conn, t, period, "implied_move_pct", as_of,
+                                                VOLATILITY_MOVE_MEDIAN_HISTORY_DAYS)
+            move_vs_median_60d = None
+            if len(prior_moves) >= VOLATILITY_MOVE_MEDIAN_HISTORY_DAYS:
+                med = statistics.median(prior_moves)
+                move_vs_median_60d = safe_div(implied_move_pct, med) if med else None
+
+            prior_optvol = _scan_history_values(conn, t, period, "option_volume_total", as_of,
+                                                 VOLATILITY_OPTVOL_AVG_HISTORY_DAYS)
+            option_volume_vs_20d_avg = None
+            if len(prior_optvol) >= VOLATILITY_OPTVOL_AVG_HISTORY_DAYS:
+                avg = sum(prior_optvol) / len(prior_optvol)
+                option_volume_vs_20d_avg = safe_div(snap.get("option_volume_total"), avg) if avg else None
+
+            earn_row = conn.execute(
+                "SELECT next_earnings_date FROM earnings_signal WHERE ticker=? ORDER BY fetched_at DESC LIMIT 1",
+                (t,),
+            ).fetchone()
+            earnings_date = earn_row[0] if earn_row else None
+
+            short_float = None
+            fund_row = conn.execute(
+                "SELECT payload_json FROM fundamentals_info WHERE ticker=? ORDER BY fetched_at DESC LIMIT 1",
+                (t,),
+            ).fetchone()
+            if fund_row:
+                try:
+                    short_float = json.loads(fund_row[0]).get("shortPercentOfFloat")
+                except Exception:
+                    short_float = None
+
+            rows_to_write.append((
+                as_of, t, urow["tier"], period, reference_close, snap["expiry"], days_to_expiry,
+                round(implied_move_pct, 3), implied_move_abs, atm_iv_pct, realized_move_pct, spread,
+                snap.get("option_volume_total"), option_volume_vs_20d_avg, snap.get("atm_oi"),
+                realized_vol_20d, iv_rv_ratio, move_vs_median_60d, earnings_date, short_float,
+                urow.get("dollar_vol_20d"), UNIVERSE_GATE_MODE, run_type, captured_at,
+            ))
+            log_stats[period]["stored"] += 1
+
+        if progress_callback:
+            progress_callback(i + 1, len(tickers))
+        time.sleep(0.3)  # same rate-limit pacing convention as Stage 1 / full_refresh
+
+    conn.executemany(
+        """INSERT INTO scan (scan_date, ticker, tier, period, reference_close, expiry, days_to_expiry,
+               implied_move_pct, implied_move_abs, atm_iv_pct, realized_move_pct, atm_spread_pct,
+               option_volume_total, option_volume_vs_20d_avg, atm_open_interest, realized_vol_20d,
+               iv_rv_ratio, move_vs_median_60d, earnings_date, short_float, dollar_volume, gate_mode,
+               run_type, captured_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(scan_date, ticker, period) DO UPDATE SET
+               tier=excluded.tier, reference_close=excluded.reference_close, expiry=excluded.expiry,
+               days_to_expiry=excluded.days_to_expiry, implied_move_pct=excluded.implied_move_pct,
+               implied_move_abs=excluded.implied_move_abs, atm_iv_pct=excluded.atm_iv_pct,
+               realized_move_pct=excluded.realized_move_pct, atm_spread_pct=excluded.atm_spread_pct,
+               option_volume_total=excluded.option_volume_total,
+               option_volume_vs_20d_avg=excluded.option_volume_vs_20d_avg,
+               atm_open_interest=excluded.atm_open_interest, realized_vol_20d=excluded.realized_vol_20d,
+               iv_rv_ratio=excluded.iv_rv_ratio, move_vs_median_60d=excluded.move_vs_median_60d,
+               earnings_date=excluded.earnings_date, short_float=excluded.short_float,
+               dollar_volume=excluded.dollar_volume, gate_mode=excluded.gate_mode,
+               run_type=excluded.run_type, captured_at=excluded.captured_at""",
+        rows_to_write,
+    )
+    # Remove STALE rows for TODAY's as_of_date that no longer qualify for a (ticker, period) this run --
+    # discovered live (2026-09-25): a ticker+period that gets SKIPPED this run (e.g. the bounded-window fix
+    # correctly excluding a ticker whose nearest expiry fell outside [25,45]/[5,10] days) is simply absent
+    # from rows_to_write, so the UPSERT above never touches its PRIMARY KEY -- an earlier run's row for
+    # that same scan_date just sits there unchanged, showing stale data (a ticker that should now have NO
+    # Month value still showing its old out-of-window expiry). Only ever deletes THIS as_of_date's rows,
+    # never touching other dates' history (needed for move_vs_median_60d / option_volume_vs_20d_avg).
+    kept_keys = {(row[1], row[3]) for row in rows_to_write}  # (ticker, period) -- row[1]=ticker, row[3]=period
+    existing_keys = conn.execute("SELECT ticker, period FROM scan WHERE scan_date=?", (as_of,)).fetchall()
+    stale = [(t, p) for (t, p) in existing_keys if (t, p) not in kept_keys]
+    if stale:
+        conn.executemany("DELETE FROM scan WHERE scan_date=? AND ticker=? AND period=?",
+                          [(as_of, t, p) for t, p in stale])
+    conn.commit()
+
+    duration = time.monotonic() - started_all
+    for period in ("week", "month"):
+        s = log_stats[period]
+        conn.execute(
+            """INSERT INTO universe_rebuild_log (run_type, as_of_date, started_at, duration_seconds,
+                   candidates_considered, attempted, stored, skipped, failed, top_filter_drop,
+                   filter_drops_json, notes)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (f"scan_{period}", as_of, datetime.now(timezone.utc).isoformat(), duration, s["attempted"],
+             s["attempted"], s["stored"], s["skipped"], s["failed"], None, None,
+             f"run_type={run_type} gate_mode={UNIVERSE_GATE_MODE} captured_at={captured_at}"),
+        )
+    conn.commit()
+
+    total_stored = len(rows_to_write)
+    total_skipped = log_stats["week"]["skipped"] + log_stats["month"]["skipped"]
+    total_failed = log_stats["week"]["failed"] + log_stats["month"]["failed"]
+    print(f"[scan] {as_of} ({run_type}, gate_mode={UNIVERSE_GATE_MODE}): {total_stored} rows stored, "
+          f"{total_skipped} skipped, {total_failed} failed, over {len(tickers)} tickers in {duration:.0f}s. "
+          f"week={log_stats['week']}, month={log_stats['month']}")
+    return {"stored": total_stored, "skipped": total_skipped, "failed": total_failed,
+            "week": log_stats["week"], "month": log_stats["month"], "duration_seconds": duration}
+
+
+def get_scan(conn, scan_date=None, period=None, tier=None):
+    """Read path for the Volatility Dislocations tab (Stage 3) -- display only, no fetching. Defaults to
+    the most recent scan_date on record."""
+    if scan_date is None:
+        row = conn.execute("SELECT MAX(scan_date) FROM scan").fetchone()
+        scan_date = row[0] if row else None
+    if not scan_date:
+        return []
+    cols = ["scan_date", "ticker", "tier", "period", "reference_close", "expiry", "days_to_expiry",
+            "implied_move_pct", "implied_move_abs", "atm_iv_pct", "realized_move_pct", "atm_spread_pct",
+            "option_volume_total", "option_volume_vs_20d_avg", "atm_open_interest", "realized_vol_20d",
+            "iv_rv_ratio", "move_vs_median_60d", "earnings_date", "short_float", "dollar_volume",
+            "gate_mode", "run_type", "captured_at"]
+    # Explicit column list, not SELECT * -- see get_universe's identical fix/comment (2026-09-25): a
+    # positional zip(cols, row) silently mislabels everything once a table's physical column order drifts
+    # from this list, which a future _COLUMN_MIGRATIONS["scan"] entry would otherwise reintroduce here too.
+    sql = f"SELECT {', '.join(cols)} FROM scan WHERE scan_date=?"
+    params = [scan_date]
+    if period is not None:
+        sql += " AND period=?"
+        params.append(period)
+    if tier is not None:
+        sql += " AND tier=?"
+        params.append(tier)
+    rows = conn.execute(sql, params).fetchall()
+    return [dict(zip(cols, r)) for r in rows]
+
+
+# ============================================================================
+# VOLATILITY DISLOCATIONS SCREENER -- on-demand background run (2026-09-25)
+# ============================================================================
+
+def start_volatility_scan_on_demand():
+    """Launches scripts/run_volatility_scan_on_demand.py as a DETACHED background process (never inside
+    the Streamlit request thread -- the UI must stay usable while it runs, per the on-demand run spec) and
+    immediately inserts the 'running' volatility_scan_runs row the tab polls, so there's no race where the
+    button's very next rerun finds no row yet. Returns the new run's id, or None if one is already running
+    (single-flight -- checked again here, not just by the UI disabling the button, since two browser tabs
+    or a fast double-click could both pass the UI-level check).
+
+    Deliberately no db_path override: the subprocess always operates on
+    DEFAULT_DB_PATH (same as every other reader/writer in this app --
+    dashboard.py's get_conn() included), so this call inserting into a
+    DIFFERENT path than the subprocess reads from can't happen."""
+    conn = get_connection(DEFAULT_DB_PATH)
+    try:
+        active = conn.execute("SELECT id FROM volatility_scan_runs WHERE status='running'").fetchone()
+        if active:
+            return None
+        as_of = today_et().isoformat()
+        cur = conn.execute(
+            """INSERT INTO volatility_scan_runs (as_of_date, status, stage, started_at, tickers_total,
+                   tickers_done)
+               VALUES (?,?,?,?,?,?)""",
+            (as_of, "running", "tier1", datetime.now(timezone.utc).isoformat(), 0, 0),
+        )
+        conn.commit()
+        run_id = cur.lastrowid
+    finally:
+        conn.close()
+
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "run_volatility_scan_on_demand.py")
+    log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "quote_timing_logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, f"on_demand_run_{run_id}.log")
+    with open(log_path, "w") as logf:
+        subprocess.Popen(
+            [sys.executable, script, "--run-id", str(run_id)],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            stdout=logf, stderr=subprocess.STDOUT,
+            start_new_session=True,  # survives the launching Streamlit request/thread ending
+        )
+    return run_id
+
+
+def get_latest_volatility_scan_run(conn):
+    """The single row the on-demand tab polls -- most recent run, whatever its status. Survives a page
+    refresh because it's read from the DB, not st.session_state."""
+    row = conn.execute(
+        """SELECT id, as_of_date, status, stage, started_at, finished_at, tickers_total, tickers_done,
+               core_count, spike_count, scan_stored, scan_skipped, scan_failed, error_message
+           FROM volatility_scan_runs ORDER BY id DESC LIMIT 1"""
+    ).fetchone()
+    if not row:
+        return None
+    cols = ["id", "as_of_date", "status", "stage", "started_at", "finished_at", "tickers_total",
+            "tickers_done", "core_count", "spike_count", "scan_stored", "scan_skipped", "scan_failed",
+            "error_message"]
+    return dict(zip(cols, row))
+
+
 if __name__ == "__main__":
-    full_refresh(load_watchlist())
+    full_refresh()

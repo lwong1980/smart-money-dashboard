@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+    Smart Money daily digest -- headless scheduled sender.
+
+    Fires on every :00 and :30, all day, every day (two StartCalendarInterval
+    entries -- StartInterval is deliberately NOT used: it fires N seconds
+    after the job was LOADED, so it drifts away from clock time across
+    restarts/reboots instead of landing on a fixed wall-clock tick).
+
+    NOTHING about send time, frequency, or "wait for..." lives here -- every
+    firing just runs digest/send.py, which reads each user's OWN saved
+    schedule from the database and decides for itself whether anything is
+    actually due. Changing "Send time" in the app takes effect on the very
+    next tick with zero changes to this file.
+    -->
+    <key>Label</key>
+    <string>com.smartmoney.digest</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/lwong/smart-money/digest/run_scheduled_digest.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/lwong/smart-money</string>
+
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+        <dict>
+            <key>Minute</key>
+            <integer>30</integer>
+        </dict>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>/Users/lwong/smart-money/digest/logs/digest.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/lwong/smart-money/digest/logs/digest.err.log</string>
+
+    <!-- Don't fire immediately on load/login -- only on the :00/:30 ticks above. -->
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

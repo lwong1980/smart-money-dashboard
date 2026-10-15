@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- ONE-SHOT: quote-timing capture, slot 1230 (12:30pm ET = 09:30 local, America/Vancouver). See
+         com.smartmoney.quotetiming.1030.plist for the full explanation; identical pattern. -->
+    <key>Label</key>
+    <string>com.smartmoney.quotetiming.1230</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/lwong/smart-money/scripts/run_quote_timing_monday.sh</string>
+        <string>1230</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/lwong/smart-money</string>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Month</key><integer>9</integer>
+        <key>Day</key><integer>28</integer>
+        <key>Hour</key><integer>9</integer>
+        <key>Minute</key><integer>30</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/lwong/smart-money/scripts/quote_timing_logs/1230.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/lwong/smart-money/scripts/quote_timing_logs/1230.err.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

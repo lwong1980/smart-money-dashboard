@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+    ONE-SHOT: the report/decision step, 30 minutes after the 1630 capture
+    (14:00 local, America/Vancouver, ~17:00 ET) -- deliberately not 5
+    minutes after, to leave room for yfinance throttling/retries on the
+    1630 capture to finish first. Reads all 5 capture files, computes
+    median spread per slot / tightest-slot-per-name / >2x-variance flags,
+    and applies decision rules a/b/c. Writes
+    quote_timing_results/2026-09-28/decision.json and prints the full
+    report to this job's stdout log -- read scripts/quote_timing_logs/
+    report.out.log (or ask Claude to read it) for the actual result.
+
+    Also self-cleans: run_quote_timing_monday.sh's "report" branch
+    launches uninstall_quote_timing_launchd.sh, detached, as its final
+    step, so all 7 of these jobs (including this one) are gone by the
+    time this finishes -- nothing depends on manually remembering to
+    uninstall before 2027-09-28.
+    -->
+    <key>Label</key>
+    <string>com.smartmoney.quotetiming.report</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/lwong/smart-money/scripts/run_quote_timing_monday.sh</string>
+        <string>report</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/lwong/smart-money</string>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Month</key><integer>9</integer>
+        <key>Day</key><integer>28</integer>
+        <key>Hour</key><integer>14</integer>
+        <key>Minute</key><integer>0</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/lwong/smart-money/scripts/quote_timing_logs/report.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/lwong/smart-money/scripts/quote_timing_logs/report.err.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

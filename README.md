@@ -9,6 +9,13 @@ self-calibration loop.
 
 ```bash
 pip install -r requirements.txt
+
+# REQUIRED before first run -- the app is gated behind Google sign-in:
+#  1. copy .streamlit/secrets.toml.example to .streamlit/secrets.toml and fill in your
+#     Google OAuth client (the file explains the Google Cloud steps and the exact
+#     redirect URI: http://localhost:8501/oauth2callback)
+#  2. choose which Google account becomes the first admin:
+export BOOTSTRAP_ADMIN_EMAIL=you@gmail.com
 streamlit run dashboard.py
 
 # optional, for live (paid) congressional data:
@@ -17,9 +24,11 @@ export QUIVER_API_KEY=...
 export ANTHROPIC_API_KEY=...
 ```
 
-The dashboard reads/writes `smart_money.db` (SQLite, created on first run) and `watchlist.json`
-(seeded from a 12-ticker default the first time it's created). Both are gitignored — they're
-local runtime state, not source.
+The dashboard reads/writes `smart_money.db` (SQLite, created on first run, gitignored — local
+runtime state, not source). It is multi-user: each signed-in Google account has its own watchlist,
+entry zones, newsletter and preferences, while market data and AI briefings are shared. Admins
+manage users from the ⚙️ ADMIN tab. (`watchlist.json` and the other small JSON files from the
+single-user version are only read once, to migrate them to the first admin's account.)
 
 ## Architecture
 
@@ -27,7 +36,8 @@ local runtime state, not source.
   the DB-backed caching layer (`cached_*` wrappers, `fetch_log` freshness ledger), the
   divergence-scoring engine, the Earnings Simulator, and the Day Prediction / backtest /
   calibration system described below.
-- **`dashboard.py`** — the Streamlit UI: 10 tabs, reads from `smart_money.db` and/or calls
+- **`auth.py`** — the Google sign-in gate (Streamlit native OIDC) and registration check.
+- **`dashboard.py`** — the Streamlit UI: 14 tabs (plus an admin-only ADMIN tab), reads from `smart_money.db` and/or calls
   `data_engine.py`'s `cached_*` wrappers directly.
 
 Every `cached_*` call returns `{"data": ..., "source": ..., "cache_hit": bool, "fetched_at": iso_str}`,

@@ -1,5 +1,12 @@
 # Smart Money Intelligence Dashboard
 
+## Working style (standing instruction)
+
+Work autonomously. Do not ask for confirmation or plan approval. Make reasonable decisions, apply them, and
+report what you decided and why at the end. Only stop and ask before: deleting or overwriting stored data,
+running anything that needs sudo, publishing anything publicly (e.g. Substack), sending email to
+subscribers, or changing how existing sections look or behave beyond what was requested.
+
 ## Purpose
 
 Pulls options flow, dark pools, congressional trades, insider activity,
@@ -10,8 +17,9 @@ retail divergence.
 
 - `data_engine.py` — source-agnostic fetchers + a DB-backed caching layer,
   writing to `smart_money.db` (SQLite).
-- `dashboard.py` — Streamlit UI, 7 tabs, reads from `smart_money.db` and/or
-  calls `data_engine.py`'s `cached_*` wrappers directly.
+- `dashboard.py` — Streamlit UI, 14 tabs (+ an admin-only ADMIN tab), reads from
+  `smart_money.db` and/or calls `data_engine.py`'s `cached_*` wrappers directly.
+- `auth.py` — Google OIDC login gate + registration check (see "Multi-user" below).
 
 ### Source-agnostic dispatch
 
@@ -249,27 +257,80 @@ The terminal logs one startup line confirming whether `QUIVER_API_KEY` was
 detected (gated behind `st.cache_resource` so it fires once per server
 process, not once per Streamlit rerun).
 
-## Watchlist (`watchlist.json`)
+## Multi-user, authentication and roles
 
-The watchlist is no longer hardcoded. `data_engine.DEFAULT_STARTER_WATCHLIST`
-is only a fallback seed (12 tickers) used the first time `watchlist.json`
-is created or when the user clicks "Reset to default" — once the file
-exists, it's the source of truth, not the constant.
+The dashboard is multi-user. Everything is gated behind Google sign-in via
+Streamlit's native OIDC (`st.login`/`st.user`/`st.logout`, needs `Authlib`);
+`auth.py` is the gate (`require_login`), called once near the top of
+`dashboard.py` before anything else renders (the emailed `?unsubscribe=`
+handler is the one deliberate exception — it must work with no account).
 
-- `load_watchlist(path="watchlist.json")` / `save_watchlist(tickers, path=...)`
-  in `data_engine.py` — pure JSON read/write, uppercased and deduped.
-- `dashboard.py`'s sidebar "⚙️ Configure Watchlist" expander is the only
-  place the file is written from the UI: a comma-separated text area +
-  Save button (writes `st.session_state.watchlist` and `watchlist.json`)
-  and a Reset-to-default button.
-- Every tab (DIVERGENCE MAP, OPTIONS FLOW, FUNDAMENTALS, the sidebar
-  "⟳ REFRESH DATA" full refresh, etc.) reads the same `watchlist` variable,
-  populated once per rerun from `st.session_state.watchlist` — there is a
-  single list, not a per-tab selection.
-- `full_refresh(tickers=None, ...)` and the `if __name__ == "__main__"`
-  CLI entry point both default to `load_watchlist()` when no explicit
-  ticker list is passed, so `python data_engine.py` picks up the same
-  persisted list the dashboard uses.
+- **Setup:** copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml`
+  (gitignored) and fill in the Google OAuth client. Authorized redirect URI:
+  `http://localhost:8501/oauth2callback` (Google only allows `http` for
+  `localhost`; a real deployment needs `https://<domain>/oauth2callback`).
+- **Authentication vs authorization:** Google proves *who* someone is; the
+  `users` table decides whether they may use the app. An unregistered Google
+  account is refused, never auto-created. Role (`user`/`admin`) and `active`
+  are re-read from the DB on every script run, so demotion/deactivation is
+  immediate.
+- **Admin bootstrap:** `BOOTSTRAP_ADMIN_EMAIL` (env var). Only while the
+  `users` table is EMPTY, only the Google account matching it is auto-created
+  as admin. Unset + empty table => a setup error, never open registration.
+  The last active admin can't be deleted/demoted/deactivated.
+- **Per-user tables** (all keyed by `user_email`): `user_watchlists`,
+  `user_preferences` (pinned runners, refresh interval, chart defaults,
+  last-viewed marker), `entry_zones` (PK `user_email,ticker`),
+  `email_subscribers` (PK `user_email,email`), `email_config` (one row per
+  user), `runners_scan_log` (PK `user_email,scan_date`), and
+  `digest_email_log.user_email`. Every accessor in `data_engine.py` REQUIRES
+  an explicit `user_email` (no default, no "current user" global) — calling
+  one without it raises. `REFERENCES users(email)` is declared but SQLite FK
+  enforcement is left off (the legacy migration writes rows before the admin's
+  first login); integrity is enforced in application code.
+- **Global/shared (never per-user):** price/options/dark-pool/divergence data,
+  `ai_briefs` (one paid briefing serves every user), backtests, predictions,
+  macro events, `seen_analyst_actions`, `firm_tiers`, `fetch_log`, and
+  `app_settings` (global sender address). `full_refresh()` with no ticker list
+  refreshes the UNION of all active users' watchlists.
+- **Roles in the UI:** regular users see 14 tabs; SETTINGS is per-user only
+  (watchlist, entry zones, newsletter, refresh interval, chart defaults) and
+  contains no source registry / API keys / SMTP / firm tiers. Admins also get
+  a `⚙️ ADMIN` tab (user management, all-users overview, and the global
+  settings that used to be in SETTINGS) plus a sidebar **View as user**
+  selector — `EFFECTIVE_EMAIL` (whose data is shown) vs `ACTOR_EMAIL` (whose
+  permissions apply). Session state is wiped whenever `EFFECTIVE_EMAIL`
+  changes so widget values can't bleed between users.
+- **Digests:** `run_digests_for_all_users()` walks every active user; each has
+  their own schedule gate, recipients, sections, watchlist, entry zones,
+  featured-stock pick (from their own watchlist) and send history.
+- **Migration:** `init_db()` rebuilds the old single-user tables to per-user
+  keys, keeping the originals as `*_legacy_premultiuser`, tags the rows with
+  `BOOTSTRAP_ADMIN_EMAIL` (or `__unassigned__` until it's set), and seeds the
+  admin's watchlist/preferences from the old `watchlist.json` /
+  `pinned_runners.json` / `runners_refresh_interval.json` /
+  `watchlist_signals_last_viewed.json` (now unused, kept only as a migration
+  source).
+- `DEFAULT_STARTER_WATCHLIST` seeds a brand-new user or "Reset to default".
+
+## Daily digest conventions (`build_digest_content`)
+
+- **One price per ticker per email.** `get_price_snapshot(ticker)` builds a `PriceSnapshot` from a single
+  yfinance `history(period="1y")` call (+ a last-price fallback chain that logs which source won); a
+  `SnapshotCache` holds one per ticker for the whole build, created in `run_daily_digest_send` and passed
+  through `select_featured_stock` -> `get_featured_stock_section` -> `send_daily_digest_email` ->
+  `build_digest_content`. Featured Stock, Key Stats, Runners, Day Predictions and Watchlist Signals all read
+  it; don't add another price read to the digest. Any field that can't be computed is `None` (never NaN/0.0).
+- **Numbers reach the template only via** `fmt_money` / `fmt_pct` / `fmt_mult` / `fmt_num` (NaN/inf/None-proof)
+  and `pct_change` / `safe_div`. `validate_digest_html()` scans the rendered email before sending, logs each
+  problem at ERROR, and adds a muted "data quality" footer line; the email still sends.
+- **Day Prediction targets** is a table; Move = (target - current)/current from the snapshot, Dir is derived
+  from that Move, rows sort by absolute Move.
+- **Manual featured stock:** `digest_settings` holds `featured_override:<user_email>` =
+  `{"ticker","mode":"once|sticky","expires_at"}`. `select_featured_stock(conn, user_email)` returns
+  `(ticker, "manual"|"auto")`; an override that can't resolve a price falls back to auto with a WARNING. A
+  "once" override is cleared only after a successful SCHEDULED send (`consume_override`), never by the test
+  button or a failed send. Once lapses after 7 days, sticky after 14.
 
 ## Key constraints
 

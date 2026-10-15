@@ -15,3 +15,14 @@ smart_money.db-wal
 .claude/
 
 .DS_Store
+
+# Streamlit secrets -- OAuth client secret + cookie signing key. Never commit.
+.streamlit/secrets.toml
+digest/logs/
+
+# JetBrains IDE project files -- machine-local, not source
+.idea/
+
+# Experiment run outputs/logs -- generated artifacts, not source
+quote_timing_results/
+scripts/quote_timing_logs/

@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+    ONE-SHOT job: quote-timing capture, slot 1030 (10:30am ET), for the
+    Volatility Dislocations Stage 1 quote-timing test.
+
+    2026-09-28 10:30 ET == 07:30 America/Vancouver (this machine's actual
+    local timezone, confirmed via /etc/localtime -- NOT assumed to be ET).
+    StartCalendarInterval times are always the SYSTEM's local time, so this
+    is the converted value, not 10:30 written literally.
+
+    Fires once on that exact date (Month/Day/Hour/Minute, no Weekday key).
+    Will fire again on 2027-09-28 unless uninstalled first -- run
+    uninstall_quote_timing_launchd.sh once Monday's test is done.
+    -->
+    <key>Label</key>
+    <string>com.smartmoney.quotetiming.1030</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/lwong/smart-money/scripts/run_quote_timing_monday.sh</string>
+        <string>1030</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/lwong/smart-money</string>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Month</key><integer>9</integer>
+        <key>Day</key><integer>28</integer>
+        <key>Hour</key><integer>7</integer>
+        <key>Minute</key><integer>30</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/lwong/smart-money/scripts/quote_timing_logs/1030.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/lwong/smart-money/scripts/quote_timing_logs/1030.err.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

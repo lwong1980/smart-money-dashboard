@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+    ONE-SHOT: quote-timing capture PLUS the one real Stage 1 rebuild, slot
+    1545 (3:45pm ET = 12:45 local, America/Vancouver). run_quote_timing_
+    monday.sh's "1545" branch runs the lightweight 30-name capture first
+    (fast), then run_stage1_rebuild_1545.py (the real rebuild_universe_
+    tier1/tier2 against smart_money.db -- takes several minutes). This is
+    the ONLY slot that writes to the universe table; the other 4 capture
+    slots are file-only.
+    -->
+    <key>Label</key>
+    <string>com.smartmoney.quotetiming.1545</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/lwong/smart-money/scripts/run_quote_timing_monday.sh</string>
+        <string>1545</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/lwong/smart-money</string>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Month</key><integer>9</integer>
+        <key>Day</key><integer>28</integer>
+        <key>Hour</key><integer>12</integer>
+        <key>Minute</key><integer>45</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/lwong/smart-money/scripts/quote_timing_logs/1545.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/lwong/smart-money/scripts/quote_timing_logs/1545.err.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

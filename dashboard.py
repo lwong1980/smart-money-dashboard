@@ -7,13 +7,46 @@ import re
 import threading
 import time
 from contextlib import nullcontext
-from datetime import date, datetime, timedelta, time as dt_time
+from datetime import date, datetime, timedelta, timezone, time as dt_time
 
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 
+import auth
+import charts
+import data_engine as de
+from digest import healthchecks
+from digest.core import run_daily_digest_send, run_digests_for_all_users
+from charts import (
+    ACCENT,
+    ANALYST_BREAKDOWN_CID,
+    ANALYST_FAN_CID,
+    _MACRO_IMPACT_COLORS,
+    COLOR_BULLISH,
+    COLOR_BEARISH,
+    COLOR_INSTITUTIONAL,
+    COLOR_NEUTRAL,
+    COLOR_RETAIL,
+    FEATURED_STOCK_CHART_CID,
+    GRID,
+    PANEL,
+    SWING_CHART_CID,
+    TEXT_MUTED,
+    TEXT_PRIMARY,
+    TEXT_SECONDARY,
+    add_macro_event_markers,
+    apply_theme,
+    build_analyst_chart_images,
+    build_featured_stock_chart_bytes,
+    build_swing_chart_image,
+    render_chart_as_image,
+    render_entry_zone_mini_chart,
+    render_price_target_fan,
+    render_price_volume_chart,
+    render_recommendation_breakdown,
+)
 from data_engine import (
     AI_BRIEF_CACHE_HOURS,
     DATA_SOURCE_CONFIG,
@@ -126,6 +159,9 @@ from data_engine import (
     get_macro_events_near,
     get_macro_events_by_id,
     get_watchlist_relevant_tickers,
+    get_cpi_bracket_odds,
+    get_macro_release_banner_state,
+    check_and_send_macro_release_alerts,
     _format_et_time_12h,
     FOMC_MEETING_DATES,
     load_pinned_runners,
@@ -169,6 +205,7 @@ from data_engine import (
     cached_fed_funds_rate,
     get_fed_target_range_text,
     get_firm_tier,
+    compute_and_log_runner_scan,
     log_runners_scan,
     get_email_config,
     save_email_config,
@@ -189,6 +226,46 @@ from data_engine import (
     remove_email_subscriber,
     resubscribe_email,
     is_valid_email_format,
+    get_subscriber_by_token,
+    get_subscriber_sections_included,
+    set_subscriber_active,
+    set_subscriber_sections_included,
+    get_or_build_todays_edition,
+    build_digest_edition,
+    get_digest_edition,
+    get_last_digest_edition,
+    _get_edition_admin_email,
+    build_substack_markdown,
+    render_substack_image_slots,
+    render_edition_for_recipient,
+    send_edition_to_substack,
+    export_substack_zip,
+    get_substack_posts,
+    get_last_substack_post,
+    get_substack_post_for_edition,
+    test_substack_connection,
+    today_et,
+    load_chart_defaults,
+    save_chart_defaults,
+    CHART_REFRESH_OPTIONS,
+    RUNNERS_REFRESH_INTERVAL_OPTIONS,
+    get_app_setting,
+    set_app_setting,
+    list_users,
+    SnapshotCache,
+    get_featured_override,
+    set_featured_override,
+    clear_featured_override,
+    get_todays_runner_tickers,
+    USER_ROLES,
+    pmset_wake_command_for,
+    UNIVERSE_GATE_MODE,
+    VOLATILITY_MOVE_DISLOCATION_FLAG,
+    VOLATILITY_UNUSUAL_OPTVOL_FLAG,
+    get_universe,
+    get_scan,
+    start_volatility_scan_on_demand,
+    get_latest_volatility_scan_run,
 )
 
 # --------------------------------------------------------------------------
@@ -196,20 +273,11 @@ from data_engine import (
 # --------------------------------------------------------------------------
 
 BG = "#030609"
-PANEL = "#080d14"
 PANEL_ALT = "#0a121b"
 BORDER = "rgba(0,229,255,0.14)"
-ACCENT = "#00e5ff"
-TEXT_PRIMARY = "#e8f4f8"
-TEXT_SECONDARY = "#8b9bab"
-TEXT_MUTED = "#4d5866"
-GRID = "#12202b"
-
-COLOR_INSTITUTIONAL = "#3987e5"   # blue
-COLOR_RETAIL = "#c98500"          # amber
-COLOR_BULLISH = "#0ca30c"         # good / green
-COLOR_BEARISH = "#e66767"         # critical / red
-COLOR_NEUTRAL = "#5a6472"         # muted gray
+# PANEL, ACCENT, TEXT_PRIMARY, TEXT_SECONDARY, TEXT_MUTED, GRID, COLOR_INSTITUTIONAL,
+# COLOR_RETAIL, COLOR_BULLISH, COLOR_BEARISH, COLOR_NEUTRAL: imported from charts.py
+# (the one place that defines them -- see that file's own comment).
 COLOR_CONFLICTED = "#a86fe0"      # violet -- distinct from NEUTRAL's gray so a
                                   # high-conviction-but-disagreeing read doesn't
                                   # visually collapse into "nothing going on"
@@ -417,15 +485,6 @@ hr {{ border-color: {BORDER}; }}
 st.set_page_config(page_title="SMART MONEY INTELLIGENCE", layout="wide", page_icon="📡")
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
-# Initialized here, immediately after page config, rather than further
-# down where the sidebar used to live -- every tab-render function below
-# reads the bare `watchlist` global or st.session_state.watchlist
-# directly, so this must be the very first stateful thing set up on any
-# script run, with no tab/dialog/fragment code able to run ahead of it.
-if "watchlist" not in st.session_state:
-    st.session_state.watchlist = load_watchlist()
-watchlist = st.session_state.watchlist
-
 
 # --------------------------------------------------------------------------
 # Startup: log QUIVER_API_KEY detection once per server process (not once
@@ -507,12 +566,109 @@ if _unsubscribe_token:
     if _unsubscribed_email:
         st.success(f"✅ **{_unsubscribed_email}** has been unsubscribed from the daily digest. "
                    f"You will not receive further emails.")
-        st.caption("Changed your mind? Re-subscribe from the SETTINGS → Email Digest panel, or contact "
+        st.caption("Changed your mind? Re-subscribe from the SETTINGS → Newsletter panel, or contact "
                    "the sender directly.")
     else:
         st.error("⚠️ This unsubscribe link isn't valid (or has already been used). If you're still receiving "
                  "emails you don't want, reply to the digest directly and ask to be removed.")
     st.stop()
+
+
+# --------------------------------------------------------------------------
+# Manage-preferences query-param handler (2026-10-13, Part 1.3) -- checks
+# for ?manage=<token> on every load, same tokenization/no-login pattern as
+# the unsubscribe handler above. A subscriber (identified ONLY by their
+# token, never requiring a dashboard account/login) can toggle which
+# sections they receive and whether they receive the newsletter at all.
+# --------------------------------------------------------------------------
+
+_manage_token = st.query_params.get("manage")
+if _manage_token:
+    st.markdown("### 📧 Smart Money Intelligence — Manage Preferences")
+    _sub = get_subscriber_by_token(get_conn(), _manage_token)
+    if not _sub:
+        st.error("⚠️ This preferences link isn't valid. If you're still receiving emails you don't want, "
+                 "reply to the digest directly and ask to be removed.")
+        st.stop()
+    st.caption(f"Preferences for **{_sub['email']}**. No login needed — this link is unique to you.")
+    _active = st.toggle("Receive the newsletter", value=not _sub["unsubscribed"], key="manage_active_toggle")
+    st.markdown("**Sections**")
+    _current_sections = set(get_subscriber_sections_included(_sub))
+    _chosen_sections = []
+    for _sec_key in DEFAULT_DIGEST_SECTIONS:
+        if st.checkbox(DIGEST_SECTION_LABELS.get(_sec_key, _sec_key), value=_sec_key in _current_sections,
+                       key=f"manage_section_{_sec_key}"):
+            _chosen_sections.append(_sec_key)
+    if st.button("💾 Save preferences", key="manage_save_btn"):
+        set_subscriber_active(get_conn(), _manage_token, _active)
+        set_subscriber_sections_included(get_conn(), _manage_token, _chosen_sections)
+        st.success("✅ Preferences saved.")
+    st.stop()
+
+
+# --------------------------------------------------------------------------
+# AUTH GATE (multi-user). Everything below this point requires a signed-in,
+# registered, active Google account -- require_login() renders the setup /
+# login / denied screen and st.stop()s otherwise, so NO tab, sidebar
+# widget, background scan, or digest send below can run for an
+# unauthenticated visitor. (The unsubscribe handler above is intentionally
+# the one exception: an emailed unsubscribe link must work with no account.)
+#
+# ACTOR_EMAIL   = who is actually logged in (drives permissions).
+# EFFECTIVE_EMAIL = whose data the UI shows/edits. Always == ACTOR_EMAIL for
+#   a regular user; an admin may switch it via the ADMIN tab's "View as
+#   user" selector (their permissions stay admin's -- only the data
+#   context changes). Every per-user read/write below uses EFFECTIVE_EMAIL.
+# --------------------------------------------------------------------------
+
+CURRENT_USER = auth.require_login(get_conn())
+ACTOR_EMAIL = CURRENT_USER["email"]
+IS_ADMIN = CURRENT_USER["role"] == "admin"
+
+
+def _resolve_effective_email():
+    if IS_ADMIN:
+        target = de.normalize_email(st.session_state.get("view_as_email"))
+        # Only honor a target that still exists; a stale selection (user
+        # deleted in another session) silently falls back to the admin's own.
+        if target and target != ACTOR_EMAIL and de.get_user(get_conn(), target):
+            return target
+    return ACTOR_EMAIL
+
+
+EFFECTIVE_EMAIL = _resolve_effective_email()
+
+
+def _uk(name):
+    """Namespace a per-user widget key / session_state key by whose data is
+    on screen. Streamlit keeps widget state under the key and the browser
+    re-sends it every rerun -- with a fixed key like "wl_textarea", switching
+    "View as user" could leave the PREVIOUS user's text in the box (and Save
+    would then write it onto the wrong user). A key that includes the user
+    makes that impossible: each user's widgets are different widgets."""
+    return f"{name}::{EFFECTIVE_EMAIL}"
+
+
+# Session-state isolation. Streamlit widget values persist in
+# st.session_state BY KEY, ignoring a changed `value=` default -- so when
+# the data context changes (an admin's "View as user" switch, or a
+# different account signing in within the same browser session), the
+# previous user's toggles / text boxes / pinned tickers would silently
+# carry over onto the new user's screen, and a Save click could write them
+# onto that user. On any context change, drop every session key except the
+# few that define identity/context itself.
+_SESSION_KEEP_KEYS = {
+    "_auth_email", "view_as_email", "_ctx_email", "_admin_view_as_select",
+    # GLOBAL (not per-user) session caches: the once-a-day reconcile/macro-refresh marker and the
+    # data-source health probes. Wiping these would re-run network work on every "View as" switch.
+    "last_auto_reconcile_date", "health", "full_registry",
+}
+if st.session_state.get("_ctx_email") != EFFECTIVE_EMAIL:
+    for _k in [k for k in st.session_state.keys() if k not in _SESSION_KEEP_KEYS]:
+        del st.session_state[_k]
+    st.session_state["_ctx_email"] = EFFECTIVE_EMAIL
+
+watchlist = load_watchlist(get_conn(), EFFECTIVE_EMAIL)
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -835,102 +991,24 @@ def interp_badge_html(label, color, note=None):
     """Generic interpretive badge -- reuses the .chip CSS class (same visual
     language as badge_html's divergence-label chips) but takes an explicit
     color instead of a LABEL_COLORS lookup, plus an optional hover tooltip
-    (the plain-English 'why' from a classify_*() call) via the title attr."""
-    if not label:
+    (the plain-English 'why' from a classify_*() call) via the title attr.
+
+    `not label` alone doesn't catch a NaN float slipping in from an
+    .iterrows()-sourced badge column (confirmed live: NaN is truthy in
+    Python, so it passed this check and crashed html.escape() -- "'float'
+    object has no attribute 'replace'" -- since html.escape assumes a str
+    and just calls .replace() with no type check). isinstance guards both
+    label and note explicitly, regardless of what a caller passes."""
+    if not isinstance(label, str) or not label:
         return ""
-    title_attr = f' title="{html.escape(note)}"' if note else ""
+    note_txt = note if isinstance(note, str) else None
+    title_attr = f' title="{html.escape(note_txt)}"' if note_txt else ""
     return f'<span class="chip" style="border-color:{color};color:{color};"{title_attr}>{html.escape(label)}</span>'
 
 
 # --------------------------------------------------------------------------
 # Chart helpers
 # --------------------------------------------------------------------------
-
-BASE_LAYOUT = dict(
-    paper_bgcolor=PANEL,
-    plot_bgcolor=PANEL,
-    font=dict(family="Space Mono, monospace", color=TEXT_SECONDARY, size=12),
-    margin=dict(l=45, r=20, t=42, b=30),
-)
-
-
-def apply_theme(fig, height=360, **overrides):
-    layout = dict(BASE_LAYOUT)
-    layout["height"] = height
-    layout.update(overrides)
-    fig.update_layout(**layout)
-    fig.update_xaxes(gridcolor=GRID, zerolinecolor=GRID, linecolor="#1c2a36")
-    fig.update_yaxes(gridcolor=GRID, zerolinecolor=GRID, linecolor="#1c2a36")
-    return fig
-
-
-_MACRO_IMPACT_COLORS = {"High": COLOR_BEARISH, "Medium": "#e8c547", "Low": TEXT_SECONDARY}
-_MACRO_ABBREV = {
-    "fomc_rate_decision": "FOMC", "cpi": "CPI", "pce": "PCE", "nfp": "NFP",
-    "gdp": "GDP", "retail_sales": "RETAIL", "jobless_claims": "CLAIMS",
-}
-
-
-def add_macro_event_markers(fig, events, intraday=False, chart_tz=None, row=None, col=None,
-                             y_bottom=None, marker_row=None):
-    """Adds a plain thin, low-opacity (35%) dashed vertical line for
-    every macro event whose date falls in the chart's own range -- fully
-    automatic (Part 6): every price-chart function calls get_macro_
-    events_in_range with its OWN visible date range and passes the
-    result straight here, so a new macro event starts appearing on every
-    relevant chart with zero per-chart/per-ticker configuration the
-    moment it's fetched. Color-coded by impact_level (red/orange High --
-    FOMC/CPI/NFP; muted gray Medium/Low). On an intraday chart (Day
-    Prediction), positions the line at the event's real scheduled_
-    time_et instead of just the date, localized to the chart's own tz
-    (chart_tz) so it lines up with the rest of that chart's tz-aware
-    x-axis.
-
-    Hover detail (this request): a single small dot marker at the BOTTOM
-    of the chart (y_bottom, supplied by the caller from its own price
-    data's range -- never both top and bottom) shows the full event
-    name/date/time on mouseover, via a real Scatter trace with hovertext
-    -- NOT annotation_hovertext, which turned out to render a literal
-    "new text" placeholder at render time even with no visible
-    annotation_text (a Plotly.js quirk, confirmed live: the Python
-    object shows text=None but the browser renders a placeholder
-    regardless -- the same bug class already diagnosed once before in
-    this codebase for the support/resistance hlines: 'only pass
-    annotation_* kwargs at all when there's real text to show'). This
-    replaces that entirely -- the line itself carries no annotation/
-    label of any kind now, at any timeframe; the dot is the only
-    interactive element, and a static, always-visible fallback is the
-    "📅 X macro events in this range" expander every caller renders
-    below its chart (render_macro_event_expander)."""
-    for ev in events:
-        color = _MACRO_IMPACT_COLORS.get(ev["impact_level"], TEXT_SECONDARY)
-        time_label = f" {_format_et_time_12h(ev['scheduled_time_et'])}" if ev.get("scheduled_time_et") else ""
-        if intraday and ev.get("scheduled_time_et"):
-            x = pd.Timestamp(f"{ev['scheduled_date']} {ev['scheduled_time_et']}")
-            if chart_tz is not None:
-                x = x.tz_localize(chart_tz)
-        else:
-            x = ev["scheduled_date"]
-        vline_kwargs = dict(x=x, line=dict(color=color, width=1, dash="dash"), opacity=0.35)
-        if row is not None:
-            vline_kwargs["row"] = row
-        if col is not None:
-            vline_kwargs["col"] = col
-        fig.add_vline(**vline_kwargs)
-
-        if y_bottom is not None:
-            trace_kwargs = dict(
-                x=[x], y=[y_bottom], mode="markers",
-                marker=dict(symbol="circle", size=7, color=color, line=dict(width=1, color=PANEL)),
-                hovertext=f"{ev['event_name']} — {ev['scheduled_date']}{time_label}",
-                hoverinfo="text", showlegend=False,
-            )
-            if marker_row is not None and col is not None:
-                fig.add_trace(go.Scatter(**trace_kwargs), row=marker_row, col=col)
-            else:
-                fig.add_trace(go.Scatter(**trace_kwargs))
-    return fig
-
 
 def render_macro_event_expander(events):
     """Part 3 -- collapsed, on-demand full detail for whatever events a
@@ -994,127 +1072,6 @@ def render_price_chart(df, ticker, mode="line", height=380):
     return fig, macro_events
 
 
-def render_price_volume_chart(df, ticker, mode="line", short_label="SMA short", long_label="SMA long",
-                               height=460, levels=None):
-    """Price chart (line or candlestick) with a volume subplot beneath it
-    and SMA_short/SMA_long overlays -- the timeframe-aware companion to
-    render_price_chart, used wherever fetch_price_history() supplies the
-    data (its columns are named SMA_short/SMA_long, not SMA50/SMA200).
-
-    `levels`, if given a detect_technical_levels()-shaped dict, overlays
-    dashed horizontal lines for every detected support/resistance level --
-    the nearest (key_level_below/key_level_above) drawn bold and labeled,
-    the rest faint so the chart stays readable when several levels cluster
-    close together."""
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.72, 0.28], vertical_spacing=0.04)
-
-    if mode == "candlestick":
-        fig.add_trace(
-            go.Candlestick(
-                x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
-                increasing_line_color=COLOR_BULLISH, decreasing_line_color=COLOR_BEARISH,
-                increasing_fillcolor=COLOR_BULLISH, decreasing_fillcolor=COLOR_BEARISH,
-                name=ticker,
-            ), row=1, col=1,
-        )
-    else:
-        fig.add_trace(
-            go.Scatter(x=df.index, y=df["Close"], mode="lines", name="Close",
-                       line=dict(color=ACCENT, width=2)), row=1, col=1,
-        )
-    if "SMA_short" in df.columns:
-        fig.add_trace(
-            go.Scatter(x=df.index, y=df["SMA_short"], mode="lines", name=short_label,
-                       line=dict(color=COLOR_INSTITUTIONAL, width=1.4, dash="dot")), row=1, col=1,
-        )
-    if "SMA_long" in df.columns:
-        fig.add_trace(
-            go.Scatter(x=df.index, y=df["SMA_long"], mode="lines", name=long_label,
-                       line=dict(color=COLOR_RETAIL, width=1.4, dash="dot")), row=1, col=1,
-        )
-
-    vol_colors = [COLOR_BULLISH if c >= o else COLOR_BEARISH for o, c in zip(df["Open"], df["Close"])]
-    fig.add_trace(go.Bar(x=df.index, y=df["Volume"], marker_color=vol_colors, name="Volume"), row=2, col=1)
-
-    if levels:
-        # Passing annotation_text=None alongside other annotation_* kwargs
-        # still makes plotly build an annotation object (just with no
-        # `text` key) -- and plotly.js's own default for a missing
-        # annotation text is the literal placeholder string "New text",
-        # which is exactly the stray label this used to show for every
-        # non-key level. Fix: only pass annotation_* kwargs at all when
-        # there's real text to show.
-        key_below = levels.get("key_level_below")
-        key_above = levels.get("key_level_above")
-        for lv in levels.get("support_levels", []):
-            is_key = lv["level"] == key_below
-            hline_kwargs = dict(
-                y=lv["level"], row=1, col=1,
-                line=dict(color=COLOR_BULLISH, width=1.8 if is_key else 1, dash="dash"),
-                opacity=0.95 if is_key else 0.4,
-            )
-            if is_key:
-                hline_kwargs.update(
-                    annotation_text=f"S {lv['level']:,.2f}", annotation_position="bottom right",
-                    annotation_font_color=COLOR_BULLISH, annotation_font_size=10,
-                )
-            fig.add_hline(**hline_kwargs)
-        for lv in levels.get("resistance_levels", []):
-            is_key = lv["level"] == key_above
-            hline_kwargs = dict(
-                y=lv["level"], row=1, col=1,
-                line=dict(color=COLOR_BEARISH, width=1.8 if is_key else 1, dash="dash"),
-                opacity=0.95 if is_key else 0.4,
-            )
-            if is_key:
-                hline_kwargs.update(
-                    annotation_text=f"R {lv['level']:,.2f}", annotation_position="top right",
-                    annotation_font_color=COLOR_BEARISH, annotation_font_size=10,
-                )
-            fig.add_hline(**hline_kwargs)
-
-    # TradingView-style continuous candles: without this, plotly's default
-    # real-time x-axis renders closed-market time (nights, weekends) as
-    # visible dead space between sessions -- gaps between trading days on
-    # daily+ charts, and a gap every night on intraday charts. rangebreaks
-    # tells plotly to compress those closed periods out entirely so
-    # consecutive trading bars sit adjacent with no gap. Detected from the
-    # data itself (more than one distinct time-of-day present) rather than
-    # a separate parameter, since a daily-bar df has no intraday gaps to
-    # hide and applying the hour-pattern break to it would be a no-op at
-    # best and wrong if it ever isn't.
-    is_intraday = pd.Series(df.index).dt.time.nunique() > 1
-    rangebreaks = [dict(bounds=["sat", "mon"])]
-    if is_intraday:
-        # US market hours (NYSE/NASDAQ, all tickers this app covers are
-        # US-listed): 9:30am-4:00pm local exchange time. bounds=[16, 9.5]
-        # hides 16:00->24:00 and 0:00->9:30, i.e. everything outside that
-        # window -- plotly's own documented pattern for this exact case.
-        rangebreaks.append(dict(bounds=[16, 9.5], pattern="hour"))
-    fig.update_xaxes(rangebreaks=rangebreaks)
-
-    macro_events = []
-    if not df.empty:
-        macro_events = get_macro_events_in_range(get_conn(), df.index.min(), df.index.max(),
-                                                  overlay_impact_filter="auto")
-        # Dot sits on the VOLUME subplot (row 2), at y=0 -- volume bars
-        # already start at 0, so this is the true visual bottom of the
-        # whole chart with no padding math needed. The vline itself still
-        # spans both subplots (row="all") so it visually connects price
-        # to the dot below.
-        add_macro_event_markers(fig, macro_events, intraday=is_intraday, chart_tz=df.index.tz, row="all", col=1,
-                                 y_bottom=0, marker_row=2)
-
-    fig.update_layout(xaxis_rangeslider_visible=False, xaxis2_rangeslider_visible=False)
-    apply_theme(
-        fig, height=height,
-        title=dict(text=f"{ticker} &mdash; Price &amp; Volume", font=dict(color=TEXT_PRIMARY, size=14)),
-        legend=dict(orientation="h", y=1.06, bgcolor="rgba(0,0,0,0)"),
-        hovermode="x unified",
-    )
-    return fig, macro_events
-
-
 def render_technical_structure_panel(levels):
     """Renders the automated TECHNICAL STRUCTURE panel from a
     detect_technical_levels()-shaped dict -- pure display of already-
@@ -1152,16 +1109,16 @@ def render_technical_structure_panel(levels):
     kcol1, kcol2 = st.columns(2)
     with kcol1:
         below = levels.get("key_level_below")
-        st.markdown(metric_chip_html(
+        st.markdown(md_safe(metric_chip_html(
             "KEY SUPPORT BELOW", f"${below:,.2f}" if below is not None else "—", color=COLOR_BULLISH,
-        ), unsafe_allow_html=True)
+        )), unsafe_allow_html=True)
         if below is not None and levels.get("breakdown_target") is not None:
             st.caption(f"Break below {below:,.2f} → next measured-move target ~{levels['breakdown_target']:,.2f}")
     with kcol2:
         above = levels.get("key_level_above")
-        st.markdown(metric_chip_html(
+        st.markdown(md_safe(metric_chip_html(
             "KEY RESISTANCE ABOVE", f"${above:,.2f}" if above is not None else "—", color=COLOR_BEARISH,
-        ), unsafe_allow_html=True)
+        )), unsafe_allow_html=True)
         if above is not None and levels.get("breakout_target") is not None:
             st.caption(f"Break above {above:,.2f} → next measured-move target ~{levels['breakout_target']:,.2f}")
 
@@ -1262,6 +1219,12 @@ def render_session_price_summary(ticker):
 _INTERVAL_DEFAULT_LOOKBACK = {"5m": "1d", "15m": "1d", "1h": "1mo", "1d": DEFAULT_LOOKBACK}
 
 
+def _chart_defaults():
+    """The effective user's saved timeframe/chart defaults (see SETTINGS ->
+    CHART DEFAULTS); app-wide defaults for anyone who hasn't chosen."""
+    return load_chart_defaults(get_conn(), EFFECTIVE_EMAIL)
+
+
 def render_timeframe_chart_section(ticker, key_prefix, mode="line", show_technical_structure=True):
     """Shared chart section, used by both the FUNDAMENTALS tab and TICKER
     DEEP-DIVE's price chart: two independent controls -- candle Interval
@@ -1276,8 +1239,8 @@ def render_timeframe_chart_section(ticker, key_prefix, mode="line", show_technic
     Technical levels are computed fresh on every call -- never wrapped in
     st.cache_data -- so switching interval/lookback always recomputes
     rather than showing a stale prior selection's levels."""
-    interval_key = f"{key_prefix}_interval"
-    lookback_key = f"{key_prefix}_lookback"
+    interval_key = _uk(f"{key_prefix}_interval")
+    lookback_key = _uk(f"{key_prefix}_lookback")
 
     def _on_interval_change():
         st.session_state[lookback_key] = _INTERVAL_DEFAULT_LOOKBACK.get(
@@ -1287,17 +1250,18 @@ def render_timeframe_chart_section(ticker, key_prefix, mode="line", show_technic
     tcol1, tcol2, tcol3 = st.columns([1.2, 1.2, 1])
     with tcol1:
         interval = st.selectbox(
-            "Interval", INTERVAL_OPTIONS, index=INTERVAL_OPTIONS.index(DEFAULT_INTERVAL),
+            "Interval", INTERVAL_OPTIONS, index=INTERVAL_OPTIONS.index(_chart_defaults()["interval"]),
             key=interval_key, on_change=_on_interval_change,
         )
     with tcol2:
         lookback = st.selectbox(
-            "Lookback", LOOKBACK_OPTIONS, index=LOOKBACK_OPTIONS.index(DEFAULT_LOOKBACK),
+            "Lookback", LOOKBACK_OPTIONS, index=LOOKBACK_OPTIONS.index(_chart_defaults()["lookback"]),
             key=lookback_key,
         )
     with tcol3:
         refresh_choice = st.selectbox(
-            "Refresh", ["On demand", "1 min", "5 min"], key=f"{key_prefix}_refresh",
+            "Refresh", CHART_REFRESH_OPTIONS, key=_uk(f"{key_prefix}_refresh"),
+            index=CHART_REFRESH_OPTIONS.index(_chart_defaults()["refresh"]),
         )
 
     def _render():
@@ -1318,7 +1282,7 @@ def render_timeframe_chart_section(ticker, key_prefix, mode="line", show_technic
         cache_suffix = f"{ticker}_{interval}_{lookback}"
         pv_fig, pv_macro_events = render_price_volume_chart(
             hist, ticker, mode=mode,
-            short_label=f"SMA {short_w}", long_label=f"SMA {long_w}", levels=levels,
+            short_label=f"SMA {short_w}", long_label=f"SMA {long_w}", levels=levels, conn=get_conn(),
         )
         st.plotly_chart(pv_fig, width='stretch', key=f"{key_prefix}_pv_{cache_suffix}")
         render_macro_event_expander(pv_macro_events)
@@ -1667,122 +1631,6 @@ def render_pl_heatmap_chart(heatmap, height=340):
     fig.update_xaxes(title_text="Date", type="category")
     fig.update_yaxes(title_text="Underlying price ($) and % move from current price")
     return apply_theme(fig, height=height, showlegend=False)
-
-
-def render_price_target_fan(hist_df, current, low, mean, high, height=380):
-    """Historical close price flowing into a forward-projecting fan toward
-    High/Average/Low analyst targets -- replaces the old static low..high
-    number-line entirely, redesigned directly against real Yahoo Finance
-    and TradingView price-target chart references (not a guess at their
-    style): a real price history line leads into three dashed projection
-    lines from the current price to each target, each ending in a
-    colored value+percent label at the right edge.
-
-    Median isn't drawn as a 4th fan line -- both reference charts use
-    exactly High/Average/Low, and a 4th line sitting close to Average
-    would just crowd the labels without adding a materially different
-    read -- but it isn't silently dropped either: the caller shows it in
-    the caption text above this chart."""
-    fig = go.Figure()
-    if hist_df is None or hist_df.empty or current is None:
-        apply_theme(fig, height=height)
-        return fig
-
-    hist = hist_df["Close"].dropna()
-    if hist.empty:
-        apply_theme(fig, height=height)
-        return fig
-
-    last_close = float(hist.iloc[-1])
-    # Plotly's annotation/axis-range serialization chokes on raw pandas
-    # Timestamps ("Type is not JSON serializable: Timestamp") even though
-    # trace x= arrays accept them fine -- ISO date strings are safe
-    # everywhere, so every date used outside a trace's own x= array goes
-    # through this conversion.
-    last_date_str = hist.index[-1].strftime("%Y-%m-%d")
-    forecast_end_str = (hist.index[-1] + pd.Timedelta(days=365)).strftime("%Y-%m-%d")
-    hist_start_str = hist.index[0].strftime("%Y-%m-%d")
-
-    hist_x = hist.index.strftime("%Y-%m-%d").tolist()
-    fig.add_trace(go.Scatter(
-        x=hist_x, y=hist.values, mode="lines", name="Historical",
-        line=dict(color=ACCENT, width=2), fill="tozeroy", fillcolor="rgba(0,229,255,0.07)",
-        hovertemplate="%{x|%b %d, %Y}: $%{y:,.2f}<extra></extra>", showlegend=False,
-    ))
-    fig.add_trace(go.Scatter(
-        x=[last_date_str], y=[last_close], mode="markers", showlegend=False,
-        marker=dict(color=TEXT_PRIMARY, size=8, line=dict(color=PANEL, width=1.5)),
-        hovertemplate=f"Current: ${last_close:,.2f}<extra></extra>",
-    ))
-    # Full-width reference line so "current" reads as a constant benchmark
-    # against the whole chart, not just a single pivot dot at the
-    # historical/forecast boundary -- makes it immediate to see where each
-    # fan line sits relative to today's price at a glance, including back
-    # across the historical portion.
-    fig.add_hline(y=last_close, line=dict(color=TEXT_PRIMARY, width=1, dash="dash"), opacity=0.35)
-
-    fan = [("High", high, COLOR_BULLISH), ("Average", mean, ACCENT), ("Low", low, COLOR_BEARISH)]
-    for name, val, color in fan:
-        if val is None or pd.isna(val):
-            continue
-        val = float(val)
-        pct = (val - last_close) / last_close * 100 if last_close else None
-        fig.add_trace(go.Scatter(
-            x=[last_date_str, forecast_end_str], y=[last_close, val], mode="lines",
-            line=dict(color=color, width=1.6, dash="dot"), showlegend=False, hoverinfo="skip",
-        ))
-        # Whole-number percent (not one decimal) specifically to keep this
-        # short enough not to clip against the right edge -- confirmed by
-        # rendering and looking at the actual output: "High $147.39 +139.1%"
-        # was wide enough to get cut off even with a wide right margin.
-        pct_txt = f" {pct:+.0f}%" if pct is not None else ""
-        fig.add_annotation(
-            x=forecast_end_str, y=val, xref="x", yref="y", xanchor="left", yanchor="middle", xshift=8,
-            text=f"<b>{name}</b> ${val:,.2f}{pct_txt}", showarrow=False,
-            font=dict(color=PANEL, size=10), bgcolor=color, bordercolor=color, borderpad=4,
-        )
-
-    fig.update_xaxes(range=[hist_start_str, forecast_end_str], showgrid=False)
-    fig.update_yaxes(title=dict(text="Price ($)", font=dict(color=TEXT_MUTED)))
-    apply_theme(fig, height=height, margin=dict(l=45, r=150, t=15, b=35), showlegend=False,
-                hovermode="x unified")
-    return fig
-
-
-def render_recommendation_breakdown(counts, height=110):
-    """Strong Buy -> Strong Sell is an ordered diverging scale, not a set of
-    independent categories, so this uses opacity steps of the two validated
-    bullish/bearish poles (plus the validated neutral gray for Hold) rather
-    than picking new unvalidated hues for Buy/Sell."""
-    order = [
-        ("strongBuy", "Strong Buy", COLOR_BULLISH),
-        ("buy", "Buy", "rgba(12,163,12,0.55)"),
-        ("hold", "Hold", COLOR_NEUTRAL),
-        ("sell", "Sell", "rgba(230,103,103,0.55)"),
-        ("strongSell", "Strong Sell", COLOR_BEARISH),
-    ]
-    total = sum((counts.get(k) or 0) for k, _, _ in order)
-
-    fig = go.Figure()
-    if total == 0:
-        apply_theme(fig, height=height)
-        return fig
-
-    for key, label, color in order:
-        n = counts.get(key) or 0
-        fig.add_trace(go.Bar(
-            x=[n], y=["Analysts"], orientation="h", name=f"{label} ({n})",
-            marker_color=color, text=[str(n) if n else ""], textposition="inside",
-            insidetextfont=dict(color=PANEL if key in ("strongBuy", "strongSell") else TEXT_PRIMARY, size=11),
-            hovertemplate=f"{label}: {n}<extra></extra>",
-        ))
-
-    fig.update_layout(barmode="stack")
-    fig.update_xaxes(visible=False)
-    fig.update_yaxes(visible=False)
-    apply_theme(fig, height=height, margin=dict(l=10, r=10, t=6, b=6),
-                legend=dict(orientation="h", y=-0.45, bgcolor="rgba(0,0,0,0)", font=dict(size=10)))
-    return fig
 
 
 def render_buyback_chart(history_df, height=220):
@@ -2440,110 +2288,90 @@ def render_firm_tiers_section():
 # supplied by this file.
 # --------------------------------------------------------------------------
 
-FEATURED_STOCK_CHART_CID = "featured_stock_chart"
+# The chart images for the digest are built by charts.py's
+# build_featured_stock_chart_bytes / build_analyst_chart_images /
+# build_swing_chart_image (imported below) -- pure Plotly + kaleido, no
+# Streamlit dependency, so the exact same functions produce the exact same
+# images whether triggered from this UI ("Send Test Email Now"/Preview) or
+# from digest/send.py's headless scheduled path (launchd, no Streamlit
+# process at all). See charts.py's own module docstring.
+# --------------------------------------------------------------------------
 
 
-def render_chart_as_image(fig, width=560, height=380):
-    """Part 2. Converts an existing Plotly figure (e.g. render_price_
-    volume_chart's output, already used unmodified by Ticker Deep-Dive)
-    into static PNG bytes via kaleido -- the standard way to embed a real
-    chart in an HTML email, since email clients can't run Plotly/JS.
-    Returns None (never raises) if kaleido/Chrome isn't available in this
-    environment -- the digest still sends, just without the chart image,
-    rather than failing the whole send over a missing chart dependency."""
-    try:
-        return fig.to_image(format="png", width=width, height=height, scale=2)
-    except Exception as e:
-        print(f"[render_chart_as_image] chart export failed: {e}")
-        return None
-
-
-def _build_featured_stock_chart_bytes(ticker, conn):
-    """Reuses render_price_volume_chart -- the EXACT function Ticker
-    Deep-Dive's own price chart uses, SMA/support-resistance overlay
-    included -- rather than building a second, digest-only chart. Returns
-    (png_bytes_or_None, cid_or_None)."""
-    hist, cfg = fetch_price_history(ticker, DEFAULT_INTERVAL, DEFAULT_LOOKBACK, conn=conn)
-    if hist.empty:
-        return None, None
-    levels = detect_technical_levels(ticker, DEFAULT_INTERVAL, DEFAULT_LOOKBACK, conn=conn)
-    fig, _ = render_price_volume_chart(
-        hist, ticker, short_label="SMA short", long_label="SMA long", height=380, levels=levels,
-    )
-    png_bytes = render_chart_as_image(fig)
-    return (png_bytes, FEATURED_STOCK_CHART_CID) if png_bytes else (None, None)
-
-
-def run_daily_digest_send(conn, force=False, recipient_email=None):
-    """The single orchestration entry point for an actual digest send --
-    called both by the background scan fragment/full-load catch-up (an
-    automatic, schedule-driven send) and by SETTINGS' "Send Test Email
-    Now" button (force=True, immediate, optionally to a not-yet-saved
-    `recipient_email` typed into the input). Builds the Featured Stock
-    section (select_featured_stock + get_featured_stock_section, both
-    data_engine.py, unmodified core logic) and its chart image (this
-    file's own render_price_volume_chart + kaleido) BEFORE calling
-    send_daily_digest_email, so a scheduled automatic send gets the exact
-    same rich newsletter as a manually-triggered test send -- there is no
-    second, thinner "automatic" path.
-
-    `force=False` (the automatic path) first asks should_send_daily_
-    digest_now() -- a pure yes/no decision with no chart/API cost of its
-    own -- and does nothing further unless it says ready, so the
-    (potentially real, billed) AI Briefing call and chart render only
-    ever happen when a send is actually about to go out."""
-    incomplete_reasons = None
-    if not force:
-        decision = should_send_daily_digest_now(conn)
-        if not decision["ready"]:
-            return {"sent": False, "reason": decision["reason"]}
-        incomplete_reasons = decision["incomplete_reasons"]
-
-    featured_stock, chart_bytes, chart_cid = None, None, None
-    featured_ticker = select_featured_stock(conn)
-    if featured_ticker:
-        featured_stock = get_featured_stock_section(featured_ticker, conn)
-        chart_bytes, chart_cid = _build_featured_stock_chart_bytes(featured_ticker, conn)
-
-    result = send_daily_digest_email(
-        conn, recipient_email=recipient_email, force=True, incomplete_reasons=incomplete_reasons,
-        featured_stock=featured_stock, chart_cid=chart_cid,
-        inline_images=({chart_cid: chart_bytes} if chart_bytes else None),
-    )
-    if incomplete_reasons:
-        result["sent_incomplete"] = True
-        result["incomplete_reasons"] = incomplete_reasons
-    return result
+# run_daily_digest_send / run_digests_for_all_users: moved to digest/core.py so digest/send.py's headless
+# launchd path (no Streamlit process) can call the exact same orchestration this UI does -- see that
+# module's docstring. Imported below (top of file) as `from digest.core import ...`.
 
 
 def render_email_digest_section():
-    """📧 EMAIL DIGEST (Parts 1-4 of this feature): in-app config for
-    recipient/schedule/content-selection -- SMTP server credentials
-    (SMTP_HOST/PORT/USER/PASSWORD) remain environment secrets, a real
-    security boundary (this table is just app state on disk; an env var
-    requires server-level access to change). The trigger-mechanism
-    honesty note is surfaced here VERBATIM, not just in code comments,
-    per this feature's own explicit instruction -- there is no real
-    background scheduler behind this, only an in-process check."""
-    st.markdown('<div class="smd-section">📧 EMAIL DIGEST</div>', unsafe_allow_html=True)
+    """📧 EMAIL DIGEST: in-app config for the single global edition's
+    schedule/content-selection -- SMTP server credentials (SMTP_HOST/
+    PORT/USER/PASSWORD) remain environment secrets, a real security
+    boundary (this table is just app state on disk; an env var requires
+    server-level access to change). The trigger-mechanism honesty note is
+    surfaced here VERBATIM, not just in code comments, per this feature's
+    own explicit instruction -- there is no real background scheduler
+    behind this, only an in-process check.
+
+    2026-10-13 single-global-edition rebuild: this is now ONE shared
+    publication, not a per-app-user digest. Schedule/subscriber-list
+    controls below are admin-only (gated on EFFECTIVE_EMAIL being the
+    actual edition-admin account, not just IS_ADMIN -- an admin "viewing
+    as" a non-admin user sees that user's own reduced view, same as that
+    user would). A non-admin account's own email_config row is left in
+    place, unused -- see data_engine._get_edition_admin_email /
+    build_digest_edition's docstrings for why it's hidden, not deleted."""
+    st.markdown('<div class="smd-section">📧 NEWSLETTER</div>', unsafe_allow_html=True)
     conn = get_conn()
-    config = get_email_config(conn)
+    admin_email = _get_edition_admin_email(conn)
+    is_edition_admin = admin_email is not None and EFFECTIVE_EMAIL == admin_email
 
-    st.warning(
-        "Digest checks run only while this dashboard is open in a connected browser tab — an in-process "
-        "check on RUNNERS' own refresh-interval timer, plus a catch-up check on every page load. There is "
-        "no real background scheduler or cron behind this. For a reliable morning send, make sure the app "
-        "is running (or gets opened) around your scheduled send time.",
-        icon="⚠️",
-    )
+    if not is_edition_admin:
+        st.caption(
+            "Smart Money Weekly is a single newsletter with one subscriber list and one admin-controlled "
+            "schedule -- per-account newsletter settings no longer apply here."
+        )
+        all_subs = get_all_subscribers(conn, admin_email) if admin_email else []
+        own = next((x for x in all_subs if x["email"].lower() == (EFFECTIVE_EMAIL or "").lower()), None)
+        if own and not own["unsubscribed"]:
+            st.info(f"**{EFFECTIVE_EMAIL}** is subscribed. Use the \"Manage preferences\" link at the "
+                    f"bottom of any digest email to change which sections you receive or to unsubscribe -- "
+                    f"no login needed there.")
+        elif own:
+            st.caption(f"**{EFFECTIVE_EMAIL}** is not currently subscribed to the newsletter.")
+        else:
+            st.caption("This account isn't on the newsletter's subscriber list.")
+        return
 
-    smtp_configured = all(os.environ.get(v) for v in ("SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASSWORD"))
-    if smtp_configured:
-        st.success("✅ SMTP configured", icon="✅")
+    config = get_email_config(conn, admin_email)
+
+    launchd_installed = _launchd_job_installed()
+    if launchd_installed:
+        st.success(
+            "Scheduled sends run via launchd, every :00 and :30, independent of whether this dashboard is "
+            "open — no browser tab or 'app running' requirement. (This app's own browser-open catch-up "
+            "check still runs too, as a second path, but the launchd job is what makes delivery reliable.)",
+            icon="✅",
+        )
     else:
-        st.warning("⚠️ SMTP not configured — set SMTP_HOST/SMTP_USER/SMTP_PASSWORD environment variables.",
-                   icon="⚠️")
+        st.warning(
+            "Scheduled sends currently depend on this dashboard being open in a connected browser tab around "
+            "your send time — there is no background scheduler running. See SETTINGS → Global settings → "
+            "Digest scheduler (admin) to install the launchd job that removes this dependency.",
+            icon="⚠️",
+        )
 
+    # Whether the SERVER can send email is deployment configuration (SMTP
+    # host/credentials) -- an admin-only concern shown in the ADMIN tab, never
+    # here. A regular user only learns whether sending is available, not how
+    # it's configured.
+    smtp_configured = all(os.environ.get(v) for v in ("SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASSWORD"))
+    if not smtp_configured:
+        st.info("Email sending isn't set up on this server yet. Your newsletter settings are saved and will "
+                "apply once your administrator enables it.", icon="ℹ️")
+
+    # Part 7: last SCHEDULED send shown separately from last TEST send -- the two can never be conflated
+    # since send_daily_digest_email(send_type=) writes to entirely separate columns for each.
     if config["last_send_status"] == "success":
         # Part 3: last_send_error is now ALWAYS a batch-result sentence
         # on a successful send (e.g. "sent to 4 of 5 subscriber(s) — 1
@@ -2551,135 +2379,238 @@ def render_email_digest_section():
         # failure -- one line covers full success, partial, and (below)
         # total failure consistently.
         batch_note = config["last_send_error"] or "sent"
-        st.info(f"✅ Last digest: {batch_note} at {time_ago(config['last_digest_sent_at'])} "
+        st.info(f"✅ Last **scheduled** digest: {batch_note} at {time_ago(config['last_digest_sent_at'])} "
                 f"({config['last_digest_sent_at']}).")
     elif config["last_send_status"] == "failed":
-        st.error(f"❌ Last digest attempt failed — {config['last_send_error']}")
+        st.error(f"❌ Last scheduled digest attempt failed — {config['last_send_error']}")
+    else:
+        st.caption("No scheduled digest has gone out yet.")
+    if config.get("last_test_sent_at"):
+        _test_ok = config.get("last_test_send_status") == "success"
+        st.caption(f"{'✅' if _test_ok else '❌'} Last **test** send: "
+                   f"{config.get('last_test_send_error') or config.get('last_test_send_status')} at "
+                   f"{time_ago(config['last_test_sent_at'])}.")
 
-    enabled = st.toggle("Enable daily digest", value=config["enabled"], key="digest_enabled_toggle")
+    # 2026-10-13: last edition's cost, right here where the admin is already looking at send status.
+    _last_ed = get_last_digest_edition(conn)
+    if _last_ed:
+        st.caption(f"📊 Last edition built: **{_last_ed['edition_date']}** — "
+                   f"{_last_ed['claude_api_calls']} Claude call(s), ${_last_ed['claude_api_cost']:.4f} — "
+                   f"featured **{_last_ed.get('featured_ticker') or '—'}**.")
 
-    # ---- Part 1: full subscriber list manager ----
-    st.markdown("**Subscribers**")
-    st.caption("Real subscriber list -- send_daily_digest_email() sends an INDIVIDUAL email to every row "
-               "below with unsubscribed=0 (never a shared To:/Cc:), each with their own unique unsubscribe "
-               "link/token.")
-    all_subscribers = get_all_subscribers(conn)
+    enabled = st.toggle("Enable newsletter", value=config["enabled"], key=_uk("digest_enabled_toggle"))
+
+    # ---- Subscribers (this account IS the edition admin at this point -- is_edition_admin gated above) ----
+    all_subscribers = get_all_subscribers(conn, admin_email)
     active_count = sum(1 for s in all_subscribers if not s["unsubscribed"])
+    st.markdown("**Subscribers**")
+    st.caption("Each active row below gets its own INDIVIDUAL email (never a shared To:/Cc:) with its own "
+               "unique unsubscribe link and manage-preferences link.")
     st.markdown(f"**Sending to {active_count} active subscriber(s)**")
 
     acol1, acol2 = st.columns([3, 1])
     new_subscriber = acol1.text_input(
-        "Add subscriber", key="digest_add_subscriber_input", placeholder="you@example.com",
+        "Add subscriber", key=_uk("digest_add_subscriber_input"), placeholder="you@example.com",
         label_visibility="collapsed",
     )
-    if acol2.button("+ Add Subscriber", key="digest_add_subscriber_btn", disabled=not new_subscriber.strip(),
-                     width='stretch'):
+    if acol2.button("+ Add Subscriber", key=_uk("digest_add_subscriber_btn"),
+                     disabled=not new_subscriber.strip(), width='stretch'):
         _candidate = new_subscriber.strip()
         if not is_valid_email_format(_candidate):
             st.error(f"'{_candidate}' doesn't look like a valid email address — not added.")
         else:
-            add_email_subscriber(conn, _candidate)
+            add_email_subscriber(conn, admin_email, _candidate)
             st.success(f"Added {_candidate}.")
             st.rerun()
 
     if not all_subscribers:
         st.caption("No subscribers yet -- add one above.")
-    else:
-        for sub in all_subscribers:
-            rcol1, rcol2, rcol3, rcol4 = st.columns([3, 1.3, 1.3, 1])
-            if sub["unsubscribed"]:
-                rcol1.markdown(f"<span style='opacity:0.5;'>{html.escape(sub['email'])}</span>",
-                                unsafe_allow_html=True)
-                rcol2.markdown(f"<span style='opacity:0.5;color:{COLOR_NEUTRAL};'>Unsubscribed "
-                                f"{fmt_date(sub['unsubscribed_at'])}</span>", unsafe_allow_html=True)
-                rcol3.caption(f"joined {fmt_date(sub['subscribed_at'])}")
-                if rcol4.button("Re-subscribe", key=f"digest_resub_{sub['email']}", width='stretch'):
-                    resubscribe_email(conn, sub["email"])
-                    st.rerun()
-            else:
-                rcol1.markdown(f"**{html.escape(sub['email'])}**", unsafe_allow_html=True)
-                rcol2.markdown(f"<span style='color:{COLOR_BULLISH};'>● Active</span>", unsafe_allow_html=True)
-                rcol3.caption(f"joined {fmt_date(sub['subscribed_at'])}")
-                if rcol4.button("Remove", key=f"digest_remove_{sub['email']}", width='stretch'):
-                    remove_email_subscriber(conn, sub["email"])
-                    st.rerun()
-
-    _email_from_env = os.environ.get("EMAIL_FROM")
-    if _email_from_env:
-        st.caption(f"From address: **{_email_from_env}** (set via EMAIL_FROM environment variable — "
-                   f"overrides the field below until that variable is unset).")
-        from_email = _email_from_env
-    else:
-        from_email = st.text_input(
-            "From email (must be a verified sender/domain identity in your SMTP provider)",
-            value=config["from_email"] or DEFAULT_DIGEST_FROM_EMAIL, key="digest_from_email_input",
-            placeholder="digest@yourdomain.com",
-        )
-
+    for sub in all_subscribers:
+        rcol1, rcol2, rcol3, rcol4 = st.columns([3, 1.3, 1.3, 1])
+        if sub["unsubscribed"]:
+            rcol1.markdown(f"<span style='opacity:0.5;'>{html.escape(sub['email'])}</span>",
+                            unsafe_allow_html=True)
+            rcol2.markdown(f"<span style='opacity:0.5;color:{COLOR_NEUTRAL};'>Unsubscribed "
+                            f"{fmt_date(sub['unsubscribed_at'])}</span>", unsafe_allow_html=True)
+            rcol3.caption(f"joined {fmt_date(sub['subscribed_at'])}")
+            if rcol4.button("Re-subscribe", key=_uk(f"digest_resub_{sub['email']}"), width='stretch'):
+                resubscribe_email(conn, admin_email, sub["email"])
+                st.rerun()
+        else:
+            rcol1.markdown(f"**{html.escape(sub['email'])}**", unsafe_allow_html=True)
+            rcol2.markdown(f"<span style='color:{COLOR_BULLISH};'>● Active</span>", unsafe_allow_html=True)
+            rcol3.caption(f"joined {fmt_date(sub['subscribed_at'])}")
+            if rcol4.button("Remove", key=_uk(f"digest_remove_{sub['email']}"), width='stretch'):
+                remove_email_subscriber(conn, admin_email, sub["email"])
+                st.rerun()
+        # 2026-10-13, Part 1.3: per-subscriber section preferences, admin-editable here (the same thing
+        # the subscriber themselves can change via the tokenized "Manage preferences" email link).
+        with st.expander(f"Sections for {sub['email']}", expanded=False):
+            _sub_sections = set(get_subscriber_sections_included(sub))
+            _sec_cols = st.columns(4)
+            _chosen = []
+            for _i, _key in enumerate(DEFAULT_DIGEST_SECTIONS):
+                if _sec_cols[_i % 4].checkbox(
+                    DIGEST_SECTION_LABELS[_key], value=_key in _sub_sections,
+                    key=_uk(f"subsec_{sub['email']}_{_key}"),
+                ):
+                    _chosen.append(_key)
+            if st.button("Save sections", key=_uk(f"subsec_save_{sub['email']}")):
+                set_subscriber_sections_included(conn, sub["unsubscribe_token"], _chosen)
+                st.success("Saved.")
+                st.rerun()
     c3, c4 = st.columns(2)
-    freq_options = ["daily", "weekdays_only", "off"]
-    freq_labels = {"daily": "Daily", "weekdays_only": "Weekdays only", "off": "Off"}
+    freq_options = ["daily", "weekly"]
+    freq_labels = {"daily": "Daily (Mon–Fri)", "weekly": "Weekly"}
+    # legacy stored values: 'weekdays_only' is the same thing as Daily now; 'off' is the toggle above
+    _stored_freq = "weekly" if config["frequency"] == "weekly" else "daily"
     frequency = c3.selectbox(
-        "Frequency", options=freq_options,
-        index=freq_options.index(config["frequency"]) if config["frequency"] in freq_options else 0,
-        format_func=lambda k: freq_labels[k], key="digest_frequency_select",
+        "Frequency", options=freq_options, index=freq_options.index(_stored_freq),
+        format_func=lambda k: freq_labels[k], key=_uk("digest_frequency_select"),
+        help="Never sent on Saturday or Sunday.",
     )
+    _days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    weekly_day = 0
+    if frequency == "weekly":
+        weekly_day = _days.index(st.selectbox(
+            "Weekly send day", _days, index=config["weekly_day"], key=_uk("digest_weekly_day_select"),
+        ))
     try:
         default_time = datetime.strptime(config["send_time_et"] or "07:30", "%H:%M").time()
     except ValueError:
         default_time = dt_time(7, 30)
-    send_time = c4.time_input("Send time (ET)", value=default_time, key="digest_send_time_input")
+    if default_time.minute not in (0, 30):
+        # Migrate a stale (pre-launchd) value UP to the next half-hour -- the headless scheduler (digest/
+        # send.py) only ever checks at :00 and :30, so anything off that grid would silently wait up to ~29
+        # extra minutes every single day. Rounds up, never down, so a send never fires earlier than configured.
+        # Persisted immediately, so this migration only ever runs once per stale value.
+        carry_hours, new_minute = divmod(default_time.minute + (30 - default_time.minute % 30), 60)
+        default_time = dt_time((default_time.hour + carry_hours) % 24, new_minute)
+        save_email_config(conn, admin_email, send_time_et=default_time.strftime("%H:%M"))
+    send_time = c4.time_input(
+        "Send time (ET)", value=default_time, step=timedelta(minutes=30), key=_uk("digest_send_time_input"),
+        help="Scheduled sends are only checked at :00 and :30 (see the launchd digest scheduler in SETTINGS "
+             "-> Global settings), so the picker is limited to those times.",
+    )
 
     c5, c6 = st.columns(2)
     wait_runners = c5.checkbox(
-        "Wait for Runners scan to complete", value=config["wait_for_runners"], key="digest_wait_runners_cb",
+        "Wait for Runners scan to complete", value=config["wait_for_runners"], key=_uk("digest_wait_runners_cb"),
     )
     wait_predictions = c6.checkbox(
         "Wait for Day Predictions to complete", value=config["wait_for_predictions"],
-        key="digest_wait_predictions_cb",
+        key=_uk("digest_wait_predictions_cb"),
     )
 
     st.markdown("**Sections to include**")
+    st.caption("This is now the DEFAULT new subscribers are seeded with at signup -- each subscriber's own "
+               "choice (above, or via their \"Manage preferences\" link) governs what THEY actually receive.")
     included = set(config["sections_included"])
     section_cols = st.columns(4)
     new_included = []
     for i, key in enumerate(DEFAULT_DIGEST_SECTIONS):
         checked = section_cols[i % 4].checkbox(
-            DIGEST_SECTION_LABELS[key], value=key in included, key=f"digest_section_cb_{key}",
+            DIGEST_SECTION_LABELS[key], value=key in included, key=_uk(f"digest_section_cb_{key}"),
         )
         if checked:
             new_included.append(key)
 
-    if st.button("Save Email Digest settings", key="digest_save_settings_btn"):
+    if st.button("Save Email Digest settings", key=_uk("digest_save_settings_btn")):
         _save_kwargs = dict(
-            enabled=enabled, frequency=frequency, send_time_et=send_time.strftime("%H:%M"),
+            enabled=enabled, frequency=frequency, weekly_day=weekly_day, send_time_et=send_time.strftime("%H:%M"),
             wait_for_runners=wait_runners, wait_for_predictions=wait_predictions, sections_included=new_included,
         )
-        if not _email_from_env:
-            # Only touched when the field is actually editable here --
-            # when EMAIL_FROM is set, the field above is hidden/inert, so
-            # leaving from_email out of this call preserves whatever's
-            # already stored instead of overwriting it with None.
-            _save_kwargs["from_email"] = from_email.strip() or None
-        save_email_config(conn, **_save_kwargs)
+        save_email_config(conn, admin_email, **_save_kwargs)
+        # Part 6: keep the admin's healthchecks.io dead-man's-switch schedule in lock-step with whatever was
+        # just saved -- a no-op (logged, not shown here) if HEALTHCHECKS_API_KEY isn't configured.
+        healthchecks.sync_check_schedule(conn, admin_email)
         st.success("Email Digest settings saved.")
         st.rerun()
 
-    ready, reasons = is_daily_digest_ready(conn)
+    ready, reasons = is_daily_digest_ready(conn, admin_email)
     st.caption(f"Readiness right now: {'✅ ready' if ready else '⏳ not ready — ' + ' '.join(reasons)}")
 
-    bcol1, bcol2 = st.columns(2)
-    if bcol1.button("👁️ Preview Today's Digest", key="digest_preview_btn"):
-        st.session_state["_digest_preview_open"] = True
+    with st.expander("⏰ Reliable wake schedule (optional, needs sudo)"):
+        st.caption(
+            "If this Mac can sleep, the launchd digest job (see SETTINGS → Global settings → Digest "
+            "scheduler) can't run while it's asleep. This wakes the machine shortly before your send time so "
+            "it's awake for the tick. Copy the command below into Terminal yourself -- it needs sudo, so "
+            "this app can never run it for you, and it doesn't follow this UI automatically: re-copy it "
+            "any time you change Send time above."
+        )
+        _cmd, _local_time, _tz_name = pmset_wake_command_for(send_time.strftime("%H:%M"))
+        st.code(_cmd, language="bash")
+        st.caption(f"({send_time.strftime('%H:%M')} ET → {_local_time} {_tz_name} on this machine, 10 minutes "
+                   f"before send time.)")
+        st.warning(
+            "This wake WILL NOT happen if: the lid is closed AND the Mac is running on battery (Apple "
+            "disables scheduled wake on battery with the lid closed -- Power Nap/scheduled-wake needs either "
+            "the lid open, or the Mac plugged into AC power). Plug in and/or leave the lid open (or use an "
+            "external display so 'open' isn't required) for this to actually fire overnight.",
+            icon="⚠️",
+        )
+
+    with st.expander("Digest settings"):
+        _ov = get_featured_override(conn, admin_email)
+        _auto_label = "Auto (rule-based)"
+        _pickable = sorted(set(watchlist) | set(get_todays_runner_tickers(conn, admin_email) or []))
+        _options = [_auto_label] + _pickable
+        _pick = st.selectbox(
+            "Featured stock for next digest", _options,
+            index=_options.index(_ov["ticker"]) if (_ov and _ov["ticker"] in _options) else 0,
+            key=_uk("digest_override_select"),
+        )
+        # Defaults to "just the next digest": a forgotten sticky pick would quietly pin the newsletter to a stale
+        # name for weeks.
+        _mode_labels = ["Just the next digest", "Until I change it"]
+        _mode_label = st.radio("Applies to", _mode_labels, index=1 if (_ov and _ov["mode"] == "sticky") else 0,
+                               horizontal=True, key=_uk("digest_override_mode"))
+        if _ov:
+            st.caption(f"Next digest will feature: **{_ov['ticker']}** "
+                       f"({'manual, one-time' if _ov['mode'] == 'once' else 'manual, until changed'}"
+                       f"{', lapses ' + _ov['expires_at'] if _ov.get('expires_at') else ''}).")
+        else:
+            st.caption("Next digest will feature: **auto-selected**.")
+        _c1, _c2 = st.columns(2)
+        if _c1.button("Apply", key=_uk("digest_override_apply")):
+            if _pick == _auto_label:
+                clear_featured_override(conn, admin_email)
+            else:
+                set_featured_override(conn, admin_email, _pick, "once" if _mode_label == _mode_labels[0] else "sticky")
+            st.rerun()
+        if _c2.button("Clear override", key=_uk("digest_override_clear"), disabled=_ov is None):
+            clear_featured_override(conn, admin_email)
+            st.rerun()
+        st.caption("A one-time pick is used by the next scheduled digest only (a test send doesn't use it up) and "
+                   "lapses after 7 days if none goes out; an 'until I change it' pick lapses after 14 days. "
+                   "Takes effect on the NEXT rebuild -- today's already-built edition (if any) keeps its "
+                   "current featured stock until you Rebuild.")
+
+        # 2026-10-14: today's edition (if one already exists) was built BEFORE this override was applied,
+        # so it still shows the old featured stock -- surface that explicitly instead of letting it look
+        # like Apply silently did nothing. Recomputed on every render (not just right after Apply), so it
+        # stays accurate across reruns/page loads too.
+        _today_ed_for_ov = get_digest_edition(conn)
+        if _ov and _today_ed_for_ov and _today_ed_for_ov.get("featured_ticker") != _ov["ticker"]:
+            st.info(f"Today's edition already features **{_today_ed_for_ov.get('featured_ticker') or '—'}**.")
+            if st.button(f"🔁 Rebuild now with {_ov['ticker']}", key=_uk("digest_override_rebuild_now")):
+                st.session_state[_uk("_digest_rebuild_confirm_open")] = True
+                st.rerun()
+            st.caption(f"Or leave it — {_ov['ticker']} will apply to the next edition.")
+
+    bcol1, bcol2, bcol3 = st.columns(3)
+    if bcol1.button("👁️ Preview Today's Digest", key=_uk("digest_preview_btn")):
+        st.session_state[_uk("_digest_preview_open")] = True
     if bcol2.button(
-        "📨 Send Test Email Now", key="digest_send_test_btn",
+        "📨 Send Test Email Now", key=_uk("digest_send_test_btn"),
         disabled=not (smtp_configured and active_count),
-        help="Sends immediately to every active subscriber above over real SMTP (Featured Stock + chart "
-             "included), bypassing the schedule/duplicate-send guard." if smtp_configured
+        help="Sends today's STORED edition (building it first, at most one real Claude call, if it doesn't "
+             "exist yet) to every active recipient over real SMTP, bypassing the schedule/duplicate-send "
+             "guard. Never triggers a second API call if today's edition already exists." if smtp_configured
              else "Set SMTP_HOST/SMTP_USER/SMTP_PASSWORD first.",
     ):
-        with st.spinner("Building today's digest (Featured Stock AI Briefing + chart)..."):
-            result = run_daily_digest_send(conn, force=True)
+        with st.spinner("Loading today's edition (building it if it doesn't exist yet)..."):
+            result = run_daily_digest_send(conn, admin_email, force=True)
         if result.get("sent"):
             st.success(f"Test email sent to: {', '.join(result.get('recipients_sent') or [])}.")
             if result.get("recipients_failed"):
@@ -2687,33 +2618,220 @@ def render_email_digest_section():
         else:
             st.error(f"Send failed: {result.get('reason')}")
         st.rerun()
+    if bcol3.button("🔁 Rebuild today's edition", key=_uk("digest_rebuild_btn"),
+                    help="Forces a fresh build -- a new, real, billed Claude call for the featured stock, "
+                         "even if today's edition already exists. Replaces it for EVERYONE, including "
+                         "anyone who already received today's send."):
+        st.session_state[_uk("_digest_rebuild_confirm_open")] = True
 
-    if st.session_state.get("_digest_preview_open"):
-        with st.expander("👁️ Today's Digest Preview", expanded=True):
-            since_iso = config["last_digest_sent_at"] or (datetime.utcnow() - timedelta(hours=24)).isoformat()
-            with st.spinner("Building preview (Featured Stock AI Briefing + chart)..."):
-                featured_ticker = select_featured_stock(conn)
-                featured_stock = get_featured_stock_section(featured_ticker, conn) if featured_ticker else None
-                chart_bytes, chart_cid = (
-                    _build_featured_stock_chart_bytes(featured_ticker, conn) if featured_ticker else (None, None)
+    if st.session_state.get(_uk("_digest_rebuild_confirm_open")):
+        with st.expander("⚠️ Confirm rebuild", expanded=True):
+            _existing_ed = get_digest_edition(conn)
+            if _existing_ed:
+                st.warning(
+                    f"Today's edition already exists (built {time_ago(_existing_ed['built_at'])}, featured "
+                    f"**{_existing_ed.get('featured_ticker') or '—'}**, ${_existing_ed['claude_api_cost']:.4f} "
+                    f"so far). Rebuilding makes a NEW, real, billed Claude call and replaces it for every "
+                    f"subscriber, including anyone who already received today's send."
                 )
-                preview = build_digest_content(
-                    conn, new_included or DEFAULT_DIGEST_SECTIONS, since_iso,
-                    featured_stock=featured_stock, chart_cid=chart_cid,
-                )
-            st.caption(f"Subject: {preview['subject']}")
-            if preview["market_holiday"]:
-                st.info(f"🎌 Market closed today ({preview['holiday_name']}).")
-            preview_html = preview["html_body"]
+            else:
+                st.info("No edition exists for today yet -- this will build the first one (at most one "
+                        "real, billed Claude call).")
+            _rcol1, _rcol2 = st.columns(2)
+            if _rcol1.button("Continue — rebuild now", key=_uk("digest_rebuild_confirm_btn")):
+                with st.spinner("Rebuilding today's edition..."):
+                    # consume_override=True: a rebuild is the admin deliberately re-picking right now, so a
+                    # one-time override used by THIS rebuild is spent by it -- it must not also apply to
+                    # tomorrow's build. See build_digest_edition's docstring (2026-10-14).
+                    build_digest_edition(conn, force=True, consume_override=True)
+                st.session_state[_uk("_digest_rebuild_confirm_open")] = False
+                st.success("Edition rebuilt.")
+                st.rerun()
+            if _rcol2.button("Cancel", key=_uk("digest_rebuild_cancel_btn")):
+                st.session_state[_uk("_digest_rebuild_confirm_open")] = False
+                st.rerun()
+
+    def _build_substack_payload(edition):
+        """Shared by "Export for Substack" and "Send to Substack" (2026-10-14 fidelity rebuild): re-renders
+        a FRESH, chart-complete html_full for this edition via render_edition_for_recipient -- the SAME
+        zero-API-call, cached-featured_stock re-render real sends use -- with real chart_cid/analyst_cids/
+        swing_cids wired in via the SAME charts.py calls the real email makes. Doesn't read
+        digest_editions.html_full directly: that stored string is built headless inside build_digest_edition
+        (data_engine.py has no plotly dependency) and so never contains the chart <img> tags the real email
+        embeds -- confirmed live (0 "cid:" occurrences in a real stored edition's html_full). Returns
+        (substack_content, images); images is {key: png_bytes} in the SAME order the email renders them,
+        which is also the order export_substack_zip/send_edition_to_substack number/insert them in."""
+        featured_ticker = edition.get("featured_ticker")
+        featured_stock = (edition.get("sections") or {}).get("featured_stock")
+        email_chart_images, chart_cid = {}, None
+        if featured_ticker and featured_stock:
+            chart_bytes, chart_cid = build_featured_stock_chart_bytes(featured_ticker, conn)
             if chart_bytes and chart_cid:
-                # The real email references the chart via a `cid:` MIME
-                # attachment (email-transport-only, unresolvable inside a
-                # sandboxed web iframe) -- swapped here, PREVIEW ONLY, for
-                # a base64 data: URI so this in-app preview can actually
-                # display the same image the email will show.
-                import base64
-                data_uri = f"data:image/png;base64,{base64.b64encode(chart_bytes).decode()}"
-                preview_html = preview_html.replace(f"cid:{chart_cid}", data_uri)
+                email_chart_images[chart_cid] = chart_bytes
+            email_chart_images.update(build_analyst_chart_images(featured_ticker, featured_stock, conn))
+            email_chart_images.update(build_swing_chart_image(featured_stock))
+        fresh = render_edition_for_recipient(conn, edition, DEFAULT_DIGEST_SECTIONS, chart_cid=chart_cid)
+        # build_substack_markdown takes the fresh HTML as an explicit argument (2026-10-14 hardening) --
+        # never reads edition["html_full"] (the build-time-only stored string) itself.
+        content = build_substack_markdown(conn, edition, fresh["html_body"])
+        images = render_substack_image_slots(content["image_slots"], email_chart_images)
+        return content, images
+
+    # ---- Send to Substack (draft only) -- 2026-10-13, Part 2 ----
+    st.markdown("**Substack**")
+    _last_sub_post = get_last_substack_post(conn)
+    if _last_sub_post:
+        st.caption(f"Last Substack post: {time_ago(_last_sub_post['created_at'])} "
+                   f"({_last_sub_post['status']}{' — ' + _last_sub_post['error'] if _last_sub_post.get('error') else ''}).")
+    else:
+        st.caption("No Substack post attempted yet.")
+
+    # 2026-10-14: a read-only auth check, separate from draft creation -- isolates whether a 401 is coming
+    # from the cookie itself (fails at "construction", before any draft code runs) vs. something scoped to
+    # the drafts endpoint specifically (passes construction/get_user_id, fails at "drafts_read"). Never
+    # creates/touches a real draft, never logs or displays the cookie value.
+    if st.button("🔌 Test Substack connection (read-only)", key=_uk("digest_substack_test_btn")):
+        with st.spinner("Checking Substack auth..."):
+            _conn_test = test_substack_connection()
+        if _conn_test["ok"]:
+            st.success(f"✅ Signed in (user_id={_conn_test['user_id']}). Resolved publication: "
+                       f"{_conn_test['resolved_publication_url']}.")
+            if _conn_test["resolved_publication_url"] and "monotrading" not in _conn_test["resolved_publication_url"]:
+                st.warning("This doesn't look like monotrading.substack.com -- check SUBSTACK_PUBLICATION_URL "
+                           "and that the signed-in account owns that publication.")
+        elif _conn_test["stage"] == "not_configured":
+            st.error(_conn_test["error"])
+        elif _conn_test["stage"] == "construction":
+            st.error(f"❌ Auth failed before any draft-specific code ran ({_conn_test['error']}). The cookie "
+                      f"itself is being rejected -- this is a sign-in problem, not specific to draft creation.")
+        else:
+            st.warning(f"⚠️ Signed in OK (user_id={_conn_test.get('user_id')}, publication "
+                        f"{_conn_test.get('resolved_publication_url')}), but a read-only check at stage "
+                        f"'{_conn_test['stage']}' still failed: {_conn_test['error']}. Narrower than a dead "
+                        f"cookie -- likely a permissions/scope gap on that publication, not the sign-in itself.")
+        # Never shows the cookie value itself -- only its shape -- but this is usually enough to tell
+        # "wrong cookie pasted" apart from "right cookie, still rejected."
+        if "cookie_names" in _conn_test:
+            st.caption(f"Cookie names found: {', '.join(_conn_test['cookie_names']) or '(none)'} · "
+                       f"substack.sid: {_conn_test['sid_shape']} (length {_conn_test['sid_value_length']}).")
+            if "substack.lli" not in _conn_test["cookie_names"]:
+                st.caption("⚠️ No `substack.lli` cookie found -- Substack sessions normally need it alongside "
+                           "substack.sid. Add `substack.lli=1` to SUBSTACK_COOKIE if DevTools shows it.")
+
+    _today_sub_post = get_substack_post_for_edition(conn, today_et())
+    scol1, scol2 = st.columns(2)
+    _substack_btn_label = "📤 Already sent to Substack — send again" if _today_sub_post else "📤 Send to Substack (draft)"
+    if scol1.button(_substack_btn_label, key=_uk("digest_substack_btn")):
+        st.session_state[_uk("_digest_substack_confirm_open")] = True
+    if _today_sub_post and scol1.button("Open existing draft", key=_uk("digest_substack_open_btn")):
+        if _today_sub_post.get("draft_url"):
+            st.markdown(f"[Open draft in Substack]({_today_sub_post['draft_url']})")
+        else:
+            st.caption("No draft URL recorded for this post.")
+
+    # Always available, independent of python-substack/API/cookie (Part 2.5) -- built from the already-
+    # built edition's cached data, never a rebuild, never a new Claude call (only cheap, free chart/
+    # headless-browser rendering, same as Preview's own chart-building).
+    _export_edition = get_digest_edition(conn)
+    if _export_edition:
+        with st.spinner("Rendering charts/tables for export (headless browser)..."):
+            _export_content, _export_images = _build_substack_payload(_export_edition)
+        _export_zip = export_substack_zip(_export_content["markdown"], _export_images)
+        scol2.download_button(
+            "⬇️ Export for Substack (.zip)", data=_export_zip,
+            file_name=f"substack_{_export_edition['edition_date']}.zip", mime="application/zip",
+            key=_uk("digest_substack_export_btn"),
+            help="Markdown + numbered PNGs (every section, same order/content as the email) for pasting "
+                 "into Substack by hand -- works even if the unofficial API/cookie isn't set up.",
+        )
+    else:
+        scol2.caption("Build today's edition first (Preview or Send Test) to export.")
+
+    if st.session_state.get(_uk("_digest_substack_confirm_open")):
+        with st.expander("⚠️ Confirm Send to Substack", expanded=True):
+            st.warning(
+                "This creates a DRAFT in Substack — it is never published automatically. Uses today's "
+                "already-built edition (no rebuild, no new Claude call). You'll edit wording and publish "
+                "manually in Substack."
+            )
+            if _today_sub_post:
+                st.error(
+                    f"This edition already has a draft ({time_ago(_today_sub_post['created_at'])}) — "
+                    f"continuing will create ANOTHER draft, not update the existing one."
+                )
+            _sscol1, _sscol2 = st.columns(2)
+            if _sscol1.button("Continue — create draft", key=_uk("digest_substack_confirm_btn")):
+                with st.spinner("Rendering charts/tables and creating the Substack draft..."):
+                    _sub_edition = get_or_build_todays_edition(conn)
+                    _sub_content, _sub_images = _build_substack_payload(_sub_edition)
+                    _result = send_edition_to_substack(conn, _sub_edition, _sub_content["markdown"], _sub_images)
+                st.session_state[_uk("_digest_substack_confirm_open")] = False
+                if _result.get("ok"):
+                    st.success(f"Draft created: {_result.get('draft_url') or _result.get('draft_id')}")
+                else:
+                    st.error(f"Substack send failed: {_result.get('error')}")
+                st.rerun()
+            if _sscol2.button("Cancel", key=_uk("digest_substack_cancel_btn")):
+                st.session_state[_uk("_digest_substack_confirm_open")] = False
+                st.rerun()
+
+    with st.expander("Substack history"):
+        _posts = get_substack_posts(conn)
+        if not _posts:
+            st.caption("No Substack posts yet.")
+        else:
+            st.dataframe(pd.DataFrame([{
+                "Edition": p["edition_date"], "Status": p["status"],
+                "Created": fmt_date(p["created_at"]),
+                "Draft": p["draft_url"] or "—", "Error": p["error"] or "",
+            } for p in _posts]), width='stretch', hide_index=True)
+
+    if st.session_state.get(_uk("_digest_preview_open")):
+        with st.expander("👁️ Today's Digest Preview", expanded=True):
+            with st.spinner("Loading today's edition (building it if it doesn't exist yet)..."):
+                _edition = get_or_build_todays_edition(conn)
+                _featured_stock = (_edition.get("sections") or {}).get("featured_stock")
+                _featured_ticker = _edition.get("featured_ticker")
+                _preview_images, _chart_cid = {}, None
+                if _featured_ticker and _featured_stock:
+                    _chart_bytes, _chart_cid = build_featured_stock_chart_bytes(_featured_ticker, conn)
+                    if _chart_bytes and _chart_cid:
+                        _preview_images[_chart_cid] = _chart_bytes
+                    _preview_images.update(build_analyst_chart_images(_featured_ticker, _featured_stock, conn))
+                    _preview_images.update(build_swing_chart_image(_featured_stock))
+                # Fixed (2026-10-14): this used to read _edition["html_full"] directly -- the STORED HTML,
+                # rendered headless at build time with the TEMPLATE CODE as it existed that moment, and with
+                # chart_cid=None always (data_engine.py has no plotly dependency, so the stored edition never
+                # had a real featured-chart <img> tag to begin with). That meant Preview silently went stale
+                # the instant either the digest template changed (confirmed live: today's Macro Calendar
+                # columns/banners never appeared in Preview until this fix) OR any underlying market data
+                # changed (a CPI actual landing, say) -- while Send Test/the real scheduled send/Substack
+                # export were ALREADY correct, since they all go through render_edition_for_recipient, a
+                # zero-API-call (digest_render_guard-protected) re-render from the edition's own stored
+                # content_json (sections/featured_stock -- the EXPENSIVE, Claude-costed part) against
+                # whatever the CURRENT template code and CURRENT live data say. Routing Preview through the
+                # same function makes it structurally impossible for this to happen again: nothing left reads
+                # digest_editions.html_full for display anywhere in this app -- that column is now only ever
+                # written as a build-time record, never read back as "the truth."
+                _rendered = render_edition_for_recipient(conn, _edition, DEFAULT_DIGEST_SECTIONS, chart_cid=_chart_cid)
+                preview_html = _rendered["html_body"]
+            _preview_ov = get_featured_override(conn, admin_email)
+            _featured_line = f"Featured: {_edition.get('featured_ticker') or '—'} ({_edition.get('featured_source') or 'auto'})"
+            if _preview_ov and _preview_ov["ticker"] != _edition.get("featured_ticker"):
+                _featured_line += f" — {_preview_ov['ticker']} pending, applies on next rebuild"
+            st.caption(f"Subject: {_edition['subject']}  ·  edition {_edition['edition_date']}  ·  "
+                       f"built {time_ago(_edition['built_at'])}  ·  "
+                       f"{_edition['claude_api_calls']} Claude call(s), ${_edition['claude_api_cost']:.4f}  ·  "
+                       f"rendered live from this data just now")
+            st.caption(_featured_line)
+            # The real email references its charts via `cid:` MIME attachments
+            # (email-transport-only, unresolvable inside a sandboxed web
+            # iframe) -- swapped here, PREVIEW ONLY, for base64 data: URIs so
+            # this in-app preview can display the same images the email will.
+            import base64
+            for _cid, _png in _preview_images.items():
+                data_uri = f"data:image/png;base64,{base64.b64encode(_png).decode()}"
+                preview_html = preview_html.replace(f"cid:{_cid}", data_uri)
             # A genuine sandboxed iframe (not st.markdown) since html_body
             # is a full standalone <html><body> document -- exactly the
             # bytes the real email client would render, not a fragment
@@ -2721,11 +2839,129 @@ def render_email_digest_section():
             st.components.v1.html(preview_html, height=700, scrolling=True)
 
 
+_TICKER_RE = re.compile(r"^[A-Z0-9.\-^=]{1,10}$")
+MAX_WATCHLIST_SIZE = 50  # every ticker costs real shared-API calls in full_refresh
+
+
+def render_user_watchlist_section():
+    st.markdown('<div class="smd-section">WATCHLIST</div>', unsafe_allow_html=True)
+    st.caption("Comma-separated tickers. Saved to your account — persists across restarts and sign-ins.")
+    wcol1, wcol2 = st.columns([3, 1])
+    with wcol1:
+        wl_text = st.text_area(
+            "Tickers", value=", ".join(watchlist),
+            label_visibility="collapsed", height=80, key=_uk("wl_textarea"),
+        )
+    with wcol2:
+        if st.button("Save", width='stretch', key=_uk("wl_save")):
+            parsed = [t.strip().upper() for t in wl_text.split(",") if t.strip()]
+            bad = [t for t in parsed if not _TICKER_RE.match(t)]
+            if bad:
+                st.error(f"Not valid ticker symbol(s): {', '.join(bad)}")
+            elif len(set(parsed)) > MAX_WATCHLIST_SIZE and not IS_ADMIN:
+                st.error(f"Watchlists are limited to {MAX_WATCHLIST_SIZE} tickers.")
+            else:
+                save_watchlist(get_conn(), EFFECTIVE_EMAIL, parsed or DEFAULT_STARTER_WATCHLIST)
+                st.rerun()
+        if st.button("Reset to default", width='stretch', key=_uk("wl_reset")):
+            save_watchlist(get_conn(), EFFECTIVE_EMAIL, DEFAULT_STARTER_WATCHLIST)
+            st.rerun()
+
+
+def render_user_entry_zones_section():
+    st.markdown('<div class="smd-section">ENTRY ZONES</div>', unsafe_allow_html=True)
+    st.caption("Auto-derived for each ticker on your watchlist (see the 📍 WATCHLIST SIGNALS tab for the full "
+               "reasoning). Recompute here to force a fresh derivation for all of them.")
+    conn = get_conn()
+    zones = {z["ticker"]: z for z in get_entry_zones(conn, EFFECTIVE_EMAIL)}
+    rows = []
+    for t in watchlist:
+        z = zones.get(t)
+        if z is None:
+            rows.append({"Ticker": t, "Entry zone": "—", "Status": "not computed yet", "Target": "—", "Computed": "—"})
+            continue
+        rng = f"${z['entry_low']:.2f}-${z['entry_high']:.2f}" if z.get("entry_low") is not None else "—"
+        tgt = f"${z['implied_target_price']:.2f}" if z.get("implied_target_price") is not None else "—"
+        rows.append({"Ticker": t, "Entry zone": rng, "Status": (z.get("last_zone_status") or "—").replace("_", " "),
+                     "Target": tgt, "Computed": fmt_date(z.get("computed_at")) if z.get("computed_at") else "—"})
+    st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
+    if st.button("🔄 Recompute all entry zones", key=_uk("settings_recompute_all_zones")):
+        with st.spinner("Recomputing..."):
+            for t in watchlist:
+                refresh_entry_zone(conn, EFFECTIVE_EMAIL, t, force_refresh=True)
+        st.rerun()
+
+
+def _on_settings_refresh_change():
+    value = st.session_state[_uk("settings_refresh_interval")]
+    save_runners_refresh_interval(get_conn(), EFFECTIVE_EMAIL, value)
+    # Keep the RUNNERS tab's own widget (same underlying preference) in
+    # step, so it doesn't later "correct" the saved value back.
+    st.session_state[_uk("runners_refresh_interval")] = value
+    st.session_state[_uk("_runners_refresh_interval_saved")] = value
+
+
+def render_user_refresh_and_chart_prefs_section():
+    conn = get_conn()
+    st.markdown('<div class="smd-section">REFRESH INTERVALS</div>', unsafe_allow_html=True)
+    saved_interval = load_runners_refresh_interval(conn, EFFECTIVE_EMAIL)
+    if _uk("settings_refresh_interval") not in st.session_state:
+        st.session_state[_uk("settings_refresh_interval")] = saved_interval
+    st.selectbox(
+        "Auto-refresh interval (RUNNERS Day Predictions + background signals scan)",
+        RUNNERS_REFRESH_INTERVAL_OPTIONS, key=_uk("settings_refresh_interval"), on_change=_on_settings_refresh_change,
+        help="'On demand' only updates when you interact with the page. Saved to your account.",
+    )
+
+    st.markdown('<div class="smd-section">TIMEFRAME & CHART DEFAULTS</div>', unsafe_allow_html=True)
+    st.caption("The interval / lookback / refresh a price chart starts with (FUNDAMENTALS, TICKER DEEP-DIVE). "
+               "You can still change them on any chart.")
+    cur = load_chart_defaults(conn, EFFECTIVE_EMAIL)
+    ccol1, ccol2, ccol3 = st.columns(3)
+    new_interval = ccol1.selectbox("Default interval", INTERVAL_OPTIONS, index=INTERVAL_OPTIONS.index(cur["interval"]),
+                                   key=_uk("settings_chart_interval"))
+    new_lookback = ccol2.selectbox("Default lookback", LOOKBACK_OPTIONS, index=LOOKBACK_OPTIONS.index(cur["lookback"]),
+                                   key=_uk("settings_chart_lookback"))
+    new_refresh = ccol3.selectbox("Default refresh", CHART_REFRESH_OPTIONS,
+                                  index=CHART_REFRESH_OPTIONS.index(cur["refresh"]), key=_uk("settings_chart_refresh"))
+    if st.button("Save chart defaults", key=_uk("settings_chart_save")):
+        save_chart_defaults(conn, EFFECTIVE_EMAIL, new_interval, new_lookback, new_refresh)
+        # Drop live chart widget state so the new defaults apply immediately.
+        for _k in [k for k in st.session_state.keys()
+                   if k.split("::")[0].endswith(("_interval", "_lookback", "_refresh"))
+                   and k.startswith(("fund_", "dd_"))]:
+            del st.session_state[_k]
+        st.success("Chart defaults saved.")
+        st.rerun()
+
+
 def render_settings_tab():
-    """SETTINGS tab: full source registry (more room than the sidebar ever
-    had), watchlist configuration, and a manual recheck-all button. Both
-    System Status and Configure Watchlist used to live in the sidebar --
-    moved here so all configuration lives in one place."""
+    """SETTINGS -- PER-USER scope only: this user's watchlist, entry zones,
+    newsletter, refresh intervals and chart defaults. Deliberately contains
+    NOTHING global: no data-source registry, API keys, SMTP, firm tiers or
+    other users' data (those live in the admin-only ADMIN tab, which is
+    not even rendered for role='user'). For an admin using "View as user",
+    this tab shows -- and edits -- THAT user's settings (EFFECTIVE_EMAIL)."""
+    if EFFECTIVE_EMAIL != ACTOR_EMAIL:
+        st.warning(f"⚠️ You are viewing and editing **{EFFECTIVE_EMAIL}**'s settings as an administrator.", icon="👁️")
+    render_user_watchlist_section()
+    render_user_entry_zones_section()
+    render_email_digest_section()
+    render_user_refresh_and_chart_prefs_section()
+    if IS_ADMIN:
+        # Admins ALSO get every original (global) setting, in this same tab, below the per-user ones.
+        # Rendered only here (not also in the ADMIN tab) so widget keys can't collide.
+        st.markdown("<hr style='margin:28px 0 8px 0;border-color:#00d4ff55;'>", unsafe_allow_html=True)
+        st.markdown('<div class="smd-section">⚙️ ADMIN — GLOBAL SETTINGS (shared by all users)</div>',
+                    unsafe_allow_html=True)
+        st.caption("Data-source registry, news feeds, SMTP/API keys, firm tiers, reconciliation, backtests and "
+                   "calibration. Visible to admins only; these apply to everyone and are not affected by "
+                   "'View as user'.")
+        render_admin_global_settings()
+
+
+def render_source_registry_section():
+    """ADMIN ONLY. The data-source health registry (global, shared)."""
     st.markdown('<div class="smd-section">SOURCE REGISTRY</div>', unsafe_allow_html=True)
     health = get_health()
     registry = get_full_registry()
@@ -2779,30 +3015,114 @@ def render_settings_tab():
     st.dataframe(pd.DataFrame(reg_rows), width='stretch', hide_index=True)
     st.caption(f"Checked at {registry.get('checked_at', '—')}")
 
-    render_news_feeds_section()
 
-    st.markdown('<div class="smd-section">WATCHLIST</div>', unsafe_allow_html=True)
-    st.caption(
-        "Comma-separated tickers. Saved to watchlist.json — persists across restarts "
-        "instead of resetting to a hardcoded list."
-    )
-    wcol1, wcol2 = st.columns([3, 1])
-    with wcol1:
-        wl_text = st.text_area(
-            "Tickers", value=", ".join(st.session_state.watchlist),
-            label_visibility="collapsed", height=80, key="wl_textarea",
+def _env_status(name):
+    return "✅ set" if os.environ.get(name) else "❌ not set"
+
+
+def render_smtp_and_api_keys_section():
+    """ADMIN ONLY. SMTP configuration + API-key status (presence only --
+    secret VALUES are never displayed anywhere in the app) + the global
+    sender identity."""
+    conn = get_conn()
+    st.markdown('<div class="smd-section">SMTP & SENDER</div>', unsafe_allow_html=True)
+    smtp_rows = [{"Setting": v, "Status": _env_status(v)} for v in
+                 ("SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASSWORD")]
+    st.dataframe(pd.DataFrame(smtp_rows), width='stretch', hide_index=True)
+    if all(os.environ.get(v) for v in ("SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASSWORD")):
+        st.success("✅ SMTP configured", icon="✅")
+    else:
+        st.warning("⚠️ SMTP not configured — set SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASSWORD environment "
+                   "variables. No user's digest can be sent until then.", icon="⚠️")
+    _email_from_env = os.environ.get("EMAIL_FROM")
+    if _email_from_env:
+        st.caption(f"From address: **{_email_from_env}** (set via the EMAIL_FROM environment variable — "
+                   f"overrides the field below until that variable is unset).")
+    else:
+        stored_from = get_app_setting(conn, "from_email") or DEFAULT_DIGEST_FROM_EMAIL
+        new_from = st.text_input(
+            "Sender (From) address — must be a verified sender/domain identity in your SMTP provider. "
+            "Applies to every user's digest.",
+            value=stored_from, key="admin_from_email_input", placeholder="digest@yourdomain.com",
         )
-    with wcol2:
-        if st.button("Save", width='stretch', key="wl_save"):
-            parsed = [t.strip().upper() for t in wl_text.split(",") if t.strip()]
-            st.session_state.watchlist = save_watchlist(parsed or DEFAULT_STARTER_WATCHLIST)
-            st.rerun()
-        if st.button("Reset to default", width='stretch', key="wl_reset"):
-            st.session_state.watchlist = save_watchlist(DEFAULT_STARTER_WATCHLIST)
+        new_name = st.text_input(
+            "Sender display name — shown in the inbox as “Name <address>”.",
+            value=get_app_setting(conn, "from_name") or de.DEFAULT_DIGEST_FROM_NAME, key="admin_from_name_input",
+        )
+        if st.button("Save sender address", key="admin_from_email_save"):
+            set_app_setting(conn, "from_email", new_from.strip() or DEFAULT_DIGEST_FROM_EMAIL)
+            set_app_setting(conn, "from_name", new_name.strip() or de.DEFAULT_DIGEST_FROM_NAME)
+            st.success("Sender saved.")
             st.rerun()
 
+    st.markdown('<div class="smd-section">API KEYS</div>', unsafe_allow_html=True)
+    st.caption("Presence only — key values are never shown. Set them in the server environment (setup_env.sh).")
+    key_rows = [{"Variable": v, "Used for": purpose, "Status": _env_status(v)} for v, purpose in (
+        ("ANTHROPIC_API_KEY", "AI Briefing (paid, on-demand; one shared cache for all users)"),
+        ("QUIVER_API_KEY", "Congressional trades via QuiverQuant (paid)"),
+        ("FRED_API_KEY", "Fed funds rate / macro calendar"),
+        ("OPENAI_API_KEY", "Optional"),
+        ("BOOTSTRAP_ADMIN_EMAIL", "First-admin gate (only consulted while the users table is empty)"),
+        ("APP_PUBLIC_URL", "Base URL used in emailed unsubscribe links"),
+        ("HEALTHCHECKS_API_KEY", "Digest dead-man's-switch (healthchecks.io) -- see Digest scheduler below"),
+    )]
+    st.dataframe(pd.DataFrame(key_rows), width='stretch', hide_index=True)
+
+
+def _launchd_job_installed():
+    """True if the headless digest launchd job is currently loaded (`launchctl print`/`list`), False if not
+    OR if launchctl itself isn't available (e.g. not macOS, or this process can't reach launchd) -- fails
+    soft either way, never raises, since this is purely informational."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["launchctl", "list", "com.smartmoney.digest"], capture_output=True, timeout=5,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def render_digest_scheduler_section():
+    """ADMIN ONLY. Install status + instructions for the headless launchd digest scheduler (digest/send.py,
+    `python -m digest.send`) -- this is a one-time, per-machine setup step (unlike Send time/Frequency,
+    which every user controls for themselves and which take effect immediately with no plist changes)."""
+    st.markdown('<div class="smd-section">DIGEST SCHEDULER (launchd)</div>', unsafe_allow_html=True)
+    st.caption(
+        "Runs the daily digest headlessly (`python -m digest.send`, no Streamlit/browser needed) every :00 "
+        "and :30, all day. Each user's own Send time/Frequency/'Wait for...' settings (in their own "
+        "SETTINGS → Newsletter) decide what actually goes out on any given tick -- nothing about timing "
+        "lives in the scheduler itself, so this only needs to be installed ONCE per machine, never touched "
+        "again after that."
+    )
+    if _launchd_job_installed():
+        st.success("✅ Installed and loaded (`com.smartmoney.digest`).", icon="✅")
+    else:
+        st.warning("⚠️ Not installed — scheduled sends currently depend on a browser tab being open.", icon="⚠️")
+    st.markdown("**Install / reinstall** (run in Terminal, from the project directory):")
+    st.code("./digest/install_launchd.sh", language="bash")
+    st.markdown("**Uninstall:**")
+    st.code("./digest/uninstall_launchd.sh", language="bash")
+    st.markdown("**Verify it's loaded:**")
+    st.code("launchctl list | grep smartmoney", language="bash")
+    st.markdown("**Watch the logs:**")
+    st.code(f"tail -f {os.getcwd()}/digest/logs/digest.out.log", language="bash")
+    st.caption(
+        "The wake-schedule (`pmset`) command needed for this to fire even while the Mac would otherwise "
+        "sleep is shown per-user in SETTINGS → Newsletter → 'Reliable wake schedule' (it needs sudo, so it "
+        "can never be run automatically). If different users have different Send times, use the EARLIEST "
+        "enabled one for the machine's wake schedule -- pmset only supports one repeating wake time at "
+        "once, so the machine must be awake for the earliest of everyone's ticks."
+    )
+
+
+def render_admin_global_settings():
+    """ADMIN ONLY. Everything global/shared that used to sit in SETTINGS."""
+    render_source_registry_section()
+    render_news_feeds_section()
+    render_smtp_and_api_keys_section()
+    render_digest_scheduler_section()
     render_firm_tiers_section()
-    render_email_digest_section()
 
     st.markdown('<div class="smd-section">EARNINGS SIMULATOR TRACK RECORD</div>', unsafe_allow_html=True)
     if st.button("🔄 Reconcile Predictions", key="reconcile_predictions_btn"):
@@ -3306,7 +3626,7 @@ def render_earnings_simulator_tab():
                 f'</div>'
             )
 
-            st.markdown(f"""
+            st.markdown(md_safe(f"""
             <div class="smcard">
               <div style="display:flex;justify-content:space-between;align-items:baseline;">
                 <div style="font-size:15px;font-weight:700;color:{TEXT_PRIMARY};">
@@ -3318,7 +3638,7 @@ def render_earnings_simulator_tab():
               <div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:4px;">{"".join(badges_html)}</div>
               {greeks_html}
             </div>
-            """, unsafe_allow_html=True)
+            """), unsafe_allow_html=True)
 
             if not analysis:
                 st.caption("Not enough data to simulate this contract (missing price/IV/DTE).")
@@ -3396,45 +3716,64 @@ _MACRO_IMPACT_BADGE = {
 }
 
 
+def render_macro_release_banner(conn):
+    """Spec item 5a/5b -- rendered once, at the very top of the page (right after the header, above every
+    tab). Reads the SAME get_macro_release_banner_state the digest's pre-release callout reads, so the two
+    can never disagree. Display only -- the one-time alert EMAIL is sent separately by
+    check_and_send_macro_release_alerts (called at the dashboard's existing full-load catch-up, see below),
+    not from here; this banner can show a post-release surprise even on a day no email went out for it
+    (e.g. an ambiguous-direction release)."""
+    state = get_macro_release_banner_state(conn)
+    if state.get("pre_release"):
+        st.warning(state["pre_release"]["text"])
+    if state.get("post_release"):
+        post = state["post_release"]
+        if post["direction"] == "risk_off":
+            st.error(post["text"])
+        else:
+            st.warning(post["text"])
+
+
 def render_macro_calendar_tab():
     """MACRO CALENDAR tab (Part 4) -- standalone, ticker-agnostic event
-    log: officially scheduled economic/Fed releases only (FRED + the
-    Fed's published FOMC calendar). Deliberately out of scope: unscheduled
-    events (political press conferences, ad hoc announcements, tariff
-    timing) -- no reliable structured free source exists for those; NEWS
-    and the AI Briefing's catalyst detection cover them once they occur
+    log: officially scheduled economic/Fed releases only (TradingView's
+    unofficial economic-calendar endpoint + ForexFactory fallback for
+    forecast/previous, the Fed's published FOMC calendar, and FRED when
+    FRED_API_KEY is set -- kept as-is, used only as a cross-check against
+    TradingView's actuals, never removed). Deliberately out of scope:
+    unscheduled events (political press conferences, ad hoc announcements,
+    tariff timing) -- no reliable structured free source exists for those;
+    NEWS and the AI Briefing's catalyst detection cover them once they occur
     or are formally announced.
 
     One wide, chronologically-sorted table for the selected window --
-    date/time ET, event name, impact badge, prior/forecast/actual, and
-    watchlist-relevance tags (get_watchlist_relevant_tickers) all in one
-    row per event, no truncation. (An earlier day-column grid version
-    packed 3 st.metric() blocks into 1/5th-page-width columns and was
-    unreadably cramped in practice -- replaced.) forecast_value is
-    always shown as "—" for FRED-sourced events -- FRED has no
-    consensus/forecast concept, only actuals and release dates, and
-    pretending otherwise would be exactly the kind of fabrication this
-    app avoids everywhere else."""
+    date/time ET, event name, impact badge, prior/forecast/actual, surprise
+    (vs. MACRO_DIRECTION_MAP's per-indicator hot/cold call), CPI market odds
+    (get_cpi_bracket_odds, CPI rows only), and watchlist-relevance tags
+    (get_watchlist_relevant_tickers), no truncation. (An earlier day-column
+    grid version packed 3 st.metric() blocks into 1/5th-page-width columns
+    and was unreadably cramped in practice -- replaced.) Any value with no
+    real source yet (no forecast landed, FOMC's no-forecast-concept, or no
+    matching Polymarket bracket) shows "—" -- never fabricated."""
     st.markdown('<div class="smd-section">MACRO CALENDAR</div>', unsafe_allow_html=True)
     st.caption(
-        "Officially scheduled economic/Fed releases only, from FRED and the Federal Reserve's published "
-        "FOMC calendar. Unscheduled events (political press conferences, ad hoc announcements, tariff "
-        "timing) are covered by the NEWS tab and the AI Briefing's catalyst detection once they occur or "
-        "are formally announced — this calendar has no reliable free source for those."
+        "Officially scheduled economic/Fed releases only, from TradingView's economic calendar "
+        "(forecast/previous/actual, no key needed), ForexFactory (forecast/previous fallback), the "
+        "Federal Reserve's published FOMC calendar, and FRED when FRED_API_KEY is set (cross-check only). "
+        "Unscheduled events (political press conferences, ad hoc announcements, tariff timing) are covered "
+        "by the NEWS tab and the AI Briefing's catalyst detection once they occur or are formally announced "
+        "— this calendar has no reliable free source for those."
     )
     conn = get_conn()
 
     hcol1, hcol2 = st.columns([1, 3])
     if hcol1.button("🔄 Refresh Calendar", key="macro_calendar_refresh"):
-        with st.spinner("Fetching FRED release schedule + FOMC dates..."):
+        with st.spinner("Fetching TradingView/ForexFactory/FOMC/FRED calendar data..."):
             cached_macro_events(conn, force_refresh=True)
         st.rerun()
     events = cached_macro_events(conn)
     if not events:
-        st.warning(
-            "No macro events on record yet — click 🔄 Refresh Calendar. If it stays empty, check "
-            "FRED_API_KEY in SETTINGS' source registry (fred_api row)."
-        )
+        st.warning("No macro events on record yet — click 🔄 Refresh Calendar.")
         return
 
     fcol1, fcol2, fcol3 = st.columns(3)
@@ -3474,9 +3813,11 @@ def render_macro_calendar_tab():
     # scrolls naturally for a long window, and stays scannable.
     upcoming_sorted = sorted(upcoming, key=lambda e: (e["scheduled_date"], e["scheduled_time_et"] or ""))
     st.caption(
-        f"{len(upcoming_sorted)} event(s), {today.isoformat()} to {window_end.isoformat()}. Forecast is always "
-        f"blank for FRED-sourced events (CPI/PCE/NFP/GDP/Retail Sales/Jobless Claims) — FRED has no consensus/"
-        f"forecast concept, only actuals and release dates."
+        f"{len(upcoming_sorted)} event(s), {today.isoformat()} to {window_end.isoformat()}. Forecast/Actual come "
+        f"from TradingView (ForexFactory fills a missing forecast for the current week only); FOMC rate "
+        f"decisions have no forecast concept and always show \"—\" there. Surprise is blank until both a real "
+        f"forecast and actual exist for that release. Market odds is CPI-only (real Polymarket bracket markets); "
+        f"a ⚠ next to an event name means FRED's own actual disagreed with TradingView's beyond rounding."
     )
     table_rows = []
     for ev in upcoming_sorted:
@@ -3487,12 +3828,40 @@ def render_macro_calendar_tab():
         # this table cell alone was getting cut off by the long SEP
         # suffix regardless of column width.
         display_name = ev["event_name"].replace(" + Summary of Economic Projections", " (+SEP)")
+        if ev.get("fred_mismatch"):
+            display_name += " ⚠"
+
+        # Macro Calendar upgrade -- Surprise + Market odds, purely additive columns. surprise_direction is
+        # None for anything without BOTH a real forecast and actual (FOMC, and any TradingView/FRED series
+        # still awaiting its release) -- shown as "—", never guessed.
+        surprise_txt = "—"
+        direction = ev.get("surprise_direction")
+        if direction and ev.get("surprise") is not None:
+            sign = "+" if ev["surprise"] > 0 else ""
+            unit_suffix = "pp" if ev.get("unit") == "%" else ""
+            if direction == "ambiguous":
+                surprise_txt = f"🟡 {sign}{ev['surprise']:g}{unit_suffix}"
+            elif direction == "in_line":
+                surprise_txt = f"⚪ {sign}{ev['surprise']:g}{unit_suffix} (in line)"
+            else:
+                dot_color = "🔴" if direction == "risk_off" else "🟢"
+                surprise_txt = f"{dot_color} {sign}{ev['surprise']:g}{unit_suffix}"
+
+        odds_txt = "—"
+        series_key = ev.get("series_key")
+        if series_key and "cpi" in series_key and ev.get("forecast_raw") is not None:
+            odds = get_cpi_bracket_odds(conn, series_key, ev["scheduled_date"], ev["forecast_raw"])
+            if odds and odds.get("thin_market"):
+                odds_txt = "thin market"
+            elif odds:
+                odds_txt = f"{odds['hotter_pct']:.0f}% hotter / {odds['cooler_pct']:.0f}% cooler"
+
         table_rows.append({
             "Date": ev["scheduled_date"], "Day": pd.Timestamp(ev["scheduled_date"]).strftime("%a"),
             "Time (ET)": _format_et_time_12h(ev["scheduled_time_et"]) or "—",
             "Event": display_name, "Impact": f"{dot} {ev['impact_level']}",
             "Prior": ev.get("prior_value") or "—", "Forecast": ev.get("forecast_value") or "—",
-            "Actual": ev.get("actual_value") or "—",
+            "Actual": ev.get("actual_value") or "—", "Surprise": surprise_txt, "Market odds": odds_txt,
             "Relevant to your watchlist": ", ".join(relevant) if relevant else "—",
         })
     # Explicit pixel widths, not "small"/"medium"/"large" -- those still
@@ -3512,6 +3881,8 @@ def render_macro_calendar_tab():
             "Prior": st.column_config.TextColumn(width="small"),
             "Forecast": st.column_config.TextColumn(width="small"),
             "Actual": st.column_config.TextColumn(width="small"),
+            "Surprise": st.column_config.TextColumn(width="small"),
+            "Market odds": st.column_config.TextColumn(width=150),
             "Event": st.column_config.TextColumn(width=320),
             "Relevant to your watchlist": st.column_config.TextColumn(width=280),
         },
@@ -3569,13 +3940,13 @@ def render_swing_verdict_panel(ticker, conn, forecast, horizon_days):
     mode_label = {"raw_pattern": "Mode 1: raw pattern", "bayesian": "Mode 2: Bayesian",
                   "trained_model": "Mode 3: trained model"}.get(forecast["mode"], forecast["mode"])
     backtest_n = forecast.get("backtest_n") or 0
-    st.markdown(
+    st.markdown(md_safe(
         f"**{dot} {forecast['predicted_direction']}** — {ticker} target ${forecast['target_price']:.2f} "
         f"({move_pct:+.2f}%) by {forecast['target_date']} ({horizon_days} trading days). {mode_label} "
         f"({backtest_n} reconciled {horizon_days}-day session(s) on record"
         + (f", avg |error| {forecast['backtest_error_pct']:.2f}%" if forecast.get("backtest_error_pct") is not None else "")
         + ")."
-    )
+    ))
 
     reasoning = []
     if not forecast.get("briefing_inputs"):
@@ -3790,7 +4161,7 @@ def render_swing_strategy_section(ticker, conn, forecast, horizon_days):
             f'<span>Vega: <b style="color:{TEXT_PRIMARY};">{vega_txt}</b></span>'
             f'</div>'
         )
-        st.markdown(f"""
+        st.markdown(md_safe(f"""
         <div class="smcard">
           <div style="display:flex;justify-content:space-between;align-items:baseline;">
             <div style="font-size:15px;font-weight:700;color:{TEXT_PRIMARY};">
@@ -3802,7 +4173,7 @@ def render_swing_strategy_section(ticker, conn, forecast, horizon_days):
           <div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:4px;">{"".join(badges_html)}</div>
           {greeks_html}
         </div>
-        """, unsafe_allow_html=True)
+        """), unsafe_allow_html=True)
 
         analysis = analyze_swing_contract(ticker, conn, c, forecast, market=market)
         if not analysis:
@@ -4013,11 +4384,48 @@ def render_swing_forecast_tab():
 
 _ZONE_STATUS_STYLE = {
     "in_zone": ("IN ZONE", COLOR_BULLISH),
-    "above": ("ABOVE ZONE", COLOR_RETAIL),
-    "below": ("BELOW ZONE", COLOR_NEUTRAL),
+    "near": ("NEAR", COLOR_RETAIL),
+    "above": ("ABOVE", COLOR_NEUTRAL),
+    "below": ("BELOW", COLOR_NEUTRAL),
     "no_zone": ("NO ZONE", COLOR_NEUTRAL),
-    None: ("NOT YET COMPUTED", COLOR_NEUTRAL),
+    None: ("PENDING", COLOR_NEUTRAL),
 }
+_ZONE_NEAR_THRESHOLD_PCT = 3.0  # display-only reclassification: 'above'/'below' within this % of the
+                                 # zone edge reads as NEAR instead -- last_zone_status itself (DB) is
+                                 # untouched, this only changes how it's grouped/colored in this table.
+
+_ANCHOR_SHORT_LABEL = {
+    "swing_support": "{touches}-touch support",
+    "volume_node": "volume node",
+    "current_price_fallback": "⚠ placeholder",
+    None: "—",
+}
+
+
+def _zone_display_status(real_status, distance_pct):
+    """real_status ('in_zone'/'above'/'below'/'no_zone'/None, from check_entry_zones -- unchanged) plus
+    this row's own distance_pct decide the DISPLAY status only ('near' is not a real last_zone_status
+    value, purely a dense-overview grouping)."""
+    if real_status in ("above", "below") and distance_pct is not None and distance_pct < _ZONE_NEAR_THRESHOLD_PCT:
+        return "near"
+    return real_status
+
+
+def _zone_distance_pct(real_status, price, entry_low, entry_high):
+    """% from the nearest zone edge -- None when in zone (nothing to measure) or data's missing."""
+    if real_status not in ("above", "below") or price is None or not entry_low or not entry_high:
+        return None
+    if real_status == "above":
+        return (price - entry_high) / entry_high * 100.0
+    return (entry_low - price) / entry_low * 100.0
+
+
+def _anchor_short_label(anchor_kind, anchor_touches):
+    label = _ANCHOR_SHORT_LABEL.get(anchor_kind, _ANCHOR_SHORT_LABEL[None])
+    if anchor_kind == "swing_support":
+        label = label.format(touches=anchor_touches if anchor_touches is not None else "?")
+    return label
+
 
 _RATING_SIGNAL_STYLE = {
     "UPGRADE": ("UPGRADE", COLOR_BULLISH),
@@ -4025,6 +4433,33 @@ _RATING_SIGNAL_STYLE = {
     "MIXED": ("MIXED", COLOR_RETAIL),
     "QUIET": ("QUIET", COLOR_NEUTRAL),
 }
+
+
+def _collapse_repeat_reiterations(actions):
+    """Display-only collapsing (2026-09-25 fix) for the expanded rating-changes table: repeated
+    reiterations from the SAME firm, at the SAME grade (e.g. BTIG reiterating Buy -> Buy 3x), collapse to
+    one row -- the most recent occurrence, annotated "(N reiterations since <earliest date>)". Upgrades
+    and downgrades are never collapsed, even if a firm somehow repeats one identically, since those are
+    real directional events. Never touches synthesize_rating_signal's own actions list, weighted_net, or
+    driving_action selection -- this runs on a plain list copy purely for how the table renders."""
+    groups = {}
+    singles = []
+    for a in actions:
+        if a["action"] == "reiterated":
+            key = (a["firm"], a.get("from_grade"), a.get("to_grade"))
+            groups.setdefault(key, []).append(a)
+        else:
+            singles.append(a)
+    collapsed = list(singles)
+    for grp in groups.values():
+        if len(grp) == 1:
+            collapsed.append(grp[0])
+        else:
+            grp_by_date = sorted(grp, key=lambda a: a["action_date"])
+            most_recent = dict(grp_by_date[-1])
+            most_recent["_repeat_note"] = f"({len(grp)} reiterations since {fmt_date(grp_by_date[0]['action_date'])})"
+            collapsed.append(most_recent)
+    return collapsed
 
 
 def render_watchlist_signals_tab():
@@ -4036,9 +4471,9 @@ def render_watchlist_signals_tab():
     # already used the old value. A first-ever visit (marker is None)
     # treats everything currently on record as new, per load_watchlist_
     # signals_last_viewed's own documented fallback.
-    last_viewed = load_watchlist_signals_last_viewed()
+    last_viewed = load_watchlist_signals_last_viewed(conn, EFFECTIVE_EMAIL)
     since_baseline = last_viewed or "1970-01-01T00:00:00"
-    signals_since = get_watchlist_signals_since(conn, since_baseline)
+    signals_since = get_watchlist_signals_since(conn, EFFECTIVE_EMAIL, since_baseline, watchlist)
     n_zones, n_actions = len(signals_since["triggered_zones"]), len(signals_since["new_actions"])
 
     st.markdown('<div class="smd-section">📍 WATCHLIST SIGNALS</div>', unsafe_allow_html=True)
@@ -4049,60 +4484,149 @@ def render_watchlist_signals_tab():
         st.caption(f"Since your last visit ({time_ago(last_viewed)}): {n_zones} ticker(s) entered their "
                    f"entry zone, {n_actions} new analyst rating action(s) recorded.")
 
-    # ---- SECTION A: 🎯 Entry Zones (auto-derived -- Part 1) ----
+    # ---- SECTION A: 🎯 Entry Zones (auto-derived -- Part 1; dense-overview rebuild 2026-09-25) ----
     st.markdown('<div class="smd-section">🎯 Entry Zones</div>', unsafe_allow_html=True)
     st.caption(
         "Auto-derived per ticker from technical support structure, its own backtested forward-return "
         "distribution, and its current divergence score -- no manual range entry. Recomputes automatically "
-        "in the background (hourly at most); use Recompute to force a refresh."
+        "in the background (hourly at most); use Recompute all to force a refresh."
     )
-    zones_by_ticker = {z["ticker"]: z for z in get_entry_zones(conn)}
+    if st.button("🔄 Recompute all", key=_uk("wsig_recompute_all")):
+        with st.spinner("Recomputing all entry zones..."):
+            refresh_all_entry_zones(conn, EFFECTIVE_EMAIL, watchlist, force_refresh=True)
+        st.rerun()
+
+    zones_by_ticker = {z["ticker"]: z for z in get_entry_zones(conn, EFFECTIVE_EMAIL)}
     enriched = []
     for t in watchlist:
         z = zones_by_ticker.get(t)
+        price = get_latest_cached_price(conn, t)
         if z is None:
-            status = None
+            real_status = None
         elif z.get("entry_low") is None:
-            status = "no_zone"
+            real_status = "no_zone"
         else:
-            status = z["last_zone_status"]
-        enriched.append({"ticker": t, "zone": z, "price": get_latest_cached_price(conn, t), "status": status})
-    # Tickers currently IN ZONE sort to the top (Part 4), then alphabetical.
-    enriched.sort(key=lambda e: (e["status"] != "in_zone", e["ticker"]))
+            real_status = z["last_zone_status"]
+        distance_pct = _zone_distance_pct(real_status, price, z.get("entry_low") if z else None,
+                                           z.get("entry_high") if z else None)
+        enriched.append({
+            "ticker": t, "zone": z, "price": price, "real_status": real_status,
+            "display_status": _zone_display_status(real_status, distance_pct), "distance_pct": distance_pct,
+        })
 
+    # --- Summary strip: one line, small cards ---
+    ssc1, ssc2, ssc3, ssc4 = st.columns(4)
+    ssc1.metric("In zone", sum(1 for e in enriched if e["display_status"] == "in_zone"))
+    ssc2.metric("Near zone (<3% away)", sum(1 for e in enriched if e["display_status"] == "near"))
+    ssc3.metric("Above zone", sum(1 for e in enriched if e["display_status"] == "above"))
+    ssc4.metric("Low-confidence anchors",
+                sum(1 for e in enriched if e["zone"] and e["zone"].get("anchor_kind") == "current_price_fallback"))
+
+    # --- Sort: IN ZONE, NEAR, ABOVE (then BELOW, then no-zone/pending -- not explicitly specified, placed
+    # last as the least actionable), within each by distance ascending (closer = more urgent first) ---
+    _STATUS_SORT_RANK = {"in_zone": 0, "near": 1, "above": 2, "below": 3, "no_zone": 4, None: 5}
+    enriched.sort(key=lambda e: (_STATUS_SORT_RANK.get(e["display_status"], 5),
+                                  e["distance_pct"] if e["distance_pct"] is not None else 0.0, e["ticker"]))
+
+    ACCURACY_COINFLIP_LOW, ACCURACY_COINFLIP_HIGH = 0.45, 0.55
+    display_cols = ["Ticker", "Status", "Price", "Entry zone", "Distance", "90d fwd return", "Anchor",
+                     "Accuracy", "Divergence", "Days in zone"]
+    rows_data = []
     for e in enriched:
-        t, z, price, status = e["ticker"], e["zone"], e["price"], e["status"]
+        t, z, price, status = e["ticker"], e["zone"], e["price"], e["display_status"]
         badge_txt, badge_color = _ZONE_STATUS_STYLE.get(status, _ZONE_STATUS_STYLE[None])
-        hcol1, hcol2 = st.columns([6, 1])
-        hcol1.markdown(
-            f"**{t}**&nbsp;&nbsp;<span class='chip' style='border-color:{badge_color};color:{badge_color};'>"
-            f"{'⭐ ' if status == 'in_zone' else ''}{badge_txt}</span>",
-            unsafe_allow_html=True,
-        )
-        if hcol2.button("🔄 Recompute", key=f"wsig_recompute_{t}", help="Force-recompute this ticker's entry zone"):
-            refresh_entry_zone(conn, t, force_refresh=True)
-            st.rerun()
-        if z is None:
-            st.caption("Not yet computed for this ticker — the background scan will populate it shortly.")
-        elif z.get("entry_low") is None:
-            st.caption(z.get("reasoning") or "No entry zone could be derived for this ticker yet.")
-        else:
-            days_in_zone_txt = ""
-            if status == "in_zone" and z["zone_entered_at"]:
-                try:
-                    entered = pd.Timestamp(z["zone_entered_at"])
-                    entered = entered.tz_localize("UTC") if entered.tzinfo is None else entered
-                    days_in_zone_txt = f" — {(pd.Timestamp.now(tz='UTC') - entered).days}d in zone"
-                except (TypeError, ValueError):
-                    days_in_zone_txt = ""
-            target_txt = f"${z['implied_target_price']:.2f}" if z.get("implied_target_price") is not None else "—"
-            price_txt = f"${price:.2f}" if price is not None else "—"
-            st.markdown(
-                f"Range **${z['entry_low']:.2f}-${z['entry_high']:.2f}** · current {price_txt} · "
-                f"target **{target_txt}**{days_in_zone_txt}"
-            )
-            st.caption(z.get("reasoning") or "")
-        st.markdown("<hr style='margin:6px 0;opacity:0.12;'>", unsafe_allow_html=True)
+        price_txt = f"${price:,.2f}" if price is not None else "—"
+        zone_txt = f"${z['entry_low']:,.2f}-${z['entry_high']:,.2f}" if z and z.get("entry_low") is not None else "—"
+        distance_txt = f"{e['distance_pct']:.1f}%" if e["distance_pct"] is not None else "—"
+
+        fwd_return = z.get("target_pct") if z else None
+        anchor_kind = z.get("anchor_kind") if z else None
+        accuracy = z.get("backtest_accuracy") if z else None
+        divergence = z.get("divergence_score") if z else None
+        divergence_txt = f"{divergence:.0f}" if divergence is not None else "—"
+
+        days_txt = "—"
+        if z and status == "in_zone" and z.get("zone_entered_at"):
+            try:
+                entered = pd.Timestamp(z["zone_entered_at"])
+                entered = entered.tz_localize("UTC") if entered.tzinfo is None else entered
+                days_txt = str((pd.Timestamp.now(tz="UTC") - entered).days)
+            except (TypeError, ValueError):
+                days_txt = "—"
+
+        # Contradiction flag (2026-09-25): IN ZONE but the backtested forward return is negative --
+        # flagged inline (visible without hover) plus explained once in the caption below the table.
+        contradiction = status == "in_zone" and fwd_return is not None and fwd_return < 0
+        fwd_return_txt = (f"{fwd_return:+.1f}%" if fwd_return is not None else "—") + (" ⚠" if contradiction else "")
+
+        rows_data.append({
+            "Ticker": t, "Status": badge_txt, "Price": price_txt, "Entry zone": zone_txt,
+            "Distance": distance_txt, "90d fwd return": fwd_return_txt,
+            "Anchor": _anchor_short_label(anchor_kind, z.get("anchor_touches") if z else None),
+            "Accuracy": f"{accuracy:.0%}" if accuracy is not None else "—",
+            "Divergence": divergence_txt, "Days in zone": days_txt,
+            "_status_color": badge_color, "_fwd_return": fwd_return, "_accuracy": accuracy,
+            "_is_placeholder": anchor_kind == "current_price_fallback",
+        })
+
+    df = pd.DataFrame(rows_data)
+
+    def _style_row(row):
+        i = row.name
+        styles = {c: "" for c in display_cols}
+        styles["Ticker"] = "font-weight:700;font-size:14px;"
+        styles["Status"] = f"color:{df.loc[i, '_status_color']};font-weight:700;"
+        for c in ("Price", "Entry zone", "Distance", "90d fwd return", "Accuracy", "Divergence", "Days in zone"):
+            styles[c] += "font-family:monospace;text-align:right;white-space:nowrap;"
+        fwd = df.loc[i, "_fwd_return"]
+        if fwd is not None:
+            styles["90d fwd return"] += f"color:{COLOR_BULLISH if fwd >= 0 else COLOR_BEARISH};font-weight:700;"
+        if df.loc[i, "_is_placeholder"]:
+            styles["Anchor"] += f"color:{COLOR_RETAIL};"
+        acc = df.loc[i, "_accuracy"]
+        if acc is not None and ACCURACY_COINFLIP_LOW <= acc <= ACCURACY_COINFLIP_HIGH:
+            styles["Accuracy"] += f"color:{COLOR_NEUTRAL};"
+        return [styles[c] for c in display_cols]
+
+    styled = df[display_cols].style.apply(_style_row, axis=1)
+    # Explicit height so all watchlist tickers fit without an inner scrollbar (~35px/row + header).
+    table_height = 38 + len(df) * 35 + 3
+    event = st.dataframe(
+        styled, width='stretch', hide_index=True, height=table_height,
+        on_select="rerun", selection_mode="single-row", key=_uk("wsig_zone_table"),
+        column_config={
+            "90d fwd return": st.column_config.TextColumn(
+                help="Backtested mean forward return over the next 90 trading days. ⚠ = in entry zone but this is negative."),
+            "Anchor": st.column_config.TextColumn(
+                help="⚠ placeholder = no real support/volume level found below price -- band is centered on price itself, lowest confidence."),
+            "Accuracy": st.column_config.TextColumn(
+                help="Swing Forecast's own directional accuracy for this ticker. Greyed between 45-55% -- coin-flip territory, not validation."),
+        },
+    )
+    st.caption("⚠ on 90d fwd return = in entry zone but backtested forward return is negative. "
+               "Click a row for detail.")
+
+    # --- Detail panel for the selected row, below the table, one at a time ---
+    if event.selection.rows:
+        sel_ticker = df.iloc[event.selection.rows[0]]["Ticker"]
+        sel = next(e for e in enriched if e["ticker"] == sel_ticker)
+        z = sel["zone"]
+        st.markdown(f"#### {sel_ticker}")
+        dcol1, dcol2 = st.columns([1, 3])
+        with dcol1:
+            if st.button("🔄 Recompute", key=_uk(f"wsig_detail_recompute_{sel_ticker}")):
+                refresh_entry_zone(conn, EFFECTIVE_EMAIL, sel_ticker, force_refresh=True)
+                st.rerun()
+            st.caption("**Why this zone**")
+            st.caption(md_safe((z.get("reasoning") if z else None)
+                                or "No entry zone could be derived for this ticker yet."))
+        with dcol2:
+            if z and z.get("entry_low") is not None:
+                hist, _cfg = fetch_price_history(sel_ticker, "1d", "3mo", conn=conn)
+                fig = render_entry_zone_mini_chart(hist, z["entry_low"], z["entry_high"], sel["price"], sel_ticker)
+                st.plotly_chart(fig, width='stretch', key=_uk(f"wsig_detail_chart_{sel_ticker}"))
+            else:
+                st.caption("No zone computed for this ticker yet — nothing to chart.")
 
     # ---- SECTION B: 📈 Rating Changes (synthesized, tier-weighted -- Part 3/4) ----
     st.markdown('<div class="smd-section">📈 Rating Changes</div>', unsafe_allow_html=True)
@@ -4111,7 +4635,8 @@ def render_watchlist_signals_tab():
         "flat list treating every firm equally. Full raw list available per ticker on expand."
     )
     signal_rows = [synthesize_rating_signal(t, conn) for t in watchlist]
-    # Real directional/mixed activity sorts above a quiet ticker, then alphabetical.
+    # Real directional/mixed activity sorts above a quiet ticker, then alphabetical. Unchanged -- this is
+    # the per-ticker headline ordering, not the expanded table's own sort (see _sort_actions_for_display).
     signal_rows.sort(key=lambda s: (s["signal"] == "QUIET", s["ticker"]))
     for sig in signal_rows:
         badge_txt, badge_color = _RATING_SIGNAL_STYLE.get(sig["signal"], _RATING_SIGNAL_STYLE["QUIET"])
@@ -4126,22 +4651,48 @@ def render_watchlist_signals_tab():
             unsafe_allow_html=True,
         )
         if sig["all_actions"]:
-            with st.expander(f"Show all {sig['n_actions']} action(s)"):
-                rows = [{
-                    "Firm": a["firm"], "Tier": a["tier_label"],
-                    "Grade change": (
+            # Count badge (2026-09-25 fix) on the collapsed header, from the REAL uncollapsed totals -- so
+            # it can be skipped without opening it.
+            n_up = sum(1 for a in sig["all_actions"] if a["action"] == "upgrade")
+            n_down = sum(1 for a in sig["all_actions"] if a["action"] == "downgrade")
+            expander_label = f"{sig['n_actions']} actions · {n_up} upgrade{'s' if n_up != 1 else ''} · {n_down} downgrade{'s' if n_down != 1 else ''}"
+            with st.expander(expander_label):
+                display_actions = _collapse_repeat_reiterations(sig["all_actions"])
+                # Tier ascending (Bulge Bracket, Elite Boutique, Smaller/Regional), then date descending
+                # within a tier -- display ordering only, never touches synthesize_rating_signal's own
+                # driving-action selection or weighted_net above.
+                by_date_desc = sorted(display_actions, key=lambda a: a["action_date"], reverse=True)
+                display_actions = sorted(by_date_desc, key=lambda a: a["tier"])
+
+                rows = []
+                for a in display_actions:
+                    grade_txt = (
                         f"{a['from_grade']} → {a['to_grade']}" if a.get("from_grade") and a.get("to_grade")
                         else (a.get("to_grade") or "—")
-                    ),
-                    "Action": a["action"], "Date": fmt_date(a["action_date"]),
-                } for a in sig["all_actions"]]
-                st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
+                    )
+                    date_txt = fmt_date(a["action_date"])
+                    if a.get("_repeat_note"):
+                        date_txt = f"{date_txt}  {a['_repeat_note']}"
+                    rows.append({
+                        "Firm": a["firm"], "Tier": a["tier_label"], "Grade change": grade_txt,
+                        "Action": a["action"], "Date": date_txt,
+                        # No real grade change AND not a fresh initiation -- muted (de-emphasized), never
+                        # an upgrade/downgrade, which always keep full contrast.
+                        "_muted": a["action"] == "reiterated",
+                    })
+                df = pd.DataFrame(rows)
+                muted_flags = df["_muted"]
+                styled = df.drop(columns=["_muted"]).style.apply(
+                    lambda row: [("color: #6b7684" if muted_flags.iloc[row.name] else "") for _ in row],
+                    axis=1,
+                )
+                st.dataframe(styled, width='stretch', hide_index=True)
 
     # Resets the "since your last visit" marker to now -- AFTER everything
     # above has already used the old baseline, so this visit's own newly-
     # triggered zones/rating actions are correctly shown as new THIS time,
     # and only stop being flagged starting next visit.
-    save_watchlist_signals_last_viewed()
+    save_watchlist_signals_last_viewed(conn, EFFECTIVE_EMAIL)
 
 
 # --------------------------------------------------------------------------
@@ -4192,6 +4743,37 @@ if st.session_state.get("last_auto_reconcile_date") != _today_str:
         calibrate_swing_forecast_model(get_conn(), _h)
     st.session_state["last_auto_reconcile_date"] = _today_str
 
+# ---- Account block (multi-user) ----
+st.sidebar.markdown(
+    f'<div style="font-size:12px;">Signed in as<br><b>{html.escape(CURRENT_USER["display_name"] or ACTOR_EMAIL)}</b>'
+    f'<br><span style="opacity:0.7;">{html.escape(ACTOR_EMAIL)}</span>'
+    f'{" &middot; <b>ADMIN</b>" if IS_ADMIN else ""}</div>',
+    unsafe_allow_html=True,
+)
+if st.sidebar.button("Sign out", key="sidebar_signout_btn"):
+    st.session_state.pop("_auth_email", None)
+    st.logout()
+
+if IS_ADMIN:
+    def _on_view_as_change():
+        choice = st.session_state.get("_admin_view_as_select")
+        st.session_state["view_as_email"] = None if choice in (None, ACTOR_EMAIL) else choice
+
+    _view_as_options = [u["email"] for u in list_users(get_conn())]
+    if ACTOR_EMAIL not in _view_as_options:
+        _view_as_options.insert(0, ACTOR_EMAIL)
+    if st.session_state.get("_admin_view_as_select") not in _view_as_options:
+        st.session_state["_admin_view_as_select"] = EFFECTIVE_EMAIL
+    st.sidebar.selectbox(
+        "👁️ View as user", _view_as_options, key="_admin_view_as_select", on_change=_on_view_as_change,
+        format_func=lambda e: f"{e} (me)" if e == ACTOR_EMAIL else e,
+        help="Admin only. Switch the data context to any user to see and manage their watchlist, entry "
+             "zones and preferences. Your permissions stay admin's.",
+    )
+    if EFFECTIVE_EMAIL != ACTOR_EMAIL:
+        st.sidebar.warning(f"Viewing as {EFFECTIVE_EMAIL}", icon="👁️")
+st.sidebar.markdown("<hr style='margin:8px 0;opacity:0.2;'>", unsafe_allow_html=True)
+
 st.sidebar.markdown(
     f'<div style="color:{ACCENT};font-size:16px;font-weight:700;letter-spacing:0.05em;">CONTROL PANEL</div>',
     unsafe_allow_html=True,
@@ -4226,14 +4808,14 @@ if st.sidebar.button("⟳  REFRESH DATA", width='stretch'):
 # --------------------------------------------------------------------------
 
 _signals_run_every = {"On demand": None, "5 min": "5m", "15 min": "15m", "1 hour": "1h"}[
-    load_runners_refresh_interval()
+    load_runners_refresh_interval(get_conn(), EFFECTIVE_EMAIL)
 ]
 
 
 def _scan_watchlist_signals_fragment():
     _conn = get_conn()
-    refresh_all_entry_zones(_conn, watchlist)
-    check_entry_zones(_conn)
+    refresh_all_entry_zones(_conn, EFFECTIVE_EMAIL, watchlist)
+    check_entry_zones(_conn, EFFECTIVE_EMAIL)
     check_rating_changes(_conn, watchlist)
     # Email Digest: checked on the SAME timer as everything else in this
     # fragment -- while a browser tab stays open and connected, this is
@@ -4245,9 +4827,9 @@ def _scan_watchlist_signals_fragment():
     # send_daily_digest_now's own docstring for the full honesty note on
     # why this is NOT a real background scheduler.
     try:
-        run_daily_digest_send(_conn, force=False)
+        run_digests_for_all_users(_conn)
     except Exception as _digest_err:
-        print(f"[run_daily_digest_send] unexpected error: {_digest_err}")
+        print(f"[run_digests_for_all_users] unexpected error: {_digest_err}")
 
 
 st.fragment(run_every=_signals_run_every)(_scan_watchlist_signals_fragment)()
@@ -4260,9 +4842,17 @@ st.fragment(run_every=_signals_run_every)(_scan_watchlist_signals_fragment)()
 # should_send_daily_digest_now's decision gates everything expensive)
 # and self-guarded, safe to call unconditionally here.
 try:
-    run_daily_digest_send(get_conn(), force=False)
+    run_digests_for_all_users(get_conn())
 except Exception as _digest_err:
-    print(f"[run_daily_digest_send] unexpected error (full-load path): {_digest_err}")
+    print(f"[run_digests_for_all_users] unexpected error (full-load path): {_digest_err}")
+
+# Macro Calendar upgrade (spec item 5b) -- mirrors the catch-up above so a High-impact release's one-time
+# alert email still fires even on a day the digest itself is skipped (weekend/already-sent) or when no
+# launchd job is configured. Independent try/except -- never blocks page render on a failure here.
+try:
+    check_and_send_macro_release_alerts(get_conn())
+except Exception as _macro_alert_err:
+    print(f"[check_and_send_macro_release_alerts] unexpected error (full-load path): {_macro_alert_err}")
 
 _quiver_note = (
     "QUIVER_API_KEY set — congressional trades use QuiverQuant (paid)."
@@ -4293,24 +4883,33 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12, tab13, tab14 = st.tabs(
-    [
-        "DIVERGENCE MAP",
-        "OPTIONS FLOW",
-        "CONGRESS & INSIDER",
-        "DARK POOL",
-        "POLYMARKET",
-        "FUNDAMENTALS",
-        "TICKER DEEP-DIVE",
-        "NEWS",
-        "RUNNERS",
-        "SETTINGS",
-        "EARNINGS SIMULATOR",
-        "MACRO CALENDAR",
-        "SWING FORECAST",
-        "📍 WATCHLIST SIGNALS",
-    ]
-)
+render_macro_release_banner(get_conn())
+
+_tab_labels = [
+    "DIVERGENCE MAP",
+    "OPTIONS FLOW",
+    "CONGRESS & INSIDER",
+    "DARK POOL",
+    "POLYMARKET",
+    "FUNDAMENTALS",
+    "TICKER DEEP-DIVE",
+    "NEWS",
+    "RUNNERS",
+    "SETTINGS",
+    "EARNINGS SIMULATOR",
+    "MACRO CALENDAR",
+    "SWING FORECAST",
+    "📍 WATCHLIST SIGNALS",
+    "🌪️ VOLATILITY DISLOCATIONS",
+]
+# The ADMIN tab is only ever CREATED for role='admin' -- for a regular user
+# it does not exist at all (not hidden, not disabled), and the code that
+# renders it is never reached.
+if IS_ADMIN:
+    _tab_labels.append("⚙️ ADMIN")
+_tabs = st.tabs(_tab_labels)
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12, tab13, tab14, tab15 = _tabs[:15]
+tab_admin = _tabs[15] if IS_ADMIN else None
 
 # --------------------------------------------------------------------------
 # Tab 1 — DIVERGENCE MAP
@@ -4703,10 +5302,10 @@ with tab6:
 def _confirm_ai_briefing_dialog(ticker):
     conn = get_conn()
     cost = estimate_ai_briefing_cost(ticker, conn)
-    st.write(
+    st.write(md_safe(
         f"This will make 1 call to the Claude API using cached dashboard data for "
         f"**{ticker}** (no new external fetches). Estimated cost: ~${cost['cost_usd']:.2f}. Continue?"
-    )
+    ))
     st.caption(
         f"Rough estimate from bundled context size: ~{cost['input_tokens']:,} input tokens, "
         f"~{cost['output_tokens']:,} output tokens."
@@ -4943,10 +5542,10 @@ def render_last_session_full(ticker, conn):
                 "✅ direction call was correct" if last["prediction_correct_direction"]
                 else "❌ direction call was wrong"
             )
-            st.caption(
+            st.caption(md_safe(
                 f"Closed at ${last['actual_close_price']:.2f} vs. predicted ${last['target_price']:.2f} "
                 f"({last['error_pct']:+.2f}% error) — {outcome}."
-            )
+            ))
         else:
             st.caption("This session hasn't been reconciled yet — runs automatically right after close.")
         return
@@ -4969,10 +5568,10 @@ def render_last_session_full(ticker, conn):
             "✅ direction call was correct" if bt_last["prediction_correct_direction"]
             else "❌ direction call was wrong"
         )
-        st.caption(
+        st.caption(md_safe(
             f"(Backtest) Closed at ${bt_last['actual_close_price']:.2f} vs. predicted "
             f"${bt_last['target_price']:.2f} ({bt_last['error_pct']:+.2f}% error) — {outcome}."
-        )
+        ))
 
 
 # --------------------------------------------------------------------------
@@ -5714,7 +6313,7 @@ with tab7:
                     cost_txt = f"${c['cost_per_contract']:,.0f}" if c["cost_per_contract"] is not None else "—"
                     breakeven_txt = f"${c['breakeven']:.2f}" if c["breakeven"] is not None else "—"
                     oi_txt = f"{c['open_interest']:,}" if c["open_interest"] is not None else "—"
-                    st.markdown(f"""
+                    st.markdown(md_safe(f"""
                     <div class="smcard">
                       <div style="display:flex;justify-content:space-between;align-items:baseline;">
                         <div style="font-size:15px;font-weight:700;color:{TEXT_PRIMARY};">
@@ -5735,7 +6334,7 @@ with tab7:
                         {"".join(badges_html)}
                       </div>
                     </div>
-                    """, unsafe_allow_html=True)
+                    """), unsafe_allow_html=True)
 
                 st.markdown('<div class="smd-section">📖 WHAT DO THESE BADGES MEAN?</div>',
                            unsafe_allow_html=True)
@@ -6272,48 +6871,18 @@ with tab9:
             icon="🌙",
         )
 
-    runner_rows = []
-    for t in watchlist:
-        f_env_r = cached_fundamentals(get_conn(), t, max_age_hours=12)
-        pdf = f_env_r["data"]["price_df"]
-        if pdf.empty or len(pdf) < 21:
-            continue
-        latest = pdf.iloc[-1]
-        avg_vol_20d = pdf["Volume"].tail(21).iloc[:-1].mean()
-        vol_ratio = (latest["Volume"] / avg_vol_20d) if avg_vol_20d else None
-        chg_pct = float((pdf["Close"].iloc[-1] / pdf["Close"].iloc[-2] - 1) * 100) if len(pdf) > 1 else None
-        unusual_vol = vol_ratio is not None and vol_ratio >= 2.0
-        big_move = chg_pct is not None and abs(chg_pct) >= 3.0
-        if not (unusual_vol or big_move):
-            continue
-        unusualness = (vol_ratio or 0) + abs(chg_pct or 0) / 3.0
-        runner_rows.append({
-            "Ticker": t, "Price": latest["Close"], "Chg %": chg_pct,
-            "Volume": int(latest["Volume"]), "Vol vs 20D avg": vol_ratio,
-            "_unusualness": unusualness,
-        })
+    # Computed by data_engine.compute_and_log_runner_scan -- the ONE implementation this tab and the
+    # headless launchd digest send (digest/send.py) both call, so "what counts as a runner today" can never
+    # disagree between the two.
+    top_rows, runner_tickers, total_flagged = compute_and_log_runner_scan(get_conn(), EFFECTIVE_EMAIL, watchlist)
 
-    if not runner_rows:
+    if not top_rows:
         st.caption("No unusual volume or price moves detected in the current watchlist right now.")
-        runner_tickers = []
-        # Email Digest readiness (Part 4): persists even the "zero runners
-        # today" outcome, so is_daily_digest_ready() can tell "scan ran,
-        # found nothing" apart from "scan hasn't run yet" -- purely
-        # additive logging, doesn't change anything this tab displays.
-        log_runners_scan(get_conn(), [])
     else:
-        # RUNNERS means the day's top movers, not the full watchlist --
-        # capped at 4, sorted most-unusual-first, same ranking as before.
-        runners_df_full = pd.DataFrame(runner_rows).sort_values("_unusualness", ascending=False).drop(
-            columns="_unusualness"
-        )
-        runners_df = runners_df_full.head(4)
-        runner_tickers = runners_df["Ticker"].tolist()
-        # Same additive logging as the empty-runners branch above, just
-        # with the real top-4 rows this tab is about to render.
-        log_runners_scan(get_conn(), [
-            {"ticker": r["Ticker"], "price": r["Price"], "chg_pct": r["Chg %"], "vol_ratio": r["Vol vs 20D avg"]}
-            for r in runners_df.to_dict("records")
+        runners_df = pd.DataFrame([
+            {"Ticker": r["ticker"], "Price": r["price"], "Chg %": r["chg_pct"], "Volume": r["volume"],
+             "Vol vs 20D avg": r["vol_ratio"]}
+            for r in top_rows
         ])
         styled = runners_df.copy()
         styled["Price"] = styled["Price"].map(lambda v: f"${v:.2f}")
@@ -6321,7 +6890,7 @@ with tab9:
         styled["Volume"] = styled["Volume"].map(lambda v: f"{v:,}")
         styled["Vol vs 20D avg"] = styled["Vol vs 20D avg"].map(lambda v: f"{v:.1f}x" if pd.notna(v) else "—")
         st.caption(
-            f"Top {len(runners_df)} of {len(runners_df_full)} flagged watchlist ticker(s) shown (RUNNERS caps at "
+            f"Top {len(runners_df)} of {total_flagged} flagged watchlist ticker(s) shown (RUNNERS caps at "
             f"4) — sorted most unusual first (volume ≥2x 20-day average, or move ≥3% intraday)."
         )
         st.dataframe(styled, width='stretch', hide_index=True)
@@ -6342,11 +6911,11 @@ with tab9:
     # session, saved back on every add/remove/auto-cleanup so the file
     # never drifts from what's actually shown.
     if "pinned_runners" not in st.session_state:
-        st.session_state.pinned_runners = load_pinned_runners()
+        st.session_state.pinned_runners = load_pinned_runners(get_conn(), EFFECTIVE_EMAIL)
     _pinned_before_cleanup = list(st.session_state.pinned_runners)
     st.session_state.pinned_runners = [t for t in st.session_state.pinned_runners if t in watchlist]
     if st.session_state.pinned_runners != _pinned_before_cleanup:
-        save_pinned_runners(st.session_state.pinned_runners)
+        save_pinned_runners(get_conn(), EFFECTIVE_EMAIL, st.session_state.pinned_runners)
 
     display_tickers = runner_tickers + [t for t in st.session_state.pinned_runners if t not in runner_tickers]
 
@@ -6360,13 +6929,13 @@ with tab9:
         acol1, acol2 = st.columns([3, 1])
         ticker_to_add = acol1.selectbox(
             "Add a watchlist ticker to Day Prediction (even if not currently flagged as a runner)",
-            options=["—"] + addable, index=0, key="runners_manual_add_select",
+            options=["—"] + addable, index=0, key=_uk("runners_manual_add_select"),
         )
         acol2.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
-        if acol2.button("➕ Add", key="runners_manual_add_btn", disabled=(ticker_to_add == "—"),
+        if acol2.button("➕ Add", key=_uk("runners_manual_add_btn"), disabled=(ticker_to_add == "—"),
                          width='stretch'):
             st.session_state.pinned_runners.append(ticker_to_add)
-            save_pinned_runners(st.session_state.pinned_runners)
+            save_pinned_runners(get_conn(), EFFECTIVE_EMAIL, st.session_state.pinned_runners)
             st.rerun()
 
     if display_tickers:
@@ -6376,19 +6945,19 @@ with tab9:
         # silently reset a chosen "5 min" back to "On demand" with zero
         # visible warning -- confirmed as the real cause behind a
         # "stuck, not refreshing every 5 min like I set it" report.
-        if "runners_refresh_interval" not in st.session_state:
-            st.session_state["runners_refresh_interval"] = load_runners_refresh_interval()
+        if _uk("runners_refresh_interval") not in st.session_state:
+            st.session_state[_uk("runners_refresh_interval")] = load_runners_refresh_interval(get_conn(), EFFECTIVE_EMAIL)
         rcol1, rcol2 = st.columns([1, 3])
         refresh_choice = rcol1.selectbox(
             "Refresh interval", ["On demand", "5 min", "15 min", "1 hour"],
-            key="runners_refresh_interval",
+            key=_uk("runners_refresh_interval"),
             help="'On demand' (default, matching the rest of this dashboard) only re-evaluates on your next "
                  "manual interaction. The timed options auto-refresh this section during market hours. Your "
                  "choice is saved and survives a page reload.",
         )
-        if refresh_choice != st.session_state.get("_runners_refresh_interval_saved"):
-            save_runners_refresh_interval(refresh_choice)
-            st.session_state["_runners_refresh_interval_saved"] = refresh_choice
+        if refresh_choice != st.session_state.get(_uk("_runners_refresh_interval_saved")):
+            save_runners_refresh_interval(get_conn(), EFFECTIVE_EMAIL, refresh_choice)
+            st.session_state[_uk("_runners_refresh_interval_saved")] = refresh_choice
         run_every = {"On demand": None, "5 min": "5m", "15 min": "15m", "1 hour": "1h"}[refresh_choice]
         # Part 2 (prior bug report): the timed refresh options kept firing
         # on their own schedule indefinitely, including hours after the
@@ -6417,9 +6986,9 @@ with tab9:
                 hcol1, hcol2 = st.columns([5, 1])
                 hcol1.markdown(f"#### {rt}" + ("  📌 manually added" if rt in pinned else ""))
                 if rt in pinned:
-                    if hcol2.button("✕ Remove", key=f"runners_remove_pin_{rt}"):
+                    if hcol2.button("✕ Remove", key=_uk(f"runners_remove_pin_{rt}")):
                         st.session_state.pinned_runners = [p for p in st.session_state.pinned_runners if p != rt]
-                        save_pinned_runners(st.session_state.pinned_runners)
+                        save_pinned_runners(get_conn(), EFFECTIVE_EMAIL, st.session_state.pinned_runners)
                         st.rerun()
                 render_day_prediction_panel(rt, get_conn())
 
@@ -6464,3 +7033,389 @@ with tab13:
 
 with tab14:
     render_watchlist_signals_tab()
+
+
+# --------------------------------------------------------------------------
+# Tab 15 — 🌪️ VOLATILITY DISLOCATIONS
+# --------------------------------------------------------------------------
+# Stage 3 of the Volatility Dislocations screener. Display-only: reads the
+# `scan` table Stage 2 already populated, zero option-chain fetches from
+# this tab itself. The only action that touches the network is the
+# "Run scan now" button, which launches a DETACHED background process
+# (data_engine.start_volatility_scan_on_demand) -- never inside this
+# request -- so the rest of the app (Runners, Day Predictions, digest,
+# every other tab) stays completely unaffected while a scan runs.
+
+def render_volatility_dislocations_tab():
+    conn = get_conn()
+    st.markdown('<div class="smd-section">🌪️ VOLATILITY DISLOCATIONS</div>', unsafe_allow_html=True)
+    st.caption("Names where the options market is pricing an unusual move relative to its own baseline. "
+               "Directionless — use it to pick what to look at, not what to buy.")
+
+    # --- on-demand run trigger + live progress (DB-backed, survives a page refresh) ---
+    run = get_latest_volatility_scan_run(conn)
+    run_active = run is not None and run["status"] == "running"
+
+    col_run, col_status = st.columns([1, 3])
+    with col_run:
+        if st.button("▶️ Run scan now", disabled=run_active, width='stretch', key=_uk("vol_run_now")):
+            new_id = start_volatility_scan_on_demand()
+            if new_id is None:
+                st.warning("A scan is already running — only one at a time.")
+            st.rerun()
+    with col_status:
+        if run_active:
+            stage_label = {"tier1": "Tier 1 rebuild", "tier2": "Tier 2 rebuild",
+                            "scan": "Stage 2 scan"}.get(run.get("stage"), run.get("stage") or "starting")
+            done, total = run.get("tickers_done") or 0, run.get("tickers_total") or 0
+            elapsed_str = "—"
+            started = run.get("started_at")
+            if started:
+                try:
+                    started_dt = datetime.fromisoformat(started)
+                    elapsed_s = (datetime.now(timezone.utc) - started_dt).total_seconds()
+                    elapsed_str = f"{int(elapsed_s // 60)}m {int(elapsed_s % 60)}s"
+                except Exception:
+                    pass
+            st.info(f"⏳ Running — {stage_label}: {done}/{total} tickers done · elapsed {elapsed_str}")
+            st.progress(min(done / total, 1.0) if total else 0.0)
+            st.button("🔄 Refresh progress", key=_uk("vol_refresh_progress"))  # any click reruns the script
+        elif run is not None and run["status"] == "failed":
+            st.error(f"Last on-demand run failed: {run.get('error_message') or 'unknown error'}")
+        elif run is not None and run["status"] == "done":
+            st.caption(f"Last on-demand run finished {run.get('finished_at')} — "
+                       f"core={run.get('core_count')} spike={run.get('spike_count')} "
+                       f"scan stored={run.get('scan_stored')} skipped={run.get('scan_skipped')}")
+
+    # --- as-of timestamp + provisional / post-close banner ---
+    scan_rows_all = get_scan(conn)  # most recent scan_date on record, every period/tier
+    if not scan_rows_all:
+        st.info("No scan data yet. Click **▶️ Run scan now** above to build the universe and run the scan.")
+        return
+
+    scan_date = scan_rows_all[0]["scan_date"]
+    captured_at = scan_rows_all[0]["captured_at"]
+    gate_mode = scan_rows_all[0]["gate_mode"] or UNIVERSE_GATE_MODE
+    st.markdown(f"**As of:** scan date `{scan_date}` · quotes captured **{captured_at or 'unknown'}**")
+
+    is_post_close = False
+    if captured_at:
+        try:
+            is_post_close = datetime.fromisoformat(captured_at).hour >= 16  # ET, market close
+        except Exception:
+            pass
+    if gate_mode == "provisional" or is_post_close:
+        st.warning(
+            "⚠️ Provisional — quality gate pending Monday's timing test. "
+            f"Scan used quotes from {captured_at or 'an unknown time'}; post-close quotes may be wider "
+            "than intraday."
+        )
+
+    # --- controls ---
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        period_label = st.radio("Period", ["Week", "Month"], index=1, horizontal=True, key=_uk("vol_period"))
+    with c2:
+        tier_label = st.radio("Tier", ["All", "Core", "Spike"], horizontal=True, key=_uk("vol_tier"))
+    with c3:
+        hide_watchlist = st.checkbox("Hide names on my watchlist", value=True, key=_uk("vol_hide_wl"))
+    with c4:
+        hide_earnings = st.checkbox("Hide names with earnings in window", value=True, key=_uk("vol_hide_earn"))
+
+    period_key = period_label.lower()
+    rows = get_scan(conn, scan_date=scan_date, period=period_key)
+    if tier_label != "All":
+        rows = [r for r in rows if r["tier"] == tier_label.lower()]
+    if hide_watchlist:
+        wl_set = set(watchlist)
+        rows = [r for r in rows if r["ticker"] not in wl_set]
+
+    # de.now_et() (module-qualified), NOT a bare now_et import -- the RUNNERS tab above (tab9, untouched,
+    # per the standing "leave Runners exactly as it is" constraint) reassigns a module-level `now_et`
+    # local variable to a pd.Timestamp partway through this same script's sequential execution; a bare
+    # `now_et` name here would resolve to THAT by the time this function runs, not the imported function.
+    today_d = de.now_et().date()
+
+    def _earnings_in_window(r):
+        if not r.get("earnings_date"):
+            return False
+        try:
+            ed = datetime.strptime(str(r["earnings_date"])[:10], "%Y-%m-%d").date()
+        except Exception:
+            return False
+        # This row's OWN days_to_expiry (stored per-row) rather than a flat 7/30-day constant --
+        # "inside the window" means before THIS specific expiry, and expiry day-counts now vary within
+        # a period (Week 5-10d, Month 25-45d).
+        window_days = r.get("days_to_expiry") or (10 if period_key == "week" else 45)
+        return 0 <= (ed - today_d).days <= window_days
+
+    # Always split (not just when hide_earnings is on) so the collapsed group below can show exactly what
+    # the toggle would hide -- computed once, not silently dropped, per the 2026-09-25 follow-up: rows with
+    # earnings inside the window are shown in a separate collapsed "Earnings in window" group, not just
+    # discarded.
+    earnings_hidden_rows = [r for r in rows if _earnings_in_window(r)]
+    if hide_earnings:
+        rows = [r for r in rows if r not in earnings_hidden_rows]
+
+    if not rows:
+        st.info("No names match the current filters for this period. A ticker with no scan row for this "
+                "period (e.g. Week where has_weekly=false) is simply absent, not shown empty.")
+        return
+
+    # market_cap_bucket / a cached (never live-fetched) "current" price marker both come from the universe
+    # table, joined in here by ticker -- `scan` itself doesn't carry market cap, and Stage 3 must not fetch.
+    uni_by_ticker = {r["ticker"]: r for r in get_universe(conn)}
+
+    # --- sort: IV-based (iv_rv_ratio), NOT raw implied_move_pct or move_vs_median_60d (2026-09-25 fix) ---
+    # Raw implied move % isn't comparable across tickers even within one Period: Month's window alone spans
+    # 25-45 days, so two names' move % differ by sqrt(45/25)=1.3x from calendar effects alone, before any
+    # real difference in volatility. atm_iv_pct (annualized) and iv_rv_ratio (implied/realized, both
+    # annualized) already divide that scaling out, so ranking uses iv_rv_ratio -- move_vs_median_60d stays
+    # visible as an informational column but is no longer the sort key.
+    rows = sorted(rows, key=lambda r: (r.get("iv_rv_ratio") is None, -(r.get("iv_rv_ratio") or 0)))
+    st.caption("Sorted by IV/RV (implied vs. realized volatility), descending — raw implied move % isn't "
+               "comparable across different expiry horizons, so it's shown but not ranked on.")
+
+    def _band(r):
+        ref, mv = r.get("reference_close"), r.get("implied_move_pct")
+        if ref is None or mv is None or mv <= 0:
+            return None, None
+        return ref * (1 - mv / 100), ref * (1 + mv / 100)
+
+    def _flags(r):
+        out = []
+        if r.get("move_vs_median_60d") is not None and r["move_vs_median_60d"] >= VOLATILITY_MOVE_DISLOCATION_FLAG:
+            out.append("📈 MOVE")
+        if (r.get("option_volume_vs_20d_avg") is not None
+                and r["option_volume_vs_20d_avg"] >= VOLATILITY_UNUSUAL_OPTVOL_FLAG):
+            out.append("🔥 VOL")
+        return " ".join(out) if out else "—"
+
+    def _table_rows(rowset):
+        out = []
+        for r in rowset:
+            lower, upper = _band(r)
+            bucket = (uni_by_ticker.get(r["ticker"]) or {}).get("market_cap_bucket")
+            expiry_txt = "—"
+            if r.get("expiry"):
+                days_txt = f" ({r['days_to_expiry']}d)" if r.get("days_to_expiry") is not None else ""
+                expiry_txt = f"{r['expiry']}{days_txt}"
+            out.append({
+                "Watchlist": r["ticker"] in watchlist,  # editable checkbox column -- the row-level action
+                "Ticker": r["ticker"],
+                "Tier": "🟢 Core" if r["tier"] == "core" else "🟠 Spike",
+                "Price": f"${r['reference_close']:,.2f}" if r.get("reference_close") is not None else "—",
+                "Expiry": expiry_txt,
+                "IV %": f"{r['atm_iv_pct']:.1f}%" if r.get("atm_iv_pct") is not None else "—",
+                "Implied Move %": f"{r['implied_move_pct']:.1f}%" if r.get("implied_move_pct") is not None else "—",
+                "Band": f"${lower:,.2f}–${upper:,.2f}" if lower is not None else "—",
+                "Implied ÷ Realized": (f"{r['iv_rv_ratio']:.1f}×" if r.get("iv_rv_ratio") is not None else "—"),
+                "vs Own Median": (f"{r['move_vs_median_60d']:.2f}x" if r.get("move_vs_median_60d") is not None
+                                  else "building"),
+                "Opt Vol vs 20d": (f"{r['option_volume_vs_20d_avg']:.2f}x"
+                                   if r.get("option_volume_vs_20d_avg") is not None else "building"),
+                "Earnings": (str(r["earnings_date"])[:10] if r.get("earnings_date") else "—"),
+                "Short Float": f"{r['short_float']*100:.1f}%" if r.get("short_float") is not None else "—",
+                "Mkt Cap": bucket.capitalize() if bucket else "—",
+                "Flags": _flags(r),
+            })
+        return pd.DataFrame(out)
+
+    _NON_WATCHLIST_COLS = ["Ticker", "Tier", "Price", "Expiry", "IV %", "Implied Move %", "Band",
+                            "Implied ÷ Realized", "vs Own Median", "Opt Vol vs 20d", "Earnings",
+                            "Short Float", "Mkt Cap", "Flags"]
+
+    def _render_table_with_watchlist_action(rowset, editor_key):
+        """st.data_editor with only the "Watchlist" column editable -- checking a box for a ticker not
+        already on the watchlist adds it (save_watchlist + rerun); every other column is read-only. This
+        replaces the old separate 'Row Detail' expander section's "Add to watchlist" button -- the action
+        now lives in the table row itself, per the 2026-09-25 follow-up. Unchecking an already-on-watchlist
+        row's box does NOT remove it (this was never a remove action, only additive, same as the button it
+        replaces)."""
+        df = _table_rows(rowset)
+        edited = st.data_editor(
+            df, width='stretch', hide_index=True, key=editor_key,
+            column_config={
+                "Watchlist": st.column_config.CheckboxColumn("⭐ Watchlist", help="Check to add to your watchlist"),
+                **{c: st.column_config.Column(disabled=True) for c in _NON_WATCHLIST_COLS},
+            },
+        )
+        newly_checked = [
+            t for t, was_on, is_on in zip(edited["Ticker"], df["Watchlist"], edited["Watchlist"])
+            if is_on and not was_on
+        ]
+        if newly_checked:
+            save_watchlist(get_conn(), EFFECTIVE_EMAIL, sorted(set(watchlist) | set(newly_checked)))
+            st.rerun()
+
+    top_rows = rows[:25]
+    _render_table_with_watchlist_action(top_rows, _uk(f"vol_table_top_{period_key}_{tier_label}"))
+    if len(rows) > 25:
+        with st.expander(f"Show all {len(rows)} names"):
+            _render_table_with_watchlist_action(rows, _uk(f"vol_table_all_{period_key}_{tier_label}"))
+
+    st.caption(
+        "An ATM straddle implies roughly a one-standard-deviation move; price finishes inside the band "
+        "about two times in three — it is not a forecast. Where earnings fall inside the window, event "
+        "premium inflates the band and it isn't comparable to a non-earnings period."
+    )
+
+    # Separate collapsed group (2026-09-25 follow-up) -- rows the "Hide earnings in window" toggle removed
+    # from the main list above are NOT just discarded; they're shown here so it's checkable, not a black box.
+    if hide_earnings and earnings_hidden_rows:
+        with st.expander(f"📅 Earnings in window ({len(earnings_hidden_rows)}) — hidden from the list above",
+                          expanded=False):
+            sorted_hidden = sorted(earnings_hidden_rows,
+                                    key=lambda r: (r.get("iv_rv_ratio") is None, -(r.get("iv_rv_ratio") or 0)))
+            _render_table_with_watchlist_action(sorted_hidden, _uk(f"vol_table_earn_{period_key}_{tier_label}"))
+
+
+with tab15:
+    render_volatility_dislocations_tab()
+
+
+# --------------------------------------------------------------------------
+# Tab 16 -- ⚙️ ADMIN (role='admin' only; the tab does not exist otherwise)
+# --------------------------------------------------------------------------
+
+def _set_view_as(email):
+    """Button callback: switch the admin's data context (runs before the
+    next script pass, so it may set widget-bound keys)."""
+    st.session_state["view_as_email"] = None if email == ACTOR_EMAIL else email
+    st.session_state["_admin_view_as_select"] = email
+
+
+def render_admin_users_section():
+    conn = get_conn()
+    users = list_users(conn)
+    st.markdown('<div class="smd-section">USERS</div>', unsafe_allow_html=True)
+    _flash = st.session_state.pop("_admin_flash", None)
+    if _flash:
+        st.success(_flash)
+    st.caption("Only accounts listed here can sign in. A valid Google login for any other account is refused.")
+    st.dataframe(pd.DataFrame([{
+        "Email": u["email"], "Name": u["display_name"] or "", "Role": u["role"],
+        "Created": fmt_date(u["created_at"]) if u["created_at"] else "—",
+        "Last login": fmt_date(u["last_login_at"]) if u["last_login_at"] else "never",
+        "Active": "✅" if u["active"] else "⛔ deactivated",
+    } for u in users]), width='stretch', hide_index=True)
+
+    st.markdown("**Add user**")
+    with st.form("admin_add_user_form", clear_on_submit=True):
+        c1, c2, c3 = st.columns([3, 2, 1.2])
+        new_email = c1.text_input("Google account email", placeholder="person@gmail.com")
+        new_name = c2.text_input("Display name")
+        new_role = c3.selectbox("Role", USER_ROLES)
+        if st.form_submit_button("➕ Add user"):
+            try:
+                created = de.create_user(conn, new_email, new_name, new_role, created_by=ACTOR_EMAIL)
+            except ValueError as e:
+                st.error(str(e))
+            else:
+                # Rerun so the tables/rows above (built before this form was
+                # processed) include the new user immediately.
+                st.session_state["_admin_flash"] = (
+                    f"Added {created['email']} as {created['role']} with a starter watchlist. "
+                    f"Use 'View as' to set up their watchlist."
+                )
+                st.rerun()
+
+    st.markdown("**Manage users**")
+    for u in users:
+        email = u["email"]
+        is_self = email == ACTOR_EMAIL
+        c1, c2, c3, c4, c5 = st.columns([3, 1.6, 1.4, 1.4, 1.6])
+        c1.markdown(f"**{html.escape(email)}**{' (you)' if is_self else ''}"
+                    f"{'' if u['active'] else ' — <span style=\"color:#e66767;\">deactivated</span>'}",
+                    unsafe_allow_html=True)
+        new_role = c2.selectbox("Role", USER_ROLES, index=USER_ROLES.index(u["role"]), key=f"admin_role_{email}",
+                                label_visibility="collapsed", disabled=is_self)
+        if new_role != u["role"] and c2.button("Apply role", key=f"admin_role_apply_{email}"):
+            try:
+                de.set_user_role(conn, email, new_role)
+                st.rerun()
+            except ValueError as e:
+                st.error(str(e))
+        if u["active"]:
+            if c3.button("Deactivate", key=f"admin_deact_{email}", disabled=is_self):
+                try:
+                    de.set_user_active(conn, email, False)
+                    st.rerun()
+                except ValueError as e:
+                    st.error(str(e))
+        else:
+            if c3.button("Reactivate", key=f"admin_react_{email}"):
+                de.set_user_active(conn, email, True)
+                st.rerun()
+        c4.button("👁️ View as", key=f"admin_viewas_{email}", on_click=_set_view_as, args=(email,),
+                  disabled=(email == EFFECTIVE_EMAIL))
+        with c5:
+            confirm = st.checkbox("confirm delete", key=f"admin_del_confirm_{email}", disabled=is_self)
+            if st.button("🗑️ Delete", key=f"admin_del_{email}", disabled=is_self or not confirm):
+                try:
+                    de.delete_user(conn, email)
+                    if st.session_state.get("view_as_email") == email:
+                        st.session_state["view_as_email"] = None
+                    st.rerun()
+                except ValueError as e:
+                    st.error(str(e))
+    st.caption("Deleting a user permanently removes their watchlist, entry zones, preferences and recipients. "
+               "Shared market data is untouched. You can't change, deactivate or delete your own account, "
+               "and the last active admin is always protected.")
+
+
+def render_admin_overview_section():
+    conn = get_conn()
+    st.markdown('<div class="smd-section">ALL USERS OVERVIEW</div>', unsafe_allow_html=True)
+    users = list_users(conn)
+    summary = []
+    for u in users:
+        tickers = de.get_saved_watchlist(conn, u["email"])
+        zones = get_entry_zones(conn, u["email"])
+        cfg = get_email_config(conn, u["email"])
+        summary.append({
+            "User": u["email"], "Tickers": len(tickers), "Watchlist": ", ".join(tickers) or "—",
+            "Zones": sum(1 for z in zones if z["entry_low"] is not None),
+            "In zone": sum(1 for z in zones if z["last_zone_status"] == "in_zone"),
+            "Digest": ("on" if cfg["enabled"] else "off") + f" · {'weekly' if cfg['frequency'] == 'weekly' else 'daily Mon–Fri'} · {cfg['send_time_et']} ET",
+            "Recipients": sum(1 for r in get_all_subscribers(conn, u["email"]) if not r["unsubscribed"]),
+        })
+    st.dataframe(pd.DataFrame(summary), width='stretch', hide_index=True)
+    for u in users:
+        with st.expander(f"{u['email']} — entry zones"):
+            zones = get_entry_zones(conn, u["email"])
+            if not zones:
+                st.caption("No entry zones computed yet.")
+                continue
+            st.dataframe(pd.DataFrame([{
+                "Ticker": z["ticker"],
+                "Entry zone": f"${z['entry_low']:.2f}-${z['entry_high']:.2f}" if z["entry_low"] is not None else "—",
+                "Status": (z["last_zone_status"] or "—").replace("_", " "),
+                "Target": f"${z['implied_target_price']:.2f}" if z["implied_target_price"] is not None else "—",
+            } for z in zones]), width='stretch', hide_index=True)
+
+
+def render_admin_tab():
+    """ADMIN console. The `ACTOR` here is always a verified admin -- this is
+    only called when IS_ADMIN, and IS_ADMIN is re-derived from the DB on
+    every script run."""
+    if not IS_ADMIN:  # belt-and-braces: never render admin controls for a non-admin
+        st.error("Admins only.")
+        return
+    if EFFECTIVE_EMAIL != ACTOR_EMAIL:
+        c1, c2 = st.columns([4, 1])
+        c1.info(f"Currently viewing as **{EFFECTIVE_EMAIL}** (their SETTINGS, WATCHLIST SIGNALS and RUNNERS "
+                f"now show and edit that user's data).", icon="👁️")
+        c2.button("Back to my view", key="admin_back_to_me", on_click=_set_view_as, args=(ACTOR_EMAIL,))
+    st.caption("Source registry, news feeds, SMTP/API keys, firm tiers, reconciliation and backtests are in the "
+               "SETTINGS tab, below the personal settings.")
+    sub_users, sub_overview = st.tabs(["Users", "All users overview"])
+    with sub_users:
+        render_admin_users_section()
+    with sub_overview:
+        render_admin_overview_section()
+
+
+if IS_ADMIN:
+    with tab_admin:
+        render_admin_tab()

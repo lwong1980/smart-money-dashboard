@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+    ONE-SHOT: prevents IDLE system sleep (not display sleep -- the screen
+    can still turn off) for 6h55m starting 07:20 local (10 min before the
+    first 10:30am-ET capture) through 14:15 local (15 min after the
+    14:00-local report step, giving its self-uninstall a margin to finish
+    too), so all 6 StartCalendarInterval jobs above actually get to fire.
+    `caffeinate -i` needs no sudo. 24900 seconds = 07:20 -> 14:15 local.
+
+    This does NOT wake the machine from a sleep it's ALREADY in when this
+    job's own start time arrives -- that needs `pmset schedule wake`
+    (sudo-only, so it can't be launchd-automated; run it yourself once,
+    see the install output / chat instructions).
+    -->
+    <key>Label</key>
+    <string>com.smartmoney.quotetiming.keepawake</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/caffeinate</string>
+        <string>-i</string>
+        <string>-t</string>
+        <string>24900</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/lwong/smart-money</string>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Month</key><integer>9</integer>
+        <key>Day</key><integer>28</integer>
+        <key>Hour</key><integer>7</integer>
+        <key>Minute</key><integer>20</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/lwong/smart-money/scripts/quote_timing_logs/keepawake.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/lwong/smart-money/scripts/quote_timing_logs/keepawake.err.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>
